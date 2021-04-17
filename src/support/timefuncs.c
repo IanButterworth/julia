@@ -36,9 +36,15 @@ JL_DLLEXPORT int jl_gettimeofday(struct jl_timeval *jtv)
 
 JL_DLLEXPORT double jl_clock_now(void)
 {
-    struct jl_timeval now;
-    jl_gettimeofday(&now);
-    return now.sec + now.usec * 1e-6;
+#if defined(_OS_WINDOWS_)
+    struct __timeb64 tb;
+    _ftime64_s(&tb);
+    return tb.time + tb.millitm * 1e-3;
+#else
+    struct timespec tp;
+    clock_gettime(CLOCK_REALTIME, &tp);
+    return tp.tv_sec + tp.tv_nsec * 1e-9;
+#endif
 }
 
 void sleep_ms(int ms)
