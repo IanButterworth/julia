@@ -60,10 +60,10 @@ Base.assert_havelock(l::SpinLock) = islocked(l) ? nothing : Base.concurrency_vio
 
 function lock(l::SpinLock)
     while true
-        if _get(l) == 0
+        if _get(l) === Int(0)
             GC.disable_finalizers()
             p = _xchg!(l, 1)
-            if p == 0
+            if p === Int(0)
                 return
             end
             GC.enable_finalizers()
@@ -75,10 +75,10 @@ function lock(l::SpinLock)
 end
 
 function trylock(l::SpinLock)
-    if _get(l) == 0
+    if _get(l) === Int(0)
         GC.disable_finalizers()
         p = _xchg!(l, 1)
-        if p == 0
+        if p === Int(0)
             return true
         end
         GC.enable_finalizers()
@@ -87,7 +87,7 @@ function trylock(l::SpinLock)
 end
 
 function unlock(l::SpinLock)
-    _get(l) == 0 && error("unlock count must match lock count")
+    _get(l) === Int(0) && error("unlock count must match lock count")
     _set!(l, 0)
     GC.enable_finalizers()
     ccall(:jl_cpu_wake, Cvoid, ())
@@ -95,5 +95,5 @@ function unlock(l::SpinLock)
 end
 
 function islocked(l::SpinLock)
-    return _get(l) != 0
+    return _get(l) !== Int(0)
 end
