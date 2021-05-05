@@ -1530,12 +1530,14 @@ static void jl_save_system_image_to_stream(ios_t *f) JL_GC_DISABLED
         gmp_limb_size = jl_unbox_long(jl_get_global((jl_module_t*)jl_get_global(jl_base_module, jl_symbol("GMP")),
                                                     jl_symbol("BITS_PER_LIMB"))) / 8;
     }
-
+    size_t ntags;
     { // step 1: record values (recursively) that need to go in the image
+        jl_printf(JL_STDOUT, "\rCreating sysimage: Step 1/4: Recording values");
         size_t i;
         for (i = 0; tags[i] != NULL; i++) {
             jl_value_t *tag = *tags[i];
             jl_serialize_value(&s, tag);
+            ntags = i;
         }
         // step 1.1: check for values only found in the generated code
         arraylist_t typenames;
@@ -1562,6 +1564,7 @@ static void jl_save_system_image_to_stream(ios_t *f) JL_GC_DISABLED
     }
 
     { // step 2: build all the sysimg sections
+        jl_printf(JL_STDOUT, "\rCreating sysimage: Step 2/4: Building sysimage sections");
         write_padding(&sysimg, sizeof(uint32_t));
         jl_write_values(&s);
         jl_write_relocations(&s);
@@ -1576,6 +1579,7 @@ static void jl_save_system_image_to_stream(ios_t *f) JL_GC_DISABLED
     }
 
     // step 3: combine all of the sections into one file
+    jl_printf(JL_STDOUT, "\rCreating sysimage: Step 3/4: Combining sections       ");
     write_uint32(f, sysimg.size - sizeof(uint32_t));
     ios_seek(&sysimg, sizeof(uint32_t));
     ios_copyall(f, &sysimg);
@@ -1614,6 +1618,7 @@ static void jl_save_system_image_to_stream(ios_t *f) JL_GC_DISABLED
         for (i = 0; tags[i] != NULL; i++) {
             jl_value_t *tag = *tags[i];
             jl_write_value(&s, tag);
+            jl_printf(JL_STDOUT, "\rCreating sysimage: Step 4/4: Recording location of root %lu/%lu", i, ntags);
         }
         jl_write_value(&s, s.ptls->root_task->tls);
         write_uint32(f, jl_get_gs_ctr());
@@ -1629,6 +1634,7 @@ static void jl_save_system_image_to_stream(ios_t *f) JL_GC_DISABLED
     arraylist_free(&s.relocs_list);
     arraylist_free(&s.gctags_list);
     jl_cleanup_serializer2();
+    jl_printf(JL_STDOUT, "\rCreating sysimage: Complete                                          \n");
 
     jl_gc_enable(en);
 }
