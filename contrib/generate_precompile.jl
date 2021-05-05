@@ -311,10 +311,14 @@ function generate_precompile_statements()
         if have_repl
             precompile_lines = split(repl_script::String, '\n'; keepempty=false)
             curr = 0
+            max_str_len = 0
             for l in precompile_lines
                 sleep(0.1)
                 curr += 1
-                print("\rGenerating REPL precompile statements... $curr/$(length(precompile_lines))")
+                str = "\rGenerating REPL precompile statements... $curr/$(length(precompile_lines)): $(l)"
+                str_len = length(str)
+                max_str_len = max(max_str_len, str_len)
+                print(str, " "^(max_str_len - str_len))
                 # consume any other output
                 bytesavailable(output_copy) > 0 && readavailable(output_copy)
                 # push our input
