@@ -490,7 +490,7 @@ end
 function explicit_manifest_deps_get(project_file::String, where::UUID, name::String)::Union{Nothing,PkgId}
     manifest_file = project_file_manifest_path(project_file)
     manifest_file === nothing && return nothing # manifest not found--keep searching LOAD_PATH
-    d = parsed_toml(manifest_file)
+    d = parsed_toml(manifest_file)["deps"]
     found_where = false
     found_name = false
     for (dep_name, entries) in d
@@ -538,7 +538,7 @@ function explicit_manifest_uuid_path(project_file::String, pkg::PkgId)::Union{No
     manifest_file = project_file_manifest_path(project_file)
     manifest_file === nothing && return nothing # no manifest, skip env
 
-    d = parsed_toml(manifest_file)
+    d = parsed_toml(manifest_file)["deps"]
     entries = get(d, pkg.name, nothing)::Union{Nothing, Vector{Any}}
     entries === nothing && return nothing # TODO: allow name to mismatch?
     for entry in entries
