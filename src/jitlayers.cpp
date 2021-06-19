@@ -232,10 +232,12 @@ extern "C"
 int jl_compile_extern_c(void *llvmmod, void *p, void *sysimg, jl_value_t *declrt, jl_value_t *sigt)
 {
     JL_LOCK(&codegen_lock);
-    uint64_t compiler_start_time = 0;
     int tid = jl_threadid();
-    if (jl_measure_compile_time[tid])
+    if (jl_measure_compile_time[tid]) {
+        if (compiler_start_time != 0 || inference_start_time != 0)
+            jl_printf(JL_STDERR, "nested timing detected in jl_compile_extern_c compiler_start_time = %llu inference_start_time = %llu\n", compiler_start_time, inference_start_time);
         compiler_start_time = jl_hrtime();
+    }
     jl_codegen_params_t params;
     jl_codegen_params_t *pparams = (jl_codegen_params_t*)p;
     if (pparams == NULL)
@@ -259,7 +261,10 @@ int jl_compile_extern_c(void *llvmmod, void *p, void *sysimg, jl_value_t *declrt
             jl_add_to_ee(std::unique_ptr<Module>(into));
     }
     if (codegen_lock.count == 1 && jl_measure_compile_time[tid])
+    {
         jl_cumulative_compile_time[tid] += (jl_hrtime() - compiler_start_time);
+        compiler_start_time = 0;
+    }
     JL_UNLOCK(&codegen_lock);
     return success;
 }
@@ -314,10 +319,12 @@ extern "C"
 jl_code_instance_t *jl_generate_fptr(jl_method_instance_t *mi JL_PROPAGATES_ROOT, size_t world)
 {
     JL_LOCK(&codegen_lock); // also disables finalizers, to prevent any unexpected recursion
-    uint64_t compiler_start_time = 0;
     int tid = jl_threadid();
-    if (jl_measure_compile_time[tid])
+    if (jl_measure_compile_time[tid]) {
+        if (compiler_start_time != 0 || inference_start_time != 0)
+            jl_printf(JL_STDERR, "nested timing detected in jl_generate_fptr compiler_start_time = %llu inference_start_time = %llu\n", compiler_start_time, inference_start_time);
         compiler_start_time = jl_hrtime();
+    }
     // if we don't have any decls already, try to generate it now
     jl_code_info_t *src = NULL;
     JL_GC_PUSH1(&src);
@@ -355,7 +362,10 @@ jl_code_instance_t *jl_generate_fptr(jl_method_instance_t *mi JL_PROPAGATES_ROOT
         codeinst = NULL;
     }
     if (codegen_lock.count == 1 && jl_measure_compile_time[tid])
+    {
         jl_cumulative_compile_time[tid] += (jl_hrtime() - compiler_start_time);
+        compiler_start_time = 0;
+    }
     JL_UNLOCK(&codegen_lock);
     JL_GC_POP();
     return codeinst;
@@ -368,10 +378,12 @@ void jl_generate_fptr_for_unspecialized(jl_code_instance_t *unspec)
         return;
     }
     JL_LOCK(&codegen_lock);
-    uint64_t compiler_start_time = 0;
     int tid = jl_threadid();
-    if (jl_measure_compile_time[tid])
+    if (jl_measure_compile_time[tid]) {
+        if (compiler_start_time != 0 || inference_start_time != 0)
+            jl_printf(JL_STDERR, "nested timing detected in jl_generate_fptr_for_unspecialized compiler_start_time = %llu inference_start_time = %llu\n", compiler_start_time, inference_start_time);
         compiler_start_time = jl_hrtime();
+    }
     if (unspec->invoke == NULL) {
         jl_code_info_t *src = NULL;
         JL_GC_PUSH1(&src);
@@ -399,7 +411,10 @@ void jl_generate_fptr_for_unspecialized(jl_code_instance_t *unspec)
         JL_GC_POP();
     }
     if (codegen_lock.count == 1 && jl_measure_compile_time[tid])
+    {
         jl_cumulative_compile_time[tid] += (jl_hrtime() - compiler_start_time);
+        compiler_start_time = 0;
+    }
     JL_UNLOCK(&codegen_lock); // Might GC
 }
 
@@ -421,10 +436,12 @@ jl_value_t *jl_dump_method_asm(jl_method_instance_t *mi, size_t world,
             // (using sentinel value `1` instead)
             // so create an exception here so we can print pretty our lies
             JL_LOCK(&codegen_lock); // also disables finalizers, to prevent any unexpected recursion
-            uint64_t compiler_start_time = 0;
             int tid = jl_threadid();
-            if (jl_measure_compile_time[tid])
+            if (jl_measure_compile_time[tid]) {
+                if (compiler_start_time != 0 || inference_start_time != 0)
+                    jl_printf(JL_STDERR, "nested timing detected in jl_dump_method_asm compiler_start_time = %llu inference_start_time = %llu\n", compiler_start_time, inference_start_time);
                 compiler_start_time = jl_hrtime();
+            }
             specfptr = (uintptr_t)codeinst->specptr.fptr;
             if (specfptr == 0) {
                 jl_code_info_t *src = jl_type_infer(mi, world, 0);
@@ -449,7 +466,10 @@ jl_value_t *jl_dump_method_asm(jl_method_instance_t *mi, size_t world,
                 JL_GC_POP();
             }
             if (jl_measure_compile_time[tid])
+            {
                 jl_cumulative_compile_time[tid] += (jl_hrtime() - compiler_start_time);
+                compiler_start_time = 0;
+            }
             JL_UNLOCK(&codegen_lock);
         }
         if (specfptr != 0)
