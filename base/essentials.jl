@@ -593,10 +593,33 @@ end
 """
     @repeat call
     @repeat n call
-    @repeat bool_expr call
+    @repeat expr call
 
 Repeat `call` until interrupt, or `n` times, and discard the output.
-If an expression is given as a first argument it must return a Bool and will repeat while true and disregard output.
+If an expression is given that returns an Integer, repeat that many times.
+If an expression is given that returns a Bool, repeat until false.
+
+```julia
+julia> @repeat println("hello")
+hello
+hello
+^ChelloERROR: InterruptException:
+...
+
+julia> @repeat 3 println("hello")
+hello
+hello
+hello
+
+julia> @repeat 2 + 1 println("hello")
+hello
+hello
+hello
+
+julia> @repeat rand() > 0.5 println("hello")
+hello
+hello
+```
 """
 macro repeat(exs...)
     if length(exs) == 1
@@ -608,20 +631,32 @@ macro repeat(exs...)
     elseif length(exs) == 2
         terms = first(exs)
         ex = last(exs)
-        if terms isa Expr || terms isa Bool
-            quote
-                while $(esc(terms))
-                    $(esc(ex))
-                end
-            end
-        elseif terms isa Integer
+        if terms isa Integer
             quote
                 for _ = 1:$(esc(terms))
                     $(esc(ex))
                 end
             end
+        elseif terms isa Expr
+            quote
+                local terms_eval = $(esc(terms))
+                if terms_eval isa Bool
+                    if terms_eval
+                        $(esc(ex)) # do once given that terms has been evaled once already
+                        while $(esc(terms))
+                            $(esc(ex))
+                        end
+                    end
+                elseif terms_eval isa Integer
+                    for _ in 1:terms_eval
+                        $(esc(ex))
+                    end
+                else
+                    throw(ArgumentError("@repeat first argument must return an Integer or a Bool"))
+                end
+            end
         else
-            throw(ArgumentError("@repeat first argument must be an Integer or an expression that returns a boolean"))
+            throw(ArgumentError("@repeat first argument must be an Integer literal, or an expression that returns an Integer or Bool"))
         end
     else
         throw(ArgumentError("Too many arguments passed to @repeat"))
