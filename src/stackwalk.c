@@ -88,6 +88,9 @@ static int jl_unw_stepn(bt_cursor_t *cursor, jl_bt_element_t *bt_data, size_t *b
     jl_set_safe_restore(&buf);
     if (!jl_setjmp(buf, 0)) {
 #endif
+        jl_bt_element_t *threadid_entry = bt_data;
+        threadid_entry->uintptr = jl_threadid();
+        n++;
         int have_more_frames = 1;
         while (have_more_frames) {
             if (n + JL_BT_MAX_ENTRY_SIZE + 1 > maxsize) {
