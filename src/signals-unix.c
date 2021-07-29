@@ -780,6 +780,9 @@ static void *signal_listener(void *arg)
                     }
                     jl_set_safe_restore(old_buf);
 
+                    // store threadid but add 1 as 0 is preserved to indicate end of block
+                    bt_data_prof[bt_size_cur++].uintptr = i + 1;
+
                     // Mark the end of this block with 0
                     bt_data_prof[bt_size_cur++].uintptr = 0;
                 }

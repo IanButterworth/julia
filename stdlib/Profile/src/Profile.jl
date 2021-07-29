@@ -147,7 +147,8 @@ function print(io::IO,
         mincount::Int = 0,
         noisefloor = 0,
         sortedby::Symbol = :filefuncline,
-        recur::Symbol = :off)
+        recur::Symbol = :off,
+        threads::AbstractVector{Int} = 1:Threads.nthreads())
     print(io, data, lidict, ProfileFormat(
             C = C,
             combine = combine,
@@ -156,15 +157,16 @@ function print(io::IO,
             noisefloor = noisefloor,
             sortedby = sortedby,
             recur = recur),
-        format)
+        format,
+        threads)
 end
 
-function print(io::IO, data::Vector{<:Unsigned}, lidict::Union{LineInfoDict, LineInfoFlatDict}, fmt::ProfileFormat, format::Symbol)
+function print(io::IO, data::Vector{<:Unsigned}, lidict::Union{LineInfoDict, LineInfoFlatDict}, fmt::ProfileFormat, format::Symbol, threads::AbstractVector{Int})
     cols::Int = Base.displaysize(io)[2]
     data = convert(Vector{UInt64}, data)
     fmt.recur ∈ (:off, :flat, :flatc) || throw(ArgumentError("recur value not recognized"))
     if format === :tree
-        tree(io, data, lidict, cols, fmt)
+        tree(io, data, lidict, cols, fmt, threads)
     elseif format === :flat
         fmt.recur === :off || throw(ArgumentError("format flat only implements recur=:off"))
         flat(io, data, lidict, cols, fmt)
@@ -182,8 +184,19 @@ a dictionary `lidict` of line information.
 
 See `Profile.print([io], data)` for an explanation of the valid keyword arguments.
 """
-print(data::Vector{<:Unsigned} = fetch(), lidict::Union{LineInfoDict, LineInfoFlatDict} = getdict(data); kwargs...) =
-    print(stdout, data, lidict; kwargs...)
+function print(data::Vector{<:Unsigned} = fetch(), lidict::Union{LineInfoDict, LineInfoFlatDict} = getdict(data); separate_threads = true, kwargs...)
+    if separate_threads
+        for t in 1:Threads.nthreads()
+            kwargs = filter(p -> !in(first(p), [:threads, :separate_threads]),  kwargs)
+            printstyled(stdout, "Thread $t\n"; bold=true, color=Base.info_color())
+            print(stdout, data, lidict; threads = t:t, kwargs...)
+            println(stdout)
+        end
+    else
+        kwargs = filter(p -> first(p) != :separate_threads,  kwargs)
+        print(stdout, data, lidict; kwargs...)
+    end
+end
 
 """
     retrieve() -> data, lidict
@@ -612,14 +625,20 @@ function tree_format(frames::Vector{<:StackFrameTree}, level::Int, cols::Int, ma
 end
 
 # turn a list of backtraces into a tree (implicitly separated by NULL markers)
-function tree!(root::StackFrameTree{T}, all::Vector{UInt64}, lidict::Union{LineInfoFlatDict, LineInfoDict}, C::Bool, recur::Symbol) where {T}
+function tree!(root::StackFrameTree{T}, all::Vector{UInt64}, lidict::Union{LineInfoFlatDict, LineInfoDict}, C::Bool, recur::Symbol, threads::AbstractVector{Int}) where {T}
     parent = root
     tops = Vector{StackFrameTree{T}}()
     build = Vector{StackFrameTree{T}}()
     startframe = length(all)
+    skip = false
     for i in startframe:-1:1
         ip = all[i]
         if ip == 0
+            if !in(all[i - 1], threads)
+                skip = true
+                continue
+            end
+            skip = false
             # sentinel value indicates the start of a new backtrace
             empty!(build)
             root.recur = 0
@@ -647,6 +666,11 @@ function tree!(root::StackFrameTree{T}, all::Vector{UInt64}, lidict::Union{LineI
             root.count += 1
             startframe = i
         else
+            if i == startframe - 1 && !in(ip, threads)
+                skip = true
+            end
+            skip && continue
+
             pushfirst!(build, parent)
             if recur === :flat || recur === :flatc
                 # Rewind the `parent` tree back, if this exact ip was already present *higher* in the current tree
@@ -687,6 +711,7 @@ function tree!(root::StackFrameTree{T}, all::Vector{UInt64}, lidict::Union{LineI
                 parent = this
                 continue
             end
+
             frames = lidict[ip]
             nframes = (frames isa Vector ? length(frames) : 1)
             this = parent
@@ -784,11 +809,11 @@ function print_tree(io::IO, bt::StackFrameTree{T}, cols::Int, fmt::ProfileFormat
     end
 end
 
-function tree(io::IO, data::Vector{UInt64}, lidict::Union{LineInfoFlatDict, LineInfoDict}, cols::Int, fmt::ProfileFormat)
+function tree(io::IO, data::Vector{UInt64}, lidict::Union{LineInfoFlatDict, LineInfoDict}, cols::Int, fmt::ProfileFormat, threads::AbstractVector{Int})
     if fmt.combine
-        root = tree!(StackFrameTree{StackFrame}(), data, lidict, fmt.C, fmt.recur)
+        root = tree!(StackFrameTree{StackFrame}(), data, lidict, fmt.C, fmt.recur, threads)
     else
-        root = tree!(StackFrameTree{UInt64}(), data, lidict, fmt.C, fmt.recur)
+        root = tree!(StackFrameTree{UInt64}(), data, lidict, fmt.C, fmt.recur, threads)
     end
     if isempty(root.down)
         warning_empty()
