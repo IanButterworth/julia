@@ -136,7 +136,7 @@ The keyword arguments can be any combination of:
     compresses any recursion (by ip), showing the approximate effect of converting any self-recursion into an iterator.
     `:flatc` does the same but also includes collapsing of C frames (may do odd things around `jl_apply`).
 """
-function print(io::IO,
+function _print(io::IO,
         data::Vector{<:Unsigned} = fetch(),
         lidict::Union{LineInfoDict, LineInfoFlatDict} = getdict(data)
         ;
@@ -149,8 +149,9 @@ function print(io::IO,
         sortedby::Symbol = :filefuncline,
         recur::Symbol = :off,
         threads::AbstractVector{Int} = 1:Threads.nthreads(),
+        tasks::AbstractVector{Int} = 1:typemax(Int),
         header::Bool = true)
-    print(io, data, lidict, ProfileFormat(
+    _print(io, data, lidict, ProfileFormat(
             C = C,
             combine = combine,
             maxdepth = maxdepth,
@@ -160,21 +161,32 @@ function print(io::IO,
             recur = recur),
         format,
         threads,
+        tasks,
         header)
 end
 
-function print(io::IO, data::Vector{<:Unsigned}, lidict::Union{LineInfoDict, LineInfoFlatDict}, fmt::ProfileFormat, format::Symbol, threads::AbstractVector{Int}, header::Bool = true)
+function _print(io::IO, data::Vector{<:Unsigned}, lidict::Union{LineInfoDict, LineInfoFlatDict}, fmt::ProfileFormat, format::Symbol, threads::AbstractVector{Int}, tasks::AbstractVector{Int}, header::Bool = true)
     cols::Int = Base.displaysize(io)[2]
     data = convert(Vector{UInt64}, data)
     fmt.recur ∈ (:off, :flat, :flatc) || throw(ArgumentError("recur value not recognized"))
     if format === :tree
-        tree(io, data, lidict, cols, fmt, threads, header)
+        tree(io, data, lidict, cols, fmt, threads, tasks, header)
     elseif format === :flat
         fmt.recur === :off || throw(ArgumentError("format flat only implements recur=:off"))
         flat(io, data, lidict, cols, fmt)
     else
         throw(ArgumentError("output format $(repr(format)) not recognized"))
     end
+end
+
+function get_task_ids(data::Vector{<:Unsigned}, tid::Int)
+    taskids = Int[]
+    for i in length(data):-1:1
+        if data[i] == 0 && data[i - 2] == tid
+            push!(taskids, data[i - 1])
+        end
+    end
+    return unique(taskids)
 end
 
 """
@@ -186,19 +198,23 @@ a dictionary `lidict` of line information.
 
 See `Profile.print([io], data)` for an explanation of the valid keyword arguments.
 """
-function print(data::Vector{<:Unsigned} = fetch(), lidict::Union{LineInfoDict, LineInfoFlatDict} = getdict(data); separate_threads = true, kwargs...)
+function print(io::IO = stdout, data::Vector{<:Unsigned} = fetch(), lidict::Union{LineInfoDict, LineInfoFlatDict} = getdict(data); separate_threads = true, kwargs...)
     if separate_threads
-        println(stdout, "Overhead ╎ [+additional indent] Count File:Line; Function")
-        println(stdout, "=========================================================")
-        for t in 1:Threads.nthreads()
-            kwargs = filter(p -> !in(first(p), [:threads, :separate_threads]),  kwargs)
-            printstyled(stdout, "Thread $t\n"; bold=true, color=Base.info_color())
-            print(stdout, data, lidict; threads = t:t, header = false, kwargs...)
-            println(stdout)
+        kwargs = filter(p -> !in(first(p), [:threads, :separate_threads]),  kwargs)
+        println(io, "Overhead ╎ [+additional indent] Count File:Line; Function")
+        println(io, "=========================================================")
+        for tid in 1:Threads.nthreads()
+            taskids = get_task_ids(data, tid)
+            printstyled(io, "Thread $tid\n"; bold=true, color=Base.info_color())
+            for taskid in taskids
+                printstyled(io, "Task $taskid\n"; bold=true, color=Base.debug_color())
+                _print(io, data, lidict; threads = tid:tid, tasks = [taskid], header = false, kwargs...)
+                println(io)
+            end
         end
     else
         kwargs = filter(p -> first(p) != :separate_threads,  kwargs)
-        print(stdout, data, lidict; kwargs...)
+        _print(io, data, lidict; kwargs...)
     end
 end
 
@@ -629,7 +645,7 @@ function tree_format(frames::Vector{<:StackFrameTree}, level::Int, cols::Int, ma
 end
 
 # turn a list of backtraces into a tree (implicitly separated by NULL markers)
-function tree!(root::StackFrameTree{T}, all::Vector{UInt64}, lidict::Union{LineInfoFlatDict, LineInfoDict}, C::Bool, recur::Symbol, threads::AbstractVector{Int}) where {T}
+function tree!(root::StackFrameTree{T}, all::Vector{UInt64}, lidict::Union{LineInfoFlatDict, LineInfoDict}, C::Bool, recur::Symbol, threads::AbstractVector{Int}, tasks::AbstractVector{Int}) where {T}
     parent = root
     tops = Vector{StackFrameTree{T}}()
     build = Vector{StackFrameTree{T}}()
@@ -638,7 +654,8 @@ function tree!(root::StackFrameTree{T}, all::Vector{UInt64}, lidict::Union{LineI
     for i in startframe:-1:1
         ip = all[i]
         if ip == 0
-            if !in(all[i - 1], threads)
+            tid = all[i - 2]
+            if !in(tid, threads)
                 skip = true
                 continue
             end
@@ -670,8 +687,17 @@ function tree!(root::StackFrameTree{T}, all::Vector{UInt64}, lidict::Union{LineI
             root.count += 1
             startframe = i
         else
-            if i == startframe - 1 && !in(ip, threads)
-                skip = true
+            if i == startframe - 1
+                if !in(ip, tasks)
+                    skip = true
+                end
+                continue
+            end
+            if i == startframe - 2
+                if !in(ip, threads)
+                    skip = true
+                end
+                continue
             end
             skip && continue
 
@@ -815,11 +841,11 @@ function print_tree(io::IO, bt::StackFrameTree{T}, cols::Int, fmt::ProfileFormat
     end
 end
 
-function tree(io::IO, data::Vector{UInt64}, lidict::Union{LineInfoFlatDict, LineInfoDict}, cols::Int, fmt::ProfileFormat, threads::AbstractVector{Int}, header::Bool)
+function tree(io::IO, data::Vector{UInt64}, lidict::Union{LineInfoFlatDict, LineInfoDict}, cols::Int, fmt::ProfileFormat, threads::AbstractVector{Int}, tasks::AbstractVector{Int}, header::Bool)
     if fmt.combine
-        root = tree!(StackFrameTree{StackFrame}(), data, lidict, fmt.C, fmt.recur, threads)
+        root = tree!(StackFrameTree{StackFrame}(), data, lidict, fmt.C, fmt.recur, threads, tasks)
     else
-        root = tree!(StackFrameTree{UInt64}(), data, lidict, fmt.C, fmt.recur, threads)
+        root = tree!(StackFrameTree{UInt64}(), data, lidict, fmt.C, fmt.recur, threads, tasks)
     end
     if isempty(root.down)
         warning_empty()
