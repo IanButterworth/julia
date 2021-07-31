@@ -654,8 +654,9 @@ function tree!(root::StackFrameTree{T}, all::Vector{UInt64}, lidict::Union{LineI
     for i in startframe:-1:1
         ip = all[i]
         if ip == 0
+            taskid = all[i - 1]
             tid = all[i - 2]
-            if !in(tid, threads)
+            if !in(tid, threads) || !in(taskid, tasks)
                 skip = true
                 continue
             end
