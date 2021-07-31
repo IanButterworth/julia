@@ -148,7 +148,8 @@ function print(io::IO,
         noisefloor = 0,
         sortedby::Symbol = :filefuncline,
         recur::Symbol = :off,
-        threads::AbstractVector{Int} = 1:Threads.nthreads())
+        threads::AbstractVector{Int} = 1:Threads.nthreads(),
+        header::Bool = true)
     print(io, data, lidict, ProfileFormat(
             C = C,
             combine = combine,
@@ -158,15 +159,16 @@ function print(io::IO,
             sortedby = sortedby,
             recur = recur),
         format,
-        threads)
+        threads,
+        header)
 end
 
-function print(io::IO, data::Vector{<:Unsigned}, lidict::Union{LineInfoDict, LineInfoFlatDict}, fmt::ProfileFormat, format::Symbol, threads::AbstractVector{Int})
+function print(io::IO, data::Vector{<:Unsigned}, lidict::Union{LineInfoDict, LineInfoFlatDict}, fmt::ProfileFormat, format::Symbol, threads::AbstractVector{Int}, header::Bool = true)
     cols::Int = Base.displaysize(io)[2]
     data = convert(Vector{UInt64}, data)
     fmt.recur ∈ (:off, :flat, :flatc) || throw(ArgumentError("recur value not recognized"))
     if format === :tree
-        tree(io, data, lidict, cols, fmt, threads)
+        tree(io, data, lidict, cols, fmt, threads, header)
     elseif format === :flat
         fmt.recur === :off || throw(ArgumentError("format flat only implements recur=:off"))
         flat(io, data, lidict, cols, fmt)
@@ -186,10 +188,12 @@ See `Profile.print([io], data)` for an explanation of the valid keyword argument
 """
 function print(data::Vector{<:Unsigned} = fetch(), lidict::Union{LineInfoDict, LineInfoFlatDict} = getdict(data); separate_threads = true, kwargs...)
     if separate_threads
+        println(stdout, "Overhead ╎ [+additional indent] Count File:Line; Function")
+        println(stdout, "=========================================================")
         for t in 1:Threads.nthreads()
             kwargs = filter(p -> !in(first(p), [:threads, :separate_threads]),  kwargs)
             printstyled(stdout, "Thread $t\n"; bold=true, color=Base.info_color())
-            print(stdout, data, lidict; threads = t:t, kwargs...)
+            print(stdout, data, lidict; threads = t:t, header = false, kwargs...)
             println(stdout)
         end
     else
@@ -768,12 +772,14 @@ end
 
 # Print the stack frame tree starting at a particular root. Uses a worklist to
 # avoid stack overflows.
-function print_tree(io::IO, bt::StackFrameTree{T}, cols::Int, fmt::ProfileFormat) where T
+function print_tree(io::IO, bt::StackFrameTree{T}, cols::Int, fmt::ProfileFormat, header::Bool) where T
     maxes = maxstats(bt)
     filenamemap = Dict{Symbol,String}()
     worklist = [(bt, 0, 0, "")]
-    println(io, "Overhead ╎ [+additional indent] Count File:Line; Function")
-    println(io, "=========================================================")
+    if header
+        println(io, "Overhead ╎ [+additional indent] Count File:Line; Function")
+        println(io, "=========================================================")
+    end
     while !isempty(worklist)
         (bt, level, noisefloor, str) = popfirst!(worklist)
         isempty(str) || println(io, str)
@@ -809,7 +815,7 @@ function print_tree(io::IO, bt::StackFrameTree{T}, cols::Int, fmt::ProfileFormat
     end
 end
 
-function tree(io::IO, data::Vector{UInt64}, lidict::Union{LineInfoFlatDict, LineInfoDict}, cols::Int, fmt::ProfileFormat, threads::AbstractVector{Int})
+function tree(io::IO, data::Vector{UInt64}, lidict::Union{LineInfoFlatDict, LineInfoDict}, cols::Int, fmt::ProfileFormat, threads::AbstractVector{Int}, header::Bool)
     if fmt.combine
         root = tree!(StackFrameTree{StackFrame}(), data, lidict, fmt.C, fmt.recur, threads)
     else
@@ -819,7 +825,7 @@ function tree(io::IO, data::Vector{UInt64}, lidict::Union{LineInfoFlatDict, Line
         warning_empty()
         return
     end
-    print_tree(io, root, cols, fmt)
+    print_tree(io, root, cols, fmt, header)
     Base.println(io, "Total snapshots: ", root.count)
     nothing
 end
