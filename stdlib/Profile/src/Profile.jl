@@ -149,7 +149,7 @@ function _print(io::IO,
         sortedby::Symbol = :filefuncline,
         recur::Symbol = :off,
         threads::AbstractVector{Int} = 1:Threads.nthreads(),
-        tasks::AbstractVector{Int} = 1:typemax(Int),
+        tasks::AbstractVector{UInt} = 1:typemax(Int),
         header::Bool = true)
     _print(io, data, lidict, ProfileFormat(
             C = C,
@@ -165,7 +165,7 @@ function _print(io::IO,
         header)
 end
 
-function _print(io::IO, data::Vector{<:Unsigned}, lidict::Union{LineInfoDict, LineInfoFlatDict}, fmt::ProfileFormat, format::Symbol, threads::AbstractVector{Int}, tasks::AbstractVector{Int}, header::Bool = true)
+function _print(io::IO, data::Vector{<:Unsigned}, lidict::Union{LineInfoDict, LineInfoFlatDict}, fmt::ProfileFormat, format::Symbol, threads::AbstractVector{Int}, tasks::AbstractVector{UInt}, header::Bool = true)
     cols::Int = Base.displaysize(io)[2]
     data = convert(Vector{UInt64}, data)
     fmt.recur ∈ (:off, :flat, :flatc) || throw(ArgumentError("recur value not recognized"))
@@ -180,7 +180,7 @@ function _print(io::IO, data::Vector{<:Unsigned}, lidict::Union{LineInfoDict, Li
 end
 
 function get_task_ids(data::Vector{<:Unsigned}, tid::Int)
-    taskids = Int[]
+    taskids = UInt[]
     for i in length(data):-1:1
         if data[i] == 0 && data[i - 2] == tid
             push!(taskids, data[i - 1])
@@ -207,7 +207,7 @@ function print(io::IO = stdout, data::Vector{<:Unsigned} = fetch(), lidict::Unio
             taskids = get_task_ids(data, tid)
             printstyled(io, "Thread $tid\n"; bold=true, color=Base.info_color())
             for taskid in taskids
-                printstyled(io, "Task $taskid\n"; bold=true, color=Base.debug_color())
+                printstyled(io, "Task $(Base.repr(taskid))\n"; bold=true, color=Base.debug_color())
                 _print(io, data, lidict; threads = tid:tid, tasks = [taskid], header = false, kwargs...)
                 println(io)
             end
@@ -645,7 +645,7 @@ function tree_format(frames::Vector{<:StackFrameTree}, level::Int, cols::Int, ma
 end
 
 # turn a list of backtraces into a tree (implicitly separated by NULL markers)
-function tree!(root::StackFrameTree{T}, all::Vector{UInt64}, lidict::Union{LineInfoFlatDict, LineInfoDict}, C::Bool, recur::Symbol, threads::AbstractVector{Int}, tasks::AbstractVector{Int}) where {T}
+function tree!(root::StackFrameTree{T}, all::Vector{UInt64}, lidict::Union{LineInfoFlatDict, LineInfoDict}, C::Bool, recur::Symbol, threads::AbstractVector{Int}, tasks::AbstractVector{UInt}) where {T}
     parent = root
     tops = Vector{StackFrameTree{T}}()
     build = Vector{StackFrameTree{T}}()
@@ -841,7 +841,7 @@ function print_tree(io::IO, bt::StackFrameTree{T}, cols::Int, fmt::ProfileFormat
     end
 end
 
-function tree(io::IO, data::Vector{UInt64}, lidict::Union{LineInfoFlatDict, LineInfoDict}, cols::Int, fmt::ProfileFormat, threads::AbstractVector{Int}, tasks::AbstractVector{Int}, header::Bool)
+function tree(io::IO, data::Vector{UInt64}, lidict::Union{LineInfoFlatDict, LineInfoDict}, cols::Int, fmt::ProfileFormat, threads::AbstractVector{Int}, tasks::AbstractVector{UInt}, header::Bool)
     if fmt.combine
         root = tree!(StackFrameTree{StackFrame}(), data, lidict, fmt.C, fmt.recur, threads, tasks)
     else
