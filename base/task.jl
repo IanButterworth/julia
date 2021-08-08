@@ -817,10 +817,15 @@ end
     nothing
 end
 
+const thread_idle = Vector{Bool}(undef,0)
+
 function wait()
     GC.safepoint()
-    W = Workqueues[Threads.threadid()]
+    tid = Threads.threadid()
+    W = Workqueues[tid]
+    !isempty(thread_idle) && (thread_idle[tid] = true)
     poptask(W)
+    !isempty(thread_idle) && (thread_idle[tid] = false)
     result = try_yieldto(ensure_rescheduled)
     process_events()
     # return when we come out of the queue

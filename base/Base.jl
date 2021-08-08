@@ -462,6 +462,7 @@ end
 
 if is_primary_base_module
 function __init__()
+    append!(empty!(thread_idle), trues(Threads.nthreads()))
     # try to ensuremake sure OpenBLAS does not set CPU affinity (#1070, #9639)
     if !haskey(ENV, "OPENBLAS_MAIN_FREE") && !haskey(ENV, "GOTOBLAS_MAIN_FREE")
         ENV["OPENBLAS_MAIN_FREE"] = "1"
