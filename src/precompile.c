@@ -22,7 +22,7 @@ JL_DLLEXPORT int jl_generating_output(void)
 
 static void *jl_precompile(int all);
 
-void jl_write_compiler_output(void)
+JL_DLLEXPORT void jl_write_compiler_output(void)
 {
     if (!jl_generating_output()) {
         return;
@@ -36,7 +36,6 @@ void jl_write_compiler_output(void)
         jl_printf(JL_STDERR, "WARNING: --output requested, but no modules defined during run\n");
         return;
     }
-
     jl_array_t *worklist = jl_module_init_order;
     JL_GC_PUSH1(&worklist);
     jl_module_init_order = jl_alloc_vec_any(0);
@@ -108,6 +107,11 @@ void jl_write_compiler_output(void)
         }
     }
     JL_GC_POP();
+}
+
+JL_DLLEXPORT void jl_options_set_outputo(const char * path)
+{
+    jl_options.outputo = path;
 }
 
 // f{<:Union{...}}(...) is a common pattern

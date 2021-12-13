@@ -44,6 +44,13 @@ extern BOOL (WINAPI *hSymRefreshModuleList)(HANDLE);
 
 // list of modules being deserialized with __init__ methods
 jl_array_t *jl_module_init_order;
+jl_array_t *jl_module_init_order_cache;
+
+JL_DLLEXPORT void jl_restore_module_init_order_cache(void)
+{
+    jl_module_init_order = jl_module_init_order_cache;
+}
+
 
 JL_DLLEXPORT size_t jl_page_size;
 
@@ -771,6 +778,7 @@ static NOINLINE void _finish_julia_init(JL_IMAGE_SEARCH rel, jl_ptls_t ptls, jl_
     if (jl_options.image_file && (!jl_generating_output() || jl_options.incremental) && jl_module_init_order) {
         jl_array_t *init_order = jl_module_init_order;
         JL_GC_PUSH1(&init_order);
+        jl_module_init_order_cache = jl_module_init_order; // used when output is requested later than init
         jl_module_init_order = NULL;
         int i, l = jl_array_len(init_order);
         for (i = 0; i < l; i++) {

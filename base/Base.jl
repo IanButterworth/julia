@@ -391,6 +391,7 @@ include("loading.jl")
 # misc useful functions & macros
 include("timing.jl")
 include("util.jl")
+include("output.jl")
 
 include("asyncmap.jl")
 
