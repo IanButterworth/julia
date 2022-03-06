@@ -70,13 +70,21 @@ end
 
 # parallel loop with parallel atomic addition
 function threaded_loop(a, r, x)
+    e = Base.Event()
+    Timer(0.1) do _
+        notify(e)
+    end
     @threads for i in r
+        # synchronize the start given that each partition is started sequentially,
+        # meaning that without the wait, if the loop is too fast the iteration can happen in order
+        wait(e)
         j = i - firstindex(r) + 1
         a[j] = 1 + atomic_add!(x, 1)
     end
 end
 
 function test_threaded_loop_and_atomic_add()
+    all_in_order = true
     for r in [1:10000, collect(1:10000), Base.IdentityUnitRange(-500:500), (1,2,3,4,5,6,7,8,9,10)]
         n = length(r)
         x = Atomic()
@@ -92,9 +100,13 @@ function test_threaded_loop_and_atomic_add()
         # Next test checks that all loop iterations ran,
         # and were unique (via pigeon-hole principle).
         @test !(false in found)
-        if was_inorder && nthreads() > 1
-            println(stderr, "Warning: threaded loop executed in order")
+        if !was_inorder
+            all_in_order = false
         end
+    end
+    if nthreads() > 1
+        # If multiple threads are available and all executed in order, then something's up
+        @test !all_in_order
     end
 end
 
