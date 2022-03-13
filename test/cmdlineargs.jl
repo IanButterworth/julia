@@ -31,261 +31,261 @@ function format_filename(s)
     return r
 end
 
-let
-    fn = format_filename("a%d %p %i %L %l %u z")
-    hd = withenv("HOME" => nothing) do
-        # get the homedir, as reported by uv_os_get_passwd, as used by jl_format_filename
-        try
-            homedir()
-        catch ex
-            (ex isa Base.IOError && ex.code == Base.UV_ENOENT) || rethrow(ex)
-            ""
-        end
-    end
-    @test startswith(fn, "a$hd ")
-    @test endswith(fn, " z")
-    @test !occursin('%', fn)
-    @test occursin(" $(getpid()) ", fn)
-    @test occursin(" $(Libc.gethostname()) ", fn)
-    @test format_filename("%a%%b") == "a%b"
-end
+# let
+#     fn = format_filename("a%d %p %i %L %l %u z")
+#     hd = withenv("HOME" => nothing) do
+#         # get the homedir, as reported by uv_os_get_passwd, as used by jl_format_filename
+#         try
+#             homedir()
+#         catch ex
+#             (ex isa Base.IOError && ex.code == Base.UV_ENOENT) || rethrow(ex)
+#             ""
+#         end
+#     end
+#     @test startswith(fn, "a$hd ")
+#     @test endswith(fn, " z")
+#     @test !occursin('%', fn)
+#     @test occursin(" $(getpid()) ", fn)
+#     @test occursin(" $(Libc.gethostname()) ", fn)
+#     @test format_filename("%a%%b") == "a%b"
+# end
 
 let exename = `$(Base.julia_cmd()) --startup-file=no --color=no`
-    # tests for handling of ENV errors
-    let v = writereadpipeline("println(\"REPL: \", @which(less), @isdefined(InteractiveUtils))",
-                setenv(`$exename -i -E 'empty!(LOAD_PATH); @isdefined InteractiveUtils'`,
-                    "JULIA_LOAD_PATH" => "",
-                    "JULIA_DEPOT_PATH" => "",
-                    "HOME" => homedir()))
-        @test v[1] == "false\nREPL: InteractiveUtilstrue\n"
-        @test v[2]
-    end
-    let v = writereadpipeline("println(\"REPL: \", InteractiveUtils)",
-                setenv(`$exename -i -e 'const InteractiveUtils = 3'`,
-                    "JULIA_LOAD_PATH" => ";;;:::",
-                    "JULIA_DEPOT_PATH" => ";;;:::",
-                    "HOME" => homedir()))
-        # TODO: ideally, `@which`, etc. would still work, but Julia can't handle `using $InterativeUtils`
-        @test v[1] == "REPL: 3\n"
-        @test v[2]
-    end
-    let v = readchomperrors(`$exename -i -e '
-            empty!(LOAD_PATH)
-            @eval Sys STDLIB=mktempdir()
-            Base.unreference_module(Base.PkgId(Base.UUID(0xb77e0a4c_d291_57a0_90e8_8db25a27a240), "InteractiveUtils"))
-            '`)
-        # simulate not having a working version of InteractiveUtils,
-        # make sure this is a non-fatal error and the REPL still loads
-        @test v[1]
-        @test isempty(v[2])
-        @test startswith(v[3], "┌ Warning: Failed to import InteractiveUtils into module Main\n")
-    end
-    real_threads = string(ccall(:jl_cpu_threads, Int32, ()))
-    for nc in ("0", "-2", "x", "2x", " ", "")
-        v = readchomperrors(setenv(`$exename -i -E 'Sys.CPU_THREADS'`, "JULIA_CPU_THREADS" => nc, "HOME" => homedir()))
-        @test v[1]
-        @test v[2] == real_threads
-        @test v[3] == "WARNING: couldn't parse `JULIA_CPU_THREADS` environment variable. Defaulting Sys.CPU_THREADS to $real_threads."
-    end
-    for nc in ("1", " 1 ", " +1 ", " 0x1 ")
-        v = readchomperrors(setenv(`$exename -i -E 'Sys.CPU_THREADS'`, "JULIA_CPU_THREADS" => nc, "HOME" => homedir()))
-        @test v[1]
-        @test v[2] == "1"
-        @test isempty(v[3])
-    end
+#     # tests for handling of ENV errors
+#     let v = writereadpipeline("println(\"REPL: \", @which(less), @isdefined(InteractiveUtils))",
+#                 setenv(`$exename -i -E 'empty!(LOAD_PATH); @isdefined InteractiveUtils'`,
+#                     "JULIA_LOAD_PATH" => "",
+#                     "JULIA_DEPOT_PATH" => "",
+#                     "HOME" => homedir()))
+#         @test v[1] == "false\nREPL: InteractiveUtilstrue\n"
+#         @test v[2]
+#     end
+#     let v = writereadpipeline("println(\"REPL: \", InteractiveUtils)",
+#                 setenv(`$exename -i -e 'const InteractiveUtils = 3'`,
+#                     "JULIA_LOAD_PATH" => ";;;:::",
+#                     "JULIA_DEPOT_PATH" => ";;;:::",
+#                     "HOME" => homedir()))
+#         # TODO: ideally, `@which`, etc. would still work, but Julia can't handle `using $InterativeUtils`
+#         @test v[1] == "REPL: 3\n"
+#         @test v[2]
+#     end
+#     let v = readchomperrors(`$exename -i -e '
+#             empty!(LOAD_PATH)
+#             @eval Sys STDLIB=mktempdir()
+#             Base.unreference_module(Base.PkgId(Base.UUID(0xb77e0a4c_d291_57a0_90e8_8db25a27a240), "InteractiveUtils"))
+#             '`)
+#         # simulate not having a working version of InteractiveUtils,
+#         # make sure this is a non-fatal error and the REPL still loads
+#         @test v[1]
+#         @test isempty(v[2])
+#         @test startswith(v[3], "┌ Warning: Failed to import InteractiveUtils into module Main\n")
+#     end
+#     real_threads = string(ccall(:jl_cpu_threads, Int32, ()))
+#     for nc in ("0", "-2", "x", "2x", " ", "")
+#         v = readchomperrors(setenv(`$exename -i -E 'Sys.CPU_THREADS'`, "JULIA_CPU_THREADS" => nc, "HOME" => homedir()))
+#         @test v[1]
+#         @test v[2] == real_threads
+#         @test v[3] == "WARNING: couldn't parse `JULIA_CPU_THREADS` environment variable. Defaulting Sys.CPU_THREADS to $real_threads."
+#     end
+#     for nc in ("1", " 1 ", " +1 ", " 0x1 ")
+#         v = readchomperrors(setenv(`$exename -i -E 'Sys.CPU_THREADS'`, "JULIA_CPU_THREADS" => nc, "HOME" => homedir()))
+#         @test v[1]
+#         @test v[2] == "1"
+#         @test isempty(v[3])
+#     end
 
-    let v = readchomperrors(setenv(`$exename -e 0`, "JULIA_LLVM_ARGS" => "-print-options", "HOME" => homedir()))
-        @test v[1]
-        @test contains(v[2], r"print-options + = 1")
-        @test contains(v[2], r"combiner-store-merge-dependence-limit + = 4")
-        @test contains(v[2], r"enable-tail-merge + = 2")
-        @test isempty(v[3])
-    end
-    let v = readchomperrors(setenv(`$exename -e 0`, "JULIA_LLVM_ARGS" => "-print-options -enable-tail-merge=1 -combiner-store-merge-dependence-limit=6", "HOME" => homedir()))
-        @test v[1]
-        @test contains(v[2], r"print-options + = 1")
-        @test contains(v[2], r"combiner-store-merge-dependence-limit + = 6")
-        @test contains(v[2], r"enable-tail-merge + = 1")
-        @test isempty(v[3])
-    end
-    let v = readchomperrors(setenv(`$exename -e 0`, "JULIA_LLVM_ARGS" => "-print-options -enable-tail-merge=1 -enable-tail-merge=1", "HOME" => homedir()))
-        @test !v[1]
-        @test isempty(v[2])
-        @test v[3] == "julia: for the --enable-tail-merge option: may only occur zero or one times!"
-    end
-end
+#     let v = readchomperrors(setenv(`$exename -e 0`, "JULIA_LLVM_ARGS" => "-print-options", "HOME" => homedir()))
+#         @test v[1]
+#         @test contains(v[2], r"print-options + = 1")
+#         @test contains(v[2], r"combiner-store-merge-dependence-limit + = 4")
+#         @test contains(v[2], r"enable-tail-merge + = 2")
+#         @test isempty(v[3])
+#     end
+#     let v = readchomperrors(setenv(`$exename -e 0`, "JULIA_LLVM_ARGS" => "-print-options -enable-tail-merge=1 -combiner-store-merge-dependence-limit=6", "HOME" => homedir()))
+#         @test v[1]
+#         @test contains(v[2], r"print-options + = 1")
+#         @test contains(v[2], r"combiner-store-merge-dependence-limit + = 6")
+#         @test contains(v[2], r"enable-tail-merge + = 1")
+#         @test isempty(v[3])
+#     end
+#     let v = readchomperrors(setenv(`$exename -e 0`, "JULIA_LLVM_ARGS" => "-print-options -enable-tail-merge=1 -enable-tail-merge=1", "HOME" => homedir()))
+#         @test !v[1]
+#         @test isempty(v[2])
+#         @test v[3] == "julia: for the --enable-tail-merge option: may only occur zero or one times!"
+#     end
+# end
 
-let exename = `$(Base.julia_cmd()) --startup-file=no --color=no`
-    # --version
-    let v = split(read(`$exename -v`, String), "julia version ")[end]
-        @test Base.VERSION_STRING == chomp(v)
-    end
-    @test read(`$exename -v`, String) == read(`$exename --version`, String)
+# let exename = `$(Base.julia_cmd()) --startup-file=no --color=no`
+#     # --version
+#     let v = split(read(`$exename -v`, String), "julia version ")[end]
+#         @test Base.VERSION_STRING == chomp(v)
+#     end
+#     @test read(`$exename -v`, String) == read(`$exename --version`, String)
 
-    # --help
-    let header = "\n    julia [switches] -- [programfile] [args...]"
-        @test startswith(read(`$exename -h`, String), header)
-        @test startswith(read(`$exename --help`, String), header)
-    end
+#     # --help
+#     let header = "\n    julia [switches] -- [programfile] [args...]"
+#         @test startswith(read(`$exename -h`, String), header)
+#         @test startswith(read(`$exename --help`, String), header)
+#     end
 
-    # ~ expansion in --project and JULIA_PROJECT
-    if !Sys.iswindows()
-        let expanded = abspath(expanduser("~/foo/Project.toml"))
-            @test expanded == readchomp(`$exename --project='~/foo' -e 'println(Base.active_project())'`)
-            @test expanded == readchomp(setenv(`$exename -e 'println(Base.active_project())'`, "JULIA_PROJECT" => "~/foo", "HOME" => homedir()))
-        end
-    end
+#     # ~ expansion in --project and JULIA_PROJECT
+#     if !Sys.iswindows()
+#         let expanded = abspath(expanduser("~/foo/Project.toml"))
+#             @test expanded == readchomp(`$exename --project='~/foo' -e 'println(Base.active_project())'`)
+#             @test expanded == readchomp(setenv(`$exename -e 'println(Base.active_project())'`, "JULIA_PROJECT" => "~/foo", "HOME" => homedir()))
+#         end
+#     end
 
-    # handling of @projectname in --project and JULIA_PROJECT
-    let expanded = abspath(Base.load_path_expand("@foo"))
-        @test expanded == readchomp(`$exename --project='@foo' -e 'println(Base.active_project())'`)
-        @test expanded == readchomp(addenv(`$exename -e 'println(Base.active_project())'`, "JULIA_PROJECT" => "@foo", "HOME" => homedir()))
-    end
+#     # handling of @projectname in --project and JULIA_PROJECT
+#     let expanded = abspath(Base.load_path_expand("@foo"))
+#         @test expanded == readchomp(`$exename --project='@foo' -e 'println(Base.active_project())'`)
+#         @test expanded == readchomp(addenv(`$exename -e 'println(Base.active_project())'`, "JULIA_PROJECT" => "@foo", "HOME" => homedir()))
+#     end
 
-    # --quiet, --banner
-    let t(q,b) = "Base.JLOptions().quiet == $q && Base.JLOptions().banner == $b"
-        @test success(`$exename                 -e $(t(0, -1))`)
-        @test success(`$exename -q              -e $(t(1,  0))`)
-        @test success(`$exename --quiet         -e $(t(1,  0))`)
-        @test success(`$exename --banner=no     -e $(t(0,  0))`)
-        @test success(`$exename --banner=yes    -e $(t(0,  1))`)
-        @test success(`$exename -q --banner=no  -e $(t(1,  0))`)
-        @test success(`$exename -q --banner=yes -e $(t(1,  1))`)
-        @test success(`$exename --banner=no  -q -e $(t(1,  0))`)
-        @test success(`$exename --banner=yes -q -e $(t(1,  1))`)
-    end
+#     # --quiet, --banner
+#     let t(q,b) = "Base.JLOptions().quiet == $q && Base.JLOptions().banner == $b"
+#         @test success(`$exename                 -e $(t(0, -1))`)
+#         @test success(`$exename -q              -e $(t(1,  0))`)
+#         @test success(`$exename --quiet         -e $(t(1,  0))`)
+#         @test success(`$exename --banner=no     -e $(t(0,  0))`)
+#         @test success(`$exename --banner=yes    -e $(t(0,  1))`)
+#         @test success(`$exename -q --banner=no  -e $(t(1,  0))`)
+#         @test success(`$exename -q --banner=yes -e $(t(1,  1))`)
+#         @test success(`$exename --banner=no  -q -e $(t(1,  0))`)
+#         @test success(`$exename --banner=yes -q -e $(t(1,  1))`)
+#     end
 
-    # --home
-    @test success(`$exename -H $(Sys.BINDIR)`)
-    @test success(`$exename --home=$(Sys.BINDIR)`)
+#     # --home
+#     @test success(`$exename -H $(Sys.BINDIR)`)
+#     @test success(`$exename --home=$(Sys.BINDIR)`)
 
-    # --eval
-    @test  success(`$exename -e "exit(0)"`)
-    @test !success(`$exename -e "exit(1)"`)
-    @test  success(`$exename --eval="exit(0)"`)
-    @test !success(`$exename --eval="exit(1)"`)
-    @test !success(`$exename -e`)
-    @test !success(`$exename --eval`)
-    # --eval --interactive (replaced --post-boot)
-    @test  success(`$exename -i -e "exit(0)"`)
-    @test !success(`$exename -i -e "exit(1)"`)
-    # issue #34924
-    @test  success(`$exename -e 'const LOAD_PATH=1'`)
+#     # --eval
+#     @test  success(`$exename -e "exit(0)"`)
+#     @test !success(`$exename -e "exit(1)"`)
+#     @test  success(`$exename --eval="exit(0)"`)
+#     @test !success(`$exename --eval="exit(1)"`)
+#     @test !success(`$exename -e`)
+#     @test !success(`$exename --eval`)
+#     # --eval --interactive (replaced --post-boot)
+#     @test  success(`$exename -i -e "exit(0)"`)
+#     @test !success(`$exename -i -e "exit(1)"`)
+#     # issue #34924
+#     @test  success(`$exename -e 'const LOAD_PATH=1'`)
 
-    # --print
-    @test read(`$exename -E "1+1"`, String) == "2\n"
-    @test read(`$exename --print="1+1"`, String) == "2\n"
-    @test !success(`$exename -E`)
-    @test !success(`$exename --print`)
+#     # --print
+#     @test read(`$exename -E "1+1"`, String) == "2\n"
+#     @test read(`$exename --print="1+1"`, String) == "2\n"
+#     @test !success(`$exename -E`)
+#     @test !success(`$exename --print`)
 
-    # --load
-    let testfile = tempname()
-        try
-            write(testfile, "testvar = :test\nprintln(\"loaded\")\n")
-            @test read(`$exename -i --load=$testfile -e "println(testvar)"`, String) == "loaded\ntest\n"
-            @test read(`$exename -i -L $testfile -e "println(testvar)"`, String) == "loaded\ntest\n"
-            # multiple, combined
-            @test read(```$exename
-                -e 'push!(ARGS, "hi")'
-                -E "1+1"
-                -E "2+2"
-                -L $testfile
-                -E '3+3'
-                -L $testfile
-                -E 'pop!(ARGS)'
-                -e 'show(ARGS); println()'
-                9 10
-                ```, String) == """
-                2
-                4
-                loaded
-                6
-                loaded
-                "hi"
-                ["9", "10"]
-                """
-        finally
-            rm(testfile)
-        end
-    end
-    # -L, --load requires an argument
-    @test !success(`$exename -L`)
-    @test !success(`$exename --load`)
+#     # --load
+#     let testfile = tempname()
+#         try
+#             write(testfile, "testvar = :test\nprintln(\"loaded\")\n")
+#             @test read(`$exename -i --load=$testfile -e "println(testvar)"`, String) == "loaded\ntest\n"
+#             @test read(`$exename -i -L $testfile -e "println(testvar)"`, String) == "loaded\ntest\n"
+#             # multiple, combined
+#             @test read(```$exename
+#                 -e 'push!(ARGS, "hi")'
+#                 -E "1+1"
+#                 -E "2+2"
+#                 -L $testfile
+#                 -E '3+3'
+#                 -L $testfile
+#                 -E 'pop!(ARGS)'
+#                 -e 'show(ARGS); println()'
+#                 9 10
+#                 ```, String) == """
+#                 2
+#                 4
+#                 loaded
+#                 6
+#                 loaded
+#                 "hi"
+#                 ["9", "10"]
+#                 """
+#         finally
+#             rm(testfile)
+#         end
+#     end
+#     # -L, --load requires an argument
+#     @test !success(`$exename -L`)
+#     @test !success(`$exename --load`)
 
-    # --cpu-target (requires LLVM enabled)
-    @test !success(`$exename -C invalidtarget`)
-    @test !success(`$exename --cpu-target=invalidtarget`)
+#     # --cpu-target (requires LLVM enabled)
+#     @test !success(`$exename -C invalidtarget`)
+#     @test !success(`$exename --cpu-target=invalidtarget`)
 
-    # -t, --threads
-    code = "print(Threads.nthreads())"
-    cpu_threads = ccall(:jl_cpu_threads, Int32, ())
-    @test string(cpu_threads) ==
-          read(`$exename --threads auto -e $code`, String) ==
-          read(`$exename --threads=auto -e $code`, String) ==
-          read(`$exename -tauto -e $code`, String) ==
-          read(`$exename -t auto -e $code`, String)
-    for nt in (nothing, "1")
-        withenv("JULIA_NUM_THREADS" => nt) do
-            @test read(`$exename --threads=2 -e $code`, String) ==
-                  read(`$exename -t 2 -e $code`, String) == "2"
-        end
-    end
-    # We want to test oversubscription, but on manycore machines, this can
-    # actually exhaust limited PID spaces
-    cpu_threads = max(2*cpu_threads, min(50, 10*cpu_threads))
-    if Sys.WORD_SIZE == 32
-        cpu_threads = min(cpu_threads, 50)
-    end
-    @test read(`$exename -t $cpu_threads -e $code`, String) == string(cpu_threads)
-    withenv("JULIA_NUM_THREADS" => string(cpu_threads)) do
-        @test read(`$exename -e $code`, String) == string(cpu_threads)
-    end
-    @test !success(`$exename -t 0`)
-    @test !success(`$exename -t -1`)
+#     # -t, --threads
+#     code = "print(Threads.nthreads())"
+#     cpu_threads = ccall(:jl_cpu_threads, Int32, ())
+#     @test string(cpu_threads) ==
+#           read(`$exename --threads auto -e $code`, String) ==
+#           read(`$exename --threads=auto -e $code`, String) ==
+#           read(`$exename -tauto -e $code`, String) ==
+#           read(`$exename -t auto -e $code`, String)
+#     for nt in (nothing, "1")
+#         withenv("JULIA_NUM_THREADS" => nt) do
+#             @test read(`$exename --threads=2 -e $code`, String) ==
+#                   read(`$exename -t 2 -e $code`, String) == "2"
+#         end
+#     end
+#     # We want to test oversubscription, but on manycore machines, this can
+#     # actually exhaust limited PID spaces
+#     cpu_threads = max(2*cpu_threads, min(50, 10*cpu_threads))
+#     if Sys.WORD_SIZE == 32
+#         cpu_threads = min(cpu_threads, 50)
+#     end
+#     @test read(`$exename -t $cpu_threads -e $code`, String) == string(cpu_threads)
+#     withenv("JULIA_NUM_THREADS" => string(cpu_threads)) do
+#         @test read(`$exename -e $code`, String) == string(cpu_threads)
+#     end
+#     @test !success(`$exename -t 0`)
+#     @test !success(`$exename -t -1`)
 
-    # Combining --threads and --procs: --threads does propagate
-    withenv("JULIA_NUM_THREADS" => nothing) do
-        code = "print(sum(remotecall_fetch(Threads.nthreads, x) for x in procs()))"
-        @test read(`$exename -p2 -t2 -e $code`, String) == "6"
-    end
+#     # Combining --threads and --procs: --threads does propagate
+#     withenv("JULIA_NUM_THREADS" => nothing) do
+#         code = "print(sum(remotecall_fetch(Threads.nthreads, x) for x in procs()))"
+#         @test read(`$exename -p2 -t2 -e $code`, String) == "6"
+#     end
 
-    # --procs
-    @test readchomp(`$exename -q -p 2 -e "println(nworkers())"`) == "2"
-    @test !success(`$exename -p 0`)
-    let p = run(`$exename --procs=1.0`, wait=false)
-        wait(p)
-        @test p.exitcode == 1 && p.termsignal == 0
-    end
+#     # --procs
+#     @test readchomp(`$exename -q -p 2 -e "println(nworkers())"`) == "2"
+#     @test !success(`$exename -p 0`)
+#     let p = run(`$exename --procs=1.0`, wait=false)
+#         wait(p)
+#         @test p.exitcode == 1 && p.termsignal == 0
+#     end
 
-    # --machine-file
-    # this does not check that machine file works,
-    # only that the filename gets correctly passed to the option struct
-    let fname = tempname()
-        touch(fname)
-        fname = realpath(fname)
-        try
-            @test readchomp(`$exename --machine-file $fname -e
-                "println(unsafe_string(Base.JLOptions().machine_file))"`) == fname
-        finally
-            rm(fname)
-        end
-    end
+#     # --machine-file
+#     # this does not check that machine file works,
+#     # only that the filename gets correctly passed to the option struct
+#     let fname = tempname()
+#         touch(fname)
+#         fname = realpath(fname)
+#         try
+#             @test readchomp(`$exename --machine-file $fname -e
+#                 "println(unsafe_string(Base.JLOptions().machine_file))"`) == fname
+#         finally
+#             rm(fname)
+#         end
+#     end
 
-    # -i, isinteractive
-    @test readchomp(`$exename -E "isinteractive()"`) == "false"
-    @test readchomp(`$exename -E "isinteractive()" -i`) == "true"
+#     # -i, isinteractive
+#     @test readchomp(`$exename -E "isinteractive()"`) == "false"
+#     @test readchomp(`$exename -E "isinteractive()" -i`) == "true"
 
-    # --color
-    @test readchomp(`$exename --color=yes -E "Base.have_color"`) == "true"
-    @test readchomp(`$exename --color=no -E "Base.have_color"`) == "false"
-    @test !success(`$exename --color=false`)
+#     # --color
+#     @test readchomp(`$exename --color=yes -E "Base.have_color"`) == "true"
+#     @test readchomp(`$exename --color=no -E "Base.have_color"`) == "false"
+#     @test !success(`$exename --color=false`)
 
-    # --history-file
-    @test readchomp(`$exename -E "Bool(Base.JLOptions().historyfile)"
-        --history-file=yes`) == "true"
-    @test readchomp(`$exename -E "Bool(Base.JLOptions().historyfile)"
-        --history-file=no`) == "false"
-    @test !success(`$exename --history-file=false`)
+#     # --history-file
+#     @test readchomp(`$exename -E "Bool(Base.JLOptions().historyfile)"
+#         --history-file=yes`) == "true"
+#     @test readchomp(`$exename -E "Bool(Base.JLOptions().historyfile)"
+#         --history-file=no`) == "false"
+#     @test !success(`$exename --history-file=false`)
 
     # --code-coverage
     mktempdir() do dir
@@ -296,70 +296,78 @@ let exename = `$(Base.julia_cmd()) --startup-file=no --color=no`
         expected_good = replace(read(joinpath(helperdir, "coverage_file.info"), String),
             "<FILENAME>" => realpath(inputfile))
         covfile = replace(joinpath(dir, "coverage.info"), "%" => "%%")
-        @test !isfile(covfile)
-        defaultcov = readchomp(`$exename -E "Base.JLOptions().code_coverage != 0" -L $inputfile`)
-        opts = Base.JLOptions()
-        coverage_file = (opts.output_code_coverage != C_NULL) ?  unsafe_string(opts.output_code_coverage) : ""
-        @test !isfile(covfile)
-        @test defaultcov == string(opts.code_coverage != 0 && (isempty(coverage_file) || occursin("%p", coverage_file)))
-        @test readchomp(`$exename -E "Base.JLOptions().code_coverage" -L $inputfile
-            --code-coverage=$covfile --code-coverage=none`) == "0"
-        @test !isfile(covfile)
-        @test readchomp(`$exename -E "Base.JLOptions().code_coverage" -L $inputfile
-            --code-coverage=$covfile --code-coverage`) == "1"
+        # @test !isfile(covfile)
+        # defaultcov = readchomp(`$exename -E "Base.JLOptions().code_coverage != 0" -L $inputfile`)
+        # opts = Base.JLOptions()
+        # coverage_file = (opts.output_code_coverage != C_NULL) ?  unsafe_string(opts.output_code_coverage) : ""
+        # @test !isfile(covfile)
+        # @test defaultcov == string(opts.code_coverage != 0 && (isempty(coverage_file) || occursin("%p", coverage_file)))
+        # @test readchomp(`$exename -E "Base.JLOptions().code_coverage" -L $inputfile
+        #     --code-coverage=$covfile --code-coverage=none`) == "0"
+        # @test !isfile(covfile)
+        # @test readchomp(`$exename -E "Base.JLOptions().code_coverage" -L $inputfile
+        #     --code-coverage=$covfile --code-coverage`) == "1"
+        # @test isfile(covfile)
+        # got = read(covfile, String)
+        # rm(covfile)
+        # @test occursin(expected, got) || (expected, got)
+        # @test_broken occursin(expected_good, got)
+        @info "================ user ================"
+        readchomp(`$exename -L $inputfile
+            --code-coverage=$covfile --code-coverage=user`)
         @test isfile(covfile)
         got = read(covfile, String)
         rm(covfile)
         @test occursin(expected, got) || (expected, got)
         @test_broken occursin(expected_good, got)
-        @test readchomp(`$exename -E "Base.JLOptions().code_coverage" -L $inputfile
-            --code-coverage=$covfile --code-coverage=user`) == "1"
-        @test isfile(covfile)
-        got = read(covfile, String)
-        rm(covfile)
-        @test occursin(expected, got) || (expected, got)
-        @test_broken occursin(expected_good, got)
-        @test readchomp(`$exename -E "Base.JLOptions().code_coverage" -L $inputfile
-            --code-coverage=$covfile --code-coverage=all`) == "2"
-        @test isfile(covfile)
-        got = read(covfile, String)
-        rm(covfile)
-        @test occursin(expected, got) || (expected, got)
-        @test_broken occursin(expected_good, got)
+        # @test readchomp(`$exename -E "Base.JLOptions().code_coverage" -L $inputfile
+        #     --code-coverage=$covfile --code-coverage=all`) == "2"
+        # @test isfile(covfile)
+        # got = read(covfile, String)
+        # rm(covfile)
+        # @test occursin(expected, got) || (expected, got)
+        # @test_broken occursin(expected_good, got)
 
         # Ask for coverage in specific file
         # TODO: Figure out why asking for a specific file/dir means some lines are under-counted
         # NOTE that a different expected reference is loaded here
-        expected = replace(read(joinpath(helperdir, "coverage_file.info.bad2"), String),
-            "<FILENAME>" => realpath(inputfile))
+        # expected = replace(read(joinpath(helperdir, "coverage_file.info.bad2"), String),
+        #     "<FILENAME>" => realpath(inputfile))
         tfile = realpath(inputfile)
-        @test readchomp(`$exename -E "(Base.JLOptions().code_coverage, unsafe_string(Base.JLOptions().tracked_path))" -L $inputfile
-            --code-coverage=$covfile --code-coverage=@$tfile`) == "(3, $(repr(tfile)))"
+        @info "================ dir ================"
+        readchomp(`$exename -L $inputfile
+            --code-coverage=$covfile --code-coverage=@$tfile`)
         @test isfile(covfile)
         got = read(covfile, String)
         rm(covfile)
+        # @info "expected"
+        # println(expected)
+        # @info "got"
+        # println(got)
         @test occursin(expected, got) || (expected, got)
         @test_broken occursin(expected_good, got)
 
-        # Ask for coverage in directory
-        tdir = dirname(realpath(inputfile))
-        @test readchomp(`$exename -E "(Base.JLOptions().code_coverage, unsafe_string(Base.JLOptions().tracked_path))" -L $inputfile
-            --code-coverage=$covfile --code-coverage=@$tdir`) == "(3, $(repr(tdir)))"
-        @test isfile(covfile)
-        got = read(covfile, String)
-        rm(covfile)
-        @test occursin(expected, got) || (expected, got)
-        @test_broken occursin(expected_good, got)
+        # # Ask for coverage in directory
+        # tdir = dirname(realpath(inputfile))
+        # println(readchomp(`$exename -L $inputfile
+        #     --code-coverage=$covfile --code-coverage=@$tdir`))
+        # @test isfile(covfile)
+        # got = read(covfile, String)
+        # rm(covfile)
+        # @test occursin(expected, got) || (expected, got)
+        # @test_broken occursin(expected_good, got)
 
-        # Ask for coverage in a different directory
-        tdir = mktempdir() # a dir that contains no code
-        @test readchomp(`$exename -E "(Base.JLOptions().code_coverage, unsafe_string(Base.JLOptions().tracked_path))" -L $inputfile
-            --code-coverage=$covfile --code-coverage=@$tdir`) == "(3, $(repr(tdir)))"
-        @test isfile(covfile)
-        got = read(covfile, String)
-        @test isempty(got)
-        rm(covfile)
+        # # Ask for coverage in a different directory
+        # tdir = mktempdir() # a dir that contains no code
+        # readchomp(`$exename -E "(Base.JLOptions().code_coverage, unsafe_string(Base.JLOptions().tracked_path))" -L $inputfile
+        #     --code-coverage=$covfile --code-coverage=@$tdir`) == "(3, $(repr(tdir)))"
+        # @test isfile(covfile)
+        # got = read(covfile, String)
+        # @test isempty(got)
+        # rm(covfile)
     end
+
+    error()
 
     # --track-allocation
     @test readchomp(`$exename -E "Base.JLOptions().malloc_log != 0"`) == "false"

@@ -2046,7 +2046,10 @@ static void coverageVisitLine(jl_codectx_t &ctx, StringRef filename, int line)
 {
     assert(!imaging_mode);
     if (filename == "" || filename == "none" || filename == "no file" || filename == "<missing>" || line < 0)
+    {
+        jl_printf(JL_STDERR, "SKIPPED %s:%d\n", filename.str().c_str(), line);
         return;
+    }
     visitLine(ctx, jl_coverage_data_pointer(filename, line), ConstantInt::get(getInt64Ty(ctx.builder.getContext()), 1), "lcnt");
 }
 
@@ -7155,8 +7158,12 @@ static std::pair<std::unique_ptr<Module>, jl_llvm_functions_t>
             if (newdbg != current_lineinfo[dbg]) {
                 current_lineinfo[dbg] = newdbg;
                 const auto &info = linetable.at(newdbg);
-                if (do_coverage(info.is_user_code, info.is_tracked))
+                if (do_coverage(info.is_user_code, info.is_tracked)) {
+                    jl_printf((JL_STREAM*)STDERR_FILENO, "VISITED2 %s:%ld %d %d\n", info.file.str().c_str(), info.line, info.is_tracked, in_tracked_path(info.file));
                     coverageVisitLine(ctx, info.file, info.line);
+                }
+                else if (info.file.endswith("coverage_file.jl"))
+                    jl_printf((JL_STREAM*)STDERR_FILENO, "SKIPPED %s:%ld %d %d\n", info.file.str().c_str(), info.line, info.is_tracked, in_tracked_path(info.file));
             }
         }
         new_lineinfo.clear();
@@ -7174,8 +7181,12 @@ static std::pair<std::unique_ptr<Module>, jl_llvm_functions_t>
     if (coverage_mode != JL_LOG_NONE) {
         // record all lines that could be covered
         for (const auto &info : linetable)
-            if (do_coverage(info.is_user_code, info.is_tracked))
-                jl_coverage_alloc_line(info.file, info.line);
+            if (do_coverage(info.is_user_code, info.is_tracked)) {
+                    jl_printf((JL_STREAM*)STDERR_FILENO, "VISITED3 %s:%ld %d %d\n", info.file.str().c_str(), info.line, info.is_tracked, in_tracked_path(info.file));
+                    jl_coverage_alloc_line(info.file, info.line);
+            }
+            else if (info.file.endswith("coverage_file.jl"))
+                jl_printf((JL_STREAM*)STDERR_FILENO, "SKIPPED %s:%ld %d %d\n", info.file.str().c_str(), info.line, info.is_tracked, in_tracked_path(info.file));
     }
 
     come_from_bb[0] = ctx.builder.GetInsertBlock();
@@ -7237,8 +7248,12 @@ static std::pair<std::unique_ptr<Module>, jl_llvm_functions_t>
             if (topinfo == linetable.at(1))
                 current_lineinfo.push_back(1);
         }
-        if (do_coverage(topinfo.is_user_code, topinfo.is_tracked))
+        if (do_coverage(topinfo.is_user_code, topinfo.is_tracked)) {
+            jl_printf((JL_STREAM*)STDERR_FILENO, "VISITED1 %s:%ld %d %d\n", topinfo.file.str().c_str(), topinfo.line, topinfo.is_tracked, in_tracked_path(topinfo.file));
             coverageVisitLine(ctx, topinfo.file, topinfo.line);
+        }
+        else if (topinfo.file.endswith("coverage_file.jl"))
+            jl_printf((JL_STREAM*)STDERR_FILENO, "SKIPPED %s:%ld %d %d\n", topinfo.file.str().c_str(), topinfo.line, topinfo.is_tracked, in_tracked_path(topinfo.file));
     }
 
     find_next_stmt(0);
