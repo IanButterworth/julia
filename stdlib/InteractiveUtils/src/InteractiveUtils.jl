@@ -14,6 +14,7 @@ using Base: unwrap_unionall, rewrap_unionall, isdeprecated, Bottom, show_unquote
     to_tuple_type, signature_type, format_bytes
 
 using Markdown
+using UUIDs: UUID
 
 include("editless.jl")
 include("codeview.jl")
@@ -142,6 +143,12 @@ function versioninfo(io::IO=stdout; verbose::Bool=false)
     println(io, "  LIBM: ",Base.libm_name)
     println(io, "  LLVM: libLLVM-",Base.libllvm_version," (", Sys.JIT, ", ", Sys.CPU_NAME, ")")
     println(io, "  Threads: ", Threads.nthreads(), " on ", Sys.CPU_THREADS, " virtual cores")
+
+    _nprocs = Base.require(Base.PkgId(UUID("8ba89e20-285c-5b6f-9357-94700520ee1b"), "Distributed")).nprocs()
+    if isdefined(Main, :Distributed) || _nprocs > 1
+        println(io, "Distributed:")
+        println(io, "  Processes: $(_nprocs)")
+    end
 
     function is_nonverbose_env(k::String)
         return occursin(r"^JULIA_|^DYLD_|^LD_", k)
