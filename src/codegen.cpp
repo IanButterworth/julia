@@ -6868,7 +6868,11 @@ static jl_llvm_functions_t
 
     // add the optimization level specified for this module, if any
     int optlevel = jl_get_module_optlevel(ctx.module);
-    if (optlevel >= 0 && optlevel <= 3) {
+    if (strcmp(unadorned_name, "__init__") == 0) {
+        // minimally optimise __init__ given they're run only once
+        f->addFnAttr("julia-optimization-level", "0");
+    }
+    else if (optlevel >= 0 && optlevel <= 3) {
         static const char* const optLevelStrings[] = { "0", "1", "2", "3" };
         FnAttrs.addAttribute("julia-optimization-level", optLevelStrings[optlevel]);
     }
