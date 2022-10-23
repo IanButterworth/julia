@@ -24,6 +24,7 @@ end
 struct ModuleCompletion <: Completion
     parent::Module
     mod::String
+    exported::Bool
 end
 
 struct PackageCompletion <: Completion
@@ -95,10 +96,18 @@ function Base.getproperty(c::Completion, name::Symbol)
     return getfield(c, name)
 end
 
+const iscolor = Ref(false)
+
 _completion_text(c::TextCompletion) = c.text
 _completion_text(c::KeywordCompletion) = c.keyword
 _completion_text(c::PathCompletion) = c.path
-_completion_text(c::ModuleCompletion) = c.mod
+function _completion_text(c::ModuleCompletion)
+    if iscolor[]
+        c.exported ? c.mod : string("​", Base.private_color(), c.mod, Base.color_normal)
+    else
+        c.exported ? c.mod : "​"*c.mod # there's a zero-width space in the quotes
+    end
+end
 _completion_text(c::PackageCompletion) = c.package
 _completion_text(c::PropertyCompletion) = string(c.property)
 _completion_text(c::FieldCompletion) = string(c.field)
@@ -134,7 +143,7 @@ function filtered_mod_names(ffunc::Function, mod::Module, name::AbstractString, 
     appendmacro!(syms, macros, "_str", "\"")
     appendmacro!(syms, macros, "_cmd", "`")
     filter!(x->completes_global(x, name), syms)
-    return [ModuleCompletion(mod, sym) for sym in syms]
+    return [ModuleCompletion(mod, sym, Base.isexported(mod, Symbol(sym))) for sym in syms]
 end
 
 # REPL Symbol Completions

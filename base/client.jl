@@ -10,6 +10,7 @@ const default_color_info = :cyan
 const default_color_debug = :blue
 const default_color_input = :normal
 const default_color_answer = :normal
+const default_color_private = :light_black
 const color_normal = text_colors[:normal]
 
 function repl_color(key, default)
@@ -26,6 +27,7 @@ debug_color()  = repl_color("JULIA_DEBUG_COLOR" , default_color_debug)
 
 input_color()  = text_colors[repl_color("JULIA_INPUT_COLOR", default_color_input)]
 answer_color() = text_colors[repl_color("JULIA_ANSWER_COLOR", default_color_answer)]
+private_color() = text_colors[repl_color("JULIA_PRIVATE_COLOR", default_color_private)]
 
 stackframe_lineinfo_color() = repl_color("JULIA_STACKFRAME_LINEINFO_COLOR", :bold)
 stackframe_function_color() = repl_color("JULIA_STACKFRAME_FUNCTION_COLOR", :bold)
@@ -405,6 +407,7 @@ function run_main_repl(interactive::Bool, quiet::Bool, banner::Bool, history_fil
         invokelatest(REPL_MODULE_REF[]) do REPL
             term_env = get(ENV, "TERM", @static Sys.iswindows() ? "" : "dumb")
             term = REPL.Terminals.TTYTerminal(term_env, stdin, stdout, stderr)
+            REPL.REPLCompletions.iscolor[] = get(stdout, :color, false)::Bool
             banner && Base.banner(term)
             if term.term_type == "dumb"
                 repl = REPL.BasicREPL(term)
