@@ -388,47 +388,57 @@ generate_precompile_statements() = try # Make sure `ansi_enablecursor` is printe
             close(output_copy)
             close(ptm)
         end
-        # wait for the definitive prompt before start writing to the TTY
-        readuntil(output_copy, JULIA_PROMPT)
-        sleep(0.1)
-        readavailable(output_copy)
-        # Input our script
-        if have_repl
-            precompile_lines = split(repl_script::String, '\n'; keepempty=false)
-            curr = 0
-            for l in precompile_lines
-                sleep(0.1)
-                curr += 1
-                print_state("repl" => "$curr/$(length(precompile_lines))")
-                # consume any other output
-                bytesavailable(output_copy) > 0 && readavailable(output_copy)
-                # push our input
-                write(debug_output, "\n#### inputting statement: ####\n$(repr(l))\n####\n")
-                write(ptm, l, "\n")
-                readuntil(output_copy, "\n")
-                # wait for the next prompt-like to appear
-                readuntil(output_copy, "\n")
-                strbuf = ""
-                while !eof(output_copy)
-                    strbuf *= String(readavailable(output_copy))
-                    occursin(JULIA_PROMPT, strbuf) && break
-                    occursin(PKG_PROMPT, strbuf) && break
-                    occursin(SHELL_PROMPT, strbuf) && break
-                    occursin(HELP_PROMPT, strbuf) && break
+        repl_inputter = @async begin
+            # wait for the definitive prompt before start writing to the TTY
+            readuntil(output_copy, JULIA_PROMPT)
+            sleep(0.1)
+            readavailable(output_copy)
+            # Input our script
+            if have_repl
+                precompile_lines = split(repl_script::String, '\n'; keepempty=false)
+                curr = 0
+                for l in precompile_lines
                     sleep(0.1)
+                    curr += 1
+                    print_state("repl" => "$curr/$(length(precompile_lines))")
+                    # consume any other output
+                    bytesavailable(output_copy) > 0 && readavailable(output_copy)
+                    # push our input
+                    write(debug_output, "\n#### inputting statement: ####\n$(repr(l))\n####\n")
+                    write(ptm, l, "\n")
+                    readuntil(output_copy, "\n")
+                    # wait for the next prompt-like to appear
+                    readuntil(output_copy, "\n")
+                    strbuf = ""
+                    while !eof(output_copy)
+                        strbuf *= String(readavailable(output_copy))
+                        occursin(JULIA_PROMPT, strbuf) && break
+                        occursin(PKG_PROMPT, strbuf) && break
+                        occursin(SHELL_PROMPT, strbuf) && break
+                        occursin(HELP_PROMPT, strbuf) && break
+                        sleep(0.1)
+                    end
                 end
             end
+            write(ptm, "exit()\n")
+            wait(tee)
+            success(p) || Base.pipeline_error(p)
+            close(ptm)
+            write(debug_output, "\n#### FINISHED ####\n")
         end
-        write(ptm, "exit()\n")
-        wait(tee)
-        success(p) || Base.pipeline_error(p)
-        close(ptm)
-        write(debug_output, "\n#### FINISHED ####\n")
-
         n_step2 = 0
-        for statement in split(read(precompile_file, String), '\n')
-            push!(statements_step2, statement)
-            n_step2 += 1
+        open(precompile_file, "r") do io
+            while true
+                eof(io) && istaskdone(repl_inputter) && break
+                if bytesavailable(io) == 0
+                    sleep(0.1)
+                    continue
+                end
+                statement = readline(io) # this blocks so we can't wait on it
+                isempty(statement) && continue
+                push!(statements_step2, statement)
+                n_step2 += 1
+            end
         end
         close(statements_step2)
         print_state("step2" => "F$n_step2")
