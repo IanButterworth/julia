@@ -1,4 +1,4 @@
-PKG_BRANCH = master
-PKG_SHA1 = 3c073aa253fa4dda70f2d4433989652c8b69e171
+PKG_BRANCH = ib/llvm_unrestrict
+PKG_SHA1 = 461bd56ffcdc1b62699ec8afd74cba12d86bfc38
 PKG_GIT_URL := https://github.com/JuliaLang/Pkg.jl.git
 PKG_TAR_URL = https://api.github.com/repos/JuliaLang/Pkg.jl/tarball/$1
