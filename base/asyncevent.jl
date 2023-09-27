@@ -100,6 +100,10 @@ mutable struct Timer
         loop = eventloop()
 
         this = new(Libc.malloc(_sizeof_uv_timer), ThreadSynchronizer(), true, false)
+
+        if generating_output() && haskey(ENV, "TIMER_DEBUG")
+            println("Timer($timeout; interval = $interval) [handle $(this.handle)] $(stacktrace())")
+        end
         associate_julia_struct(this.handle, this)
         iolock_begin()
         err = ccall(:uv_timer_init, Cint, (Ptr{Cvoid}, Ptr{Cvoid}), loop, this)
