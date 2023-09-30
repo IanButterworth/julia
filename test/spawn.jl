@@ -24,12 +24,15 @@ havebb = false
 function _tryonce_download_from_cache(desired_url::AbstractString)
     cache_url = "https://cache.julialang.org/foo/$(desired_url)"
     cache_output_filename = joinpath(mktempdir(), "myfile")
-    cache_response = Downloads.request(
+    t = @elapsed cache_response = Downloads.request(
         cache_url;
         output = cache_output_filename,
         throw = false,
         timeout = 60,
     )
+    if occursin("busybox.exe", desired_url)
+        @info "busybox.exe" desired_url cache_url cache_response t
+    end
     if cache_response isa Downloads.Response
         if Downloads.status_ok(cache_response.proto, cache_response.status)
             return cache_output_filename
