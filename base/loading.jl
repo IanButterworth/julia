@@ -1537,7 +1537,9 @@ end
 @constprop :none function _require_search_from_serialized(pkg::PkgId, sourcepath::String, build_id::UInt128)
     assert_havelock(require_lock)
     paths = find_all_in_cache_path(pkg)
+    @debug "find_all_in_cache_path($pkg)" paths
     for path_to_try in paths::Vector{String}
+        @debug "Trying path_to_try"
         staledeps = stale_cachefile(pkg, build_id, sourcepath, path_to_try)
         if staledeps === true
             continue
@@ -3015,6 +3017,7 @@ end
         end
         modules, (includes, requires), required_modules, srctextpos, prefs, prefs_hash, clone_targets, flags = parse_cache_header(io)
         if isempty(modules)
+            @debug "Rejecting cache file $cachefile due to it not containing any modules"
             return true # ignore empty file
         end
         if ccall(:jl_match_cache_flags, UInt8, (UInt8,), flags) == 0
