@@ -269,6 +269,9 @@ function do_string_escape(s)
     return escape_string(s, ('\"','$'))
 end
 
+const readdir_cache = Dict{String,Vector{String}}()
+readdir_cached(dir=pwd()) = get!(readdir_cache, dir, readdir(dir))
+
 function complete_path(path::AbstractString;
                        use_envpath=false,
                        shell_escape=false,
@@ -287,9 +290,9 @@ function complete_path(path::AbstractString;
     end
     files = try
         if isempty(dir)
-            readdir()
+            readdir_cached()
         elseif isdir(dir)
-            readdir(dir)
+            readdir_cached(dir)
         else
             return Completion[], dir, false
         end
@@ -327,7 +330,7 @@ function complete_path(path::AbstractString;
             end
 
             filesinpath = try
-                readdir(pathdir)
+                readdir_cached(pathdir)
             catch e
                 # Bash allows dirs in PATH that can't be read, so we should as well.
                 if isa(e, Base.IOError) || isa(e, Base.ArgumentError)
@@ -1291,7 +1294,7 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
                     append!(suggestions, project_deps_get_completion_candidates(s, dir))
                 end
                 isdir(dir) || continue
-                for pname in readdir(dir)
+                for pname in readdir_cached(dir)
                     if pname[1] != '.' && pname != "METADATA" &&
                         pname != "REQUIRE" && startswith(pname, s)
                         # Valid file paths are
@@ -1327,6 +1330,7 @@ function completions(string::String, pos::Int, context_module::Module=Main, shif
 end
 
 function shell_completions(string, pos)
+    empty!(readdir_cache)
     # First parse everything up to the current position
     scs = string[1:pos]
     args, last_arg_start = try
