@@ -81,15 +81,7 @@ function runtests(name, path, isolate=true; seed=nothing)
         end
         rss = Sys.maxrss()
         #res_and_time_data[1] is the testset
-        ts = res_and_time_data[1]
-        passes, fails, errors, broken, c_passes, c_fails, c_errors, c_broken = Test.get_test_counts(ts)
-        # simplify our stored data to just contain the counts
-        res_and_time_data = (TestSetException(passes+c_passes, fails+c_fails, errors+c_errors, broken+c_broken, Test.filter_errors(ts)),
-                             res_and_time_data[2],
-                             res_and_time_data[3],
-                             res_and_time_data[4],
-                             res_and_time_data[5],
-                             rss)
+        res_and_time_data = (res_and_time_data..., rss)
         return res_and_time_data
     catch ex
         Test.TESTSET_PRINT_ENABLE[] = old_print_setting
