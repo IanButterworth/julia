@@ -841,6 +841,7 @@ end
     readdir(dir::AbstractString=pwd();
         join::Bool = false,
         sort::Bool = true,
+        type::Union{Nothing,Symbol,Vector{Symbol}} = nothing
     ) -> Vector{String}
 
 Return the names in the directory `dir` or the current working directory if not
@@ -852,6 +853,10 @@ back, call `readdir` with an absolute directory path and `join` set to true.
 By default, `readdir` sorts the list of names it returns. If you want to skip
 sorting the names and get them in the order that the file system lists them,
 you can use `readdir(dir, sort=false)` to opt out of sorting.
+
+The `type` argument can be used to filter the results by file type. It can be
+one or a vector of the following symbols: `:unknown`, `:file`, `:dir`, `:link`,
+`:fifo`, `:socket`, `:char`, `:block`.
 
 See also: [`walkdir`](@ref).
 
@@ -892,6 +897,10 @@ julia> readdir("base")
  "views.jl"
  "weakkeydict.jl"
 
+ julia> readdir(; type=:link)
+ 1-element Vector{String}:
+  "julia"
+
 julia> readdir("base", join=true)
 145-element Array{String,1}:
  "base/.gitignore"
@@ -913,7 +922,16 @@ julia> readdir(abspath("base"), join=true)
  "/home/JuliaUser/dev/julia/base/weakkeydict.jl"
 ```
 """
-function readdir(dir::AbstractString; join::Bool=false, sort::Bool=true)
+function readdir(dir::AbstractString; join::Bool=false, sort::Bool=true, type::Union{Nothing,Symbol,Vector{Symbol}}=nothing)
+    if type isa Symbol
+        haskey(entry_types, type) || throw(ArgumentError("`type` kwarg is limited to the following symbols $(keys(entry_types))"))
+    elseif type isa AbstractVector
+        any(t -> !haskey(entry_types, t), type) && throw(ArgumentError("`type` kwarg is limited to the following symbols $(keys(entry_types))"))
+    end
+    if type !== nothing
+        type isa Symbol && (type = (type,))
+        type_ints = (entry_types[t] for t in type)
+    end
     # Allocate space for uv_fs_t struct
     req = Libc.malloc(_sizeof_uv_fs)
     try
@@ -927,7 +945,9 @@ function readdir(dir::AbstractString; join::Bool=false, sort::Bool=true)
         ent = Ref{uv_dirent_t}()
         while Base.UV_EOF != ccall(:uv_fs_scandir_next, Cint, (Ptr{Cvoid}, Ptr{uv_dirent_t}), req, ent)
             name = unsafe_string(ent[].name)
-            push!(entries, join ? joinpath(dir, name) : name)
+            if type == nothing || ent[].typ in type_ints
+                push!(entries, join ? joinpath(dir, name) : name)
+            end
         end
 
         # Clean up the request string
@@ -941,8 +961,18 @@ function readdir(dir::AbstractString; join::Bool=false, sort::Bool=true)
         Libc.free(req)
     end
 end
-readdir(; join::Bool=false, sort::Bool=true) =
-    readdir(join ? pwd() : ".", join=join, sort=sort)
+readdir(; join::Bool=false, kwargs...) = readdir(join ? pwd() : "."; join, kwargs...)
+
+const entry_types = Dict{Symbol,Int}(
+    :unknown => 0,
+    :file => 1,
+    :dir => 2,
+    :link => 3,
+    :fifo => 4,
+    :socket => 5,
+    :char => 6,
+    :block => 7
+)
 
 """
     walkdir(dir; topdown=true, follow_symlinks=false, onerror=throw)
