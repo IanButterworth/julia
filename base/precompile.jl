@@ -606,7 +606,7 @@ function precompilepkgs(pkgs::Vector{String}=String[]; internal_call::Bool=false
             wait(first_started)
             (isempty(pkg_queue) || interrupted_or_done.set) && return
             fancyprint && lock(print_lock) do
-                printpkgstyle(io, :Precompiling, target)
+                printpkgstyle(io, :Precompiling, target * "\n")
                 print(io, ansi_disablecursor)
             end
             t = Timer(0; interval=1/10)
@@ -733,7 +733,7 @@ function precompilepkgs(pkgs::Vector{String}=String[]; internal_call::Bool=false
                     _name = haskey(exts, pkg) ? string(exts[pkg], " → ", pkg.name) : pkg.name
                     name = is_direct_dep ? _name : string(color_string(_name, :light_black))
                     !fancyprint && lock(print_lock) do
-                        isempty(pkg_queue) && printpkgstyle(io, :Precompiling, target)
+                        isempty(pkg_queue) && printpkgstyle(io, :Precompiling, target * "\n")
                     end
                     push!(pkg_queue, pkg)
                     started[pkg] = true
