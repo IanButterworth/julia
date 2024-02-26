@@ -799,6 +799,7 @@ function precompilepkgs(pkgs::Vector{String}=String[]; internal_call::Bool=false
         end
         push!(tasks, task)
     end
+    tdebug = Timer(t -> foreach(kv->println("$(kv[1].name) processed = $(kv[2].set[])"), was_processed), 5; interval=5)
     isempty(tasks) && notify(interrupted_or_done)
     try
         wait(interrupted_or_done)
@@ -807,6 +808,7 @@ function precompilepkgs(pkgs::Vector{String}=String[]; internal_call::Bool=false
     finally
         Base.LOADING_CACHE[] = nothing
     end
+    close(tdebug)
     notify(first_started) # in cases of no-op or !fancyprint
     fancyprint && wait(t_print)
     quick_exit = !all(istaskdone, tasks) || interrupted # if some not finished internal error is likely

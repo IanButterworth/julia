@@ -1044,20 +1044,35 @@ end
             cmd = """
             $load_distr
             begin
+                println(1)
                 $ew push!(empty!(DEPOT_PATH), $(repr(depot_path)))
+                println(2)
                 using HasExtensions
+                println(3)
                 $ew using HasExtensions
+                println(4)
                 $ew Base.get_extension(HasExtensions, :Extension) === nothing || error("unexpectedly got an extension")
+                println(5)
                 $ew HasExtensions.ext_loaded && error("ext_loaded set")
+                println(6)
                 using HasDepWithExtensions
+                println(7)
                 $ew using HasDepWithExtensions
+                println(8)
                 $ew Base.get_extension(HasExtensions, :Extension).extvar == 1 || error("extvar in Extension not set")
+                println(9)
                 $ew HasExtensions.ext_loaded || error("ext_loaded not set")
+                println(10)
                 $ew HasExtensions.ext_folder_loaded && error("ext_folder_loaded set")
+                println(11)
                 $ew HasDepWithExtensions.do_something() || error("do_something errored")
+                println(12)
                 using ExtDep2
+                println(13)
                 $ew using ExtDep2
+                println(14)
                 $ew HasExtensions.ext_folder_loaded || error("ext_folder_loaded not set")
+                println(15)
             end
             """
             return `$(Base.julia_cmd()) $compile --startup-file=no -e $cmd`
