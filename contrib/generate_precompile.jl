@@ -272,6 +272,8 @@ generate_precompile_statements() = try # Make sure `ansi_enablecursor` is printe
               """)
         tmp_prec = tempname(prec_path)
         tmp_proc = tempname(prec_path)
+        touch(tmp_prec)
+        touch(tmp_proc)
         s = """
             pushfirst!(DEPOT_PATH, $(repr(prec_path)));
             Base.PRECOMPILE_TRACE_COMPILE[] = $(repr(tmp_prec));
@@ -280,15 +282,35 @@ generate_precompile_statements() = try # Make sure `ansi_enablecursor` is printe
             """
         p = run(pipeline(addenv(`$(julia_exepath()) -O0 --trace-compile=$tmp_proc --sysimage $sysimg
                 --cpu-target=native --startup-file=no --color=yes`, procenv),
-                 stdin=IOBuffer(s), stdout=debug_output))
+                 stdin=IOBuffer(s), stdout=debug_output), wait=false)
         n_step1 = 0
-        for f in (tmp_prec, tmp_proc)
-            isfile(f) || continue
-            for statement in split(read(f, String), '\n')
-                push!(statements_step1, statement)
-                n_step1 += 1
+        _lock = Base.ReentrantLock()
+        t_end_fs = @async begin
+            Base.success(p)
+            sleep(1) # give some time for statement files to be written
+        end
+        Base.errormonitor(t_end_fs)
+        @sync for f in (tmp_prec, tmp_proc)
+            @async open(f, "r") do io
+                while true
+                    line = ""
+                    while !endswith(line, '\n')
+                        line *= readline(io, keep=true)
+                        eof(io) && sleep(0.1)  # Wait for a while before trying again, to avoid busy waiting
+                        bytesavailable(io) == 0 && istaskdone(t_end_fs) && break
+                    end
+                    line = strip(line)
+                    if !isempty(line)
+                        lock(_lock) do
+                            push!(statements_step1, line)
+                            n_step1 += 1
+                        end
+                    end
+                    bytesavailable(io) == 0 && istaskdone(t_end_fs) && break
+                end
             end
         end
+
         close(statements_step1)
         print_state("step1" => "F$n_step1")
         return :ok
