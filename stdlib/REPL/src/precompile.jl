@@ -77,6 +77,16 @@ procenv = Dict{String,Any}(
         "TERM" => "",
         "JULIA_FALLBACK_REPL" => "0") # Turn REPL.jl on in subprocess
 
+# simulates typing, gives tab completion hints a chance to be generated
+function slowwrite(io, strings...)
+    for s in strings
+        for c in s
+            write(io, c)
+            sleep(0.2)
+        end
+    end
+end
+
 generate_precompile_statements() = try
     # Extract the precompile statements from the precompile file
     statements_step = Channel{String}(Inf)
@@ -135,7 +145,7 @@ generate_precompile_statements() = try
                 # If the line ends with a CTRL_C, don't write an extra newline, which would
                 # cause a second empty prompt. Our code below expects one new prompt per
                 # input line and can race out of sync with the unexpected second line.
-                endswith(l, CTRL_C) ? write(ptm, l) : write(ptm, l, "\n")
+                endswith(l, CTRL_C) ? slowwrite(ptm, l) : slowwrite(ptm, l, "\n")
                 readuntil(output_copy, "\n")
                 # wait for the next prompt-like to appear
                 readuntil(output_copy, "\n")
