@@ -1263,7 +1263,11 @@ function setup_interface(
                     # wait but only take if task is still running
                     peek(stdin, Char)
                     @lock iolock begin
-                        transition_finished || edit_insert(s, read(stdin, Char))
+                        if !transition_finished
+                            c = read(stdin, Char)
+                            # don't foward return keys
+                            c == '\r' || edit_insert(s, c)
+                        end
                     end
                 end
             else
