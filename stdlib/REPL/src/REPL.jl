@@ -1231,6 +1231,7 @@ function setup_interface(
                 print(LineEdit.terminal(s), styled"{blue,bold:({gray:......}) pkg> }")
                 pkg_mode = nothing
                 transition_finished = false
+                return_pressed = false
                 iolock = Base.ReentrantLock() # to avoid race between tasks reading stdin & input buffer
                 # spawn Pkg load to avoid blocking typing during loading. Typing will block if only 1 thread
                 t_replswitch = Threads.@spawn begin
@@ -1256,19 +1257,33 @@ function setup_interface(
                             transition_finished = true
                         end
                     end
+                    REPLExt
                 end
-                Base.errormonitor(t_replswitch)
                 # while loading just accept all keys, no keymap functionality
-                while !istaskdone(t_replswitch)
-                    # wait but only take if task is still running
-                    peek(stdin, Char)
-                    @lock iolock begin
-                        if !transition_finished
-                            c = read(stdin, Char)
-                            # don't foward return keys
-                            c == '\r' || edit_insert(s, c)
+                t_stdincopy = Threads.@spawn while !istaskdone(t_replswitch)
+                    try
+                        peek(stdin, Char)
+                    catch
+                        # ignore interrupt
+                    else
+                        @lock iolock begin
+                            if !transition_finished # only take if transition is still pending
+                                c = read(stdin, Char)
+                                if c == '\r' # don't foward return keys
+                                    return_pressed = true
+                                else
+                                    edit_insert(s, c)
+                                end
+                            end
                         end
                     end
+                end
+                Base.errormonitor(t_stdincopy)
+                REPLExt = fetch(t_replswitch)
+                if return_pressed # if return was pressed run what was entered
+                    LineEdit.on_enter(s)
+                    LineEdit.commit_line(s)
+                    @invokelatest REPLExt.on_done(s, LineEdit.buffer(s), true, pkg_mode.repl)
                 end
             else
                 edit_insert(s, ']')
