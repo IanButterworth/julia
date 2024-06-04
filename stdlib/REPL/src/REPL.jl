@@ -1250,9 +1250,15 @@ function setup_interface(
                             buf = copy(LineEdit.buffer(s))
                             transition(s, pkg_mode) do
                                 LineEdit.state(s, pkg_mode).input_buffer = buf
-                            end
-                            if !isempty(s)
-                                @invokelatest(LineEdit.check_for_hint(s)) && @invokelatest(LineEdit.refresh_line(s))
+                                if !isempty(s)
+                                    @invokelatest(LineEdit.check_for_hint(s)) && @invokelatest(LineEdit.refresh_line(s))
+                                end
+                                if return_pressed # if return was pressed run what was entered
+                                    LineEdit.commit_line(s)
+                                    terminal = LineEdit.terminal(s)
+                                    @invokelatest LineEdit.mode(s).on_done(s, LineEdit.buffer(s), true)
+                                    LineEdit.push_undo(s)
+                                end
                             end
                             transition_finished = true
                         end
@@ -1260,7 +1266,9 @@ function setup_interface(
                     REPLExt
                 end
                 # while loading just accept all keys, no keymap functionality
-                t_stdincopy = Threads.@spawn while !istaskdone(t_replswitch)
+                # use @async here to keep this on the same thread as the REPL. With @spawn both tasks
+                # can get stuck waiting for each other
+                t_stdincopy = @async while !istaskdone(t_replswitch)
                     try
                         peek(stdin, Char)
                     catch
@@ -1279,12 +1287,7 @@ function setup_interface(
                     end
                 end
                 Base.errormonitor(t_stdincopy)
-                REPLExt = fetch(t_replswitch)
-                if return_pressed # if return was pressed run what was entered
-                    LineEdit.on_enter(s)
-                    LineEdit.commit_line(s)
-                    @invokelatest REPLExt.on_done(s, LineEdit.buffer(s), true, pkg_mode.repl)
-                end
+                wait(t_replswitch)
             else
                 edit_insert(s, ']')
             end
