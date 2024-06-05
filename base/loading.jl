@@ -2503,6 +2503,9 @@ end
 # load a serialized file directly from append_bundled_depot_path for uuidkey without stalechecks
 function require_stdlib(uuidkey::PkgId, ext::Union{Nothing, String}=nothing)
     @lock require_lock begin
+    if ext isa String
+        uuidkey = PkgId(uuid5(uuidkey.uuid, ext), ext)
+    end
     if root_module_exists(uuidkey)
         return loaded_modules[uuidkey]
     end
@@ -2513,7 +2516,6 @@ function require_stdlib(uuidkey::PkgId, ext::Union{Nothing, String}=nothing)
         sourcepath = normpath(env, uuidkey.name, "src", uuidkey.name * ".jl")
     else
         sourcepath = find_ext_path(normpath(joinpath(env, uuidkey.name)), ext)
-        uuidkey = PkgId(uuid5(uuidkey.uuid, ext), ext)
     end
     #mbypath = manifest_uuid_path(env, uuidkey)
     #if mbypath isa String && isfile_casesensitive(mbypath)
