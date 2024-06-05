@@ -1082,6 +1082,8 @@ setup_interface(
     extra_repl_keymap::Any = repl.options.extra_keymap
 ) = setup_interface(repl, hascolor, extra_repl_keymap)
 
+const Pkg_pkgid = Base.PkgId(Base.UUID("44cfe95a-1eb2-52ea-b672-e2afdf69b78f"), "Pkg")
+
 # This non keyword method can be precompiled which is important
 function setup_interface(
     repl::LineEditREPL,
@@ -1164,10 +1166,24 @@ function setup_interface(
         prompt_suffix = hascolor ?
         (repl.envcolors ? Base.input_color : repl.input_color) : "",
         repl = repl,
-        complete = replc,
-        on_done = respond(repl, julia_prompt) do line
-            # do nothing. Handling is managed by the '\r' keymap
-        end,
+        complete = LineEdit.EmptyCompletionProvider(),
+        on_done = (s::MIState, buf, ok::Bool) -> begin
+                # ok to do this even if Pkg is loading on the other task because of the loading lock
+                REPLExt = Base.require_stdlib(Pkg_pkgid, "REPLExt")
+                if REPLExt isa Module && isdefined(REPLExt, :PkgCompletionProvider)
+                    for mode in repl.interface.modes
+                        if mode isa LineEdit.Prompt && mode.complete isa REPLExt.PkgCompletionProvider
+                            # pkg mode
+                            _buf = copy(LineEdit.buffer(s))
+                            transition(s, mode) do
+                                LineEdit.state(s, mode).input_buffer = _buf
+                            end
+                            return @invokelatest mode.on_done(s, buf, ok)
+                        end
+                    end
+                end
+                return
+            end,
         sticky = true)
 
 
@@ -1247,8 +1263,7 @@ function setup_interface(
                     LineEdit.state(s, dummy_pkg_mode).input_buffer = buf
                 end
                 t_replswitch = Threads.@spawn begin
-                    pkgid = Base.PkgId(Base.UUID("44cfe95a-1eb2-52ea-b672-e2afdf69b78f"), "Pkg")
-                    REPLExt = Base.require_stdlib(pkgid, "REPLExt")
+                    REPLExt = Base.require_stdlib(Pkg_pkgid, "REPLExt")
                     if LineEdit.mode(s) === dummy_pkg_mode
                         if REPLExt isa Module && isdefined(REPLExt, :PkgCompletionProvider)
                             for mode in repl.interface.modes
@@ -1449,28 +1464,7 @@ function setup_interface(
     b = Dict{Any,Any}[skeymap, mk, prefix_keymap, LineEdit.history_keymap, LineEdit.default_keymap, LineEdit.escape_defaults]
     prepend!(b, extra_repl_keymap)
 
-    shell_mode.keymap_dict = help_mode.keymap_dict = LineEdit.keymap(b)
-
-    dummy_pkg_mode.keymap_dict = copy(LineEdit.keymap(b))
-    dummy_pkg_mode.keymap_dict['\r'] = (s::MIState,o...)->begin
-        pkgid = Base.PkgId(Base.UUID("44cfe95a-1eb2-52ea-b672-e2afdf69b78f"), "Pkg")
-        # ok to do this even if Pkg is loading on the other task because of the loading lock
-        REPLExt = Base.require_stdlib(pkgid, "REPLExt")
-        if LineEdit.mode(s) === dummy_pkg_mode
-            if REPLExt isa Module && isdefined(REPLExt, :PkgCompletionProvider)
-                for mode in repl.interface.modes
-                    if mode isa LineEdit.Prompt && mode.complete isa REPLExt.PkgCompletionProvider
-                        buf = copy(LineEdit.buffer(s))
-                        transition(s, mode) do
-                            LineEdit.state(s, mode).input_buffer = buf
-                        end
-                        break
-                    end
-                end
-            end
-        end
-        return LineEdit.keymap(b)['\r'](s, o...) # do the normal execute
-    end
+    shell_mode.keymap_dict = help_mode.keymap_dict = dummy_pkg_mode.keymap_dict = LineEdit.keymap(b)
 
     allprompts = LineEdit.TextInterface[julia_prompt, shell_mode, help_mode, dummy_pkg_mode, search_prompt, prefix_prompt]
     return ModalInterface(allprompts)
