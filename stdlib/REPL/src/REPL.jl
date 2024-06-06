@@ -1264,22 +1264,24 @@ function setup_interface(
                 end
                 t_replswitch = Threads.@spawn begin
                     REPLExt = Base.require_stdlib(Pkg_pkgid, "REPLExt")
-                    if LineEdit.mode(s) === dummy_pkg_mode
-                        if REPLExt isa Module && isdefined(REPLExt, :PkgCompletionProvider)
-                            for mode in repl.interface.modes
-                                if mode isa LineEdit.Prompt && mode.complete isa REPLExt.PkgCompletionProvider
-                                    buf = copy(LineEdit.buffer(s))
-                                    transition(s, mode) do
-                                        LineEdit.state(s, mode).input_buffer = buf
-                                    end
-                                    if !isempty(s)
-                                        @invokelatest(LineEdit.check_for_hint(s)) && @invokelatest(LineEdit.refresh_line(s))
-                                    end
-                                    break
+
+                    put!(s.async_channel, (s, _) -> begin
+                        LineEdit.mode(s) === dummy_pkg_mode || return :ok
+                        (REPLExt isa Module && isdefined(REPLExt, :PkgCompletionProvider)) || return :ok
+                        for mode in repl.interface.modes
+                            if mode isa LineEdit.Prompt && mode.complete isa REPLExt.PkgCompletionProvider
+                                buf = copy(LineEdit.buffer(s))
+                                transition(s, mode) do
+                                    LineEdit.state(s, mode).input_buffer = buf
                                 end
+                                if !isempty(s)
+                                    @invokelatest(LineEdit.check_for_hint(s)) && @invokelatest(LineEdit.refresh_line(s))
+                                end
+                                break
                             end
                         end
-                    end
+                        return :ok
+                    end)
                 end
                 Base.errormonitor(t_replswitch)
             else

@@ -75,9 +75,10 @@ mutable struct MIState
     key_repeats::Int
     last_action::Symbol
     current_action::Symbol
+    async_channel::Channel
 end
 
-MIState(i, mod, c, a, m) = MIState(i, mod, c, a, m, String[], 0, Char[], 0, :none, :none)
+MIState(i, mod, c, a, m) = MIState(i, mod, c, a, m, String[], 0, Char[], 0, :none, :none, Channel())
 
 const BufferLike = Union{MIState,ModeState,IOBuffer}
 const State = Union{MIState,ModeState}
@@ -2829,7 +2830,11 @@ function prompt!(term::TextTerminal, prompt::ModalInterface, s::MIState = init_s
         old_state = mode(s)
         while true
             kmap = keymap(s, prompt)
-            fcn = match_input(kmap, s)
+            waitany((
+                @async(eof(term) || peek(term, Char)),
+                @async(wait(s.async_channel)),
+                ), throw=true)
+            fcn = isempty(s.async_channel) ? match_input(kmap, s) : take!(s.async_channel)
             kdata = keymap_data(s, prompt)
             s.current_action = :unknown # if the to-be-run action doesn't update this field,
                                         # :unknown will be recorded in the last_action field
