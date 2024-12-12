@@ -791,6 +791,8 @@ function _precompilepkgs(pkgs::Vector{String},
         end
     end
 
+    n_total = 0
+
     ## fancy print loop
     t_print = @async begin
         try
@@ -809,7 +811,6 @@ function _precompilepkgs(pkgs::Vector{String},
             i = 1
             last_length = 0
             bar = MiniProgressBar(; indent=0, header = "Precompiling packages ", color = :green, percentage=false, always_reprint=true)
-            n_total = length(direct_deps) * length(configs)
             bar.max = n_total - n_already_precomp
             final_loop = false
             n_print_rows = 0
@@ -911,99 +912,110 @@ function _precompilepkgs(pkgs::Vector{String},
                 continue
             end
             flags, cacheflags = config
-            task = @async begin
-                try
-                    loaded = haskey(Base.loaded_modules, pkg)
-                    for dep in deps # wait for deps to finish
-                        wait(was_processed[(dep,config)])
-                    end
-                    circular = pkg in circular_deps
-                    is_stale = !Base.isprecompiled(pkg; ignore_loaded=true, stale_cache, cachepath_cache, cachepaths, sourcepath, flags=cacheflags)
-                    if !circular && is_stale
-                        Base.acquire(parallel_limiter)
-                        is_project_dep = pkg in project_deps
-
-                        # std monitoring
-                        std_pipe = Base.link_pipe!(Pipe(); reader_supports_async=true, writer_supports_async=true)
-                        t_monitor = @async monitor_std(pkg_config, std_pipe; single_requested_pkg)
-
-                        name = describe_pkg(pkg, is_project_dep, flags, cacheflags)
-                        lock(print_lock) do
-                            if !fancyprint && isempty(pkg_queue)
-                                printpkgstyle(io, :Precompiling, something(target, "packages..."))
-                            end
-                        end
-                        push!(pkg_queue, pkg_config)
-                        started[pkg_config] = true
-                        fancyprint && notify(first_started)
-                        if interrupted_or_done.set
-                            notify(was_processed[pkg_config])
-                            Base.release(parallel_limiter)
-                            return
-                        end
-                        try
-                            # allows processes to wait if another process is precompiling a given package to
-                            # a functionally identical package cache (except for preferences, which may differ)
-                            t = @elapsed ret = precompile_pkgs_maybe_cachefile_lock(io, print_lock, fancyprint, pkg_config, pkgspidlocked, hascolor) do
-                                Base.with_logger(Base.NullLogger()) do
-                                    # The false here means we ignore loaded modules, so precompile for a fresh session
-                                    keep_loaded_modules = false
-                                    # for extensions, any extension in our direct dependencies is one we have a right to load
-                                    # for packages, we may load any extension (all possible triggers are accounted for above)
-                                    loadable_exts = haskey(ext_to_parent, pkg) ? filter((dep)->haskey(ext_to_parent, dep), direct_deps[pkg]) : nothing
-                                    Base.compilecache(pkg, sourcepath, std_pipe, std_pipe, keep_loaded_modules;
-                                                      flags, cacheflags, loadable_exts)
-                                end
-                            end
-                            if ret isa Base.PrecompilableError
-                                push!(precomperr_deps, pkg_config)
-                                !fancyprint && lock(print_lock) do
-                                    println(io, _timing_string(t), color_string("  ? ", Base.warn_color()), name)
-                                end
-                            else
-                                !fancyprint && lock(print_lock) do
-                                    println(io, _timing_string(t), color_string("  ✓ ", loaded ? Base.warn_color() : :green), name)
-                                end
-                                was_recompiled[pkg_config] = true
-                            end
-                            loaded && (n_loaded += 1)
-                        catch err
-                            # @show err
-                            close(std_pipe.in) # close pipe to end the std output monitor
-                            wait(t_monitor)
-                            if err isa ErrorException || (err isa ArgumentError && startswith(err.msg, "Invalid header in cache file"))
-                                errmsg = String(take!(get(IOBuffer, std_outputs, pkg_config)))
-                                delete!(std_outputs, pkg_config) # so it's not shown as warnings, given error report
-                                failed_deps[pkg_config] = (strict || is_project_dep) ? string(sprint(showerror, err), "\n", strip(errmsg)) : ""
-                                !fancyprint && lock(print_lock) do
-                                    println(io, " "^9, color_string("  ✗ ", Base.error_color()), name)
-                                end
-                            else
-                                rethrow()
-                            end
-                        finally
-                            isopen(std_pipe.in) && close(std_pipe.in) # close pipe to end the std output monitor
-                            wait(t_monitor)
-                            Base.release(parallel_limiter)
-                        end
-                    else
-                        is_stale || (n_already_precomp += 1)
-                    end
-                    n_done += 1
-                    notify(was_processed[pkg_config])
-                catch err_outer
-                    # For debugging:
-                    # println("Task failed $err_outer")
-                    # Base.display_error(ErrorException(""), Base.catch_backtrace())# logging doesn't show here
-                    handle_interrupt(err_outer) || rethrow()
-                    notify(was_processed[pkg_config])
-                finally
-                    filter!(!istaskdone, tasks)
-                    length(tasks) == 1 && notify(interrupted_or_done)
-                end
+            ignore_loaded_states = if any(dep -> haskey(Base.loaded_modules, dep), deps)
+                (true, false)
+            else
+                (true)
             end
-            Base.errormonitor(task) # interrupts are handled separately so ok to watch for other errors like this
-            push!(tasks, task)
+
+            for ignore_loaded in ignore_loaded_states
+                n_total += 1
+                task = @async begin
+                    try
+                        loaded = haskey(Base.loaded_modules, pkg)
+                        for dep in deps # wait for deps to finish
+                            # TODO: this is a lot more complicated than this.. we need to know which dep job we're waiting for
+                            # and that's dependent on the ignore_loaded state
+                            wait(was_processed[(dep,config)])
+                        end
+                        circular = pkg in circular_deps
+                        is_stale = !Base.isprecompiled(pkg; ignore_loaded, stale_cache, cachepath_cache, cachepaths, sourcepath, flags=cacheflags)
+                        if !circular && is_stale
+                            Base.acquire(parallel_limiter)
+                            is_project_dep = pkg in project_deps
+
+                            # std monitoring
+                            std_pipe = Base.link_pipe!(Pipe(); reader_supports_async=true, writer_supports_async=true)
+                            t_monitor = @async monitor_std(pkg_config, std_pipe; single_requested_pkg)
+
+                            name = describe_pkg(pkg, is_project_dep, flags, cacheflags)
+                            lock(print_lock) do
+                                if !fancyprint && isempty(pkg_queue)
+                                    printpkgstyle(io, :Precompiling, something(target, "packages..."))
+                                end
+                            end
+                            push!(pkg_queue, pkg_config)
+                            started[pkg_config] = true
+                            fancyprint && notify(first_started)
+                            if interrupted_or_done.set
+                                notify(was_processed[pkg_config])
+                                Base.release(parallel_limiter)
+                                return
+                            end
+                            try
+                                # allows processes to wait if another process is precompiling a given package to
+                                # a functionally identical package cache (except for preferences, which may differ)
+                                t = @elapsed ret = precompile_pkgs_maybe_cachefile_lock(io, print_lock, fancyprint, pkg_config, pkgspidlocked, hascolor, ignore_loaded) do
+                                    Base.with_logger(Base.NullLogger()) do
+                                        # The false here means we ignore loaded modules, so precompile for a fresh session
+                                        keep_loaded_modules = !ignore_loaded
+                                        # for extensions, any extension in our direct dependencies is one we have a right to load
+                                        # for packages, we may load any extension (all possible triggers are accounted for above)
+                                        loadable_exts = haskey(ext_to_parent, pkg) ? filter((dep)->haskey(ext_to_parent, dep), direct_deps[pkg]) : nothing
+                                        Base.compilecache(pkg, sourcepath, std_pipe, std_pipe, keep_loaded_modules;
+                                                        flags, cacheflags, loadable_exts)
+                                    end
+                                end
+                                if ret isa Base.PrecompilableError
+                                    push!(precomperr_deps, pkg_config)
+                                    !fancyprint && lock(print_lock) do
+                                        println(io, _timing_string(t), color_string("  ? ", Base.warn_color()), name)
+                                    end
+                                else
+                                    !fancyprint && lock(print_lock) do
+                                        println(io, _timing_string(t), color_string("  ✓ ", loaded ? Base.warn_color() : :green), name)
+                                    end
+                                    was_recompiled[pkg_config] = true
+                                end
+                                loaded && (n_loaded += 1)
+                            catch err
+                                # @show err
+                                close(std_pipe.in) # close pipe to end the std output monitor
+                                wait(t_monitor)
+                                if err isa ErrorException || (err isa ArgumentError && startswith(err.msg, "Invalid header in cache file"))
+                                    errmsg = String(take!(get(IOBuffer, std_outputs, pkg_config)))
+                                    delete!(std_outputs, pkg_config) # so it's not shown as warnings, given error report
+                                    failed_deps[pkg_config] = (strict || is_project_dep) ? string(sprint(showerror, err), "\n", strip(errmsg)) : ""
+                                    !fancyprint && lock(print_lock) do
+                                        println(io, " "^9, color_string("  ✗ ", Base.error_color()), name)
+                                    end
+                                else
+                                    rethrow()
+                                end
+                            finally
+                                isopen(std_pipe.in) && close(std_pipe.in) # close pipe to end the std output monitor
+                                wait(t_monitor)
+                                Base.release(parallel_limiter)
+                            end
+                        else
+                            is_stale || (n_already_precomp += 1)
+                        end
+                        n_done += 1
+                        notify(was_processed[pkg_config])
+                    catch err_outer
+                        # For debugging:
+                        # println("Task failed $err_outer")
+                        # Base.display_error(ErrorException(""), Base.catch_backtrace())# logging doesn't show here
+                        handle_interrupt(err_outer) || rethrow()
+                        notify(was_processed[pkg_config])
+                    finally
+                        filter!(!istaskdone, tasks)
+                        length(tasks) == 1 && notify(interrupted_or_done)
+                    end
+                end
+                Base.errormonitor(task) # interrupts are handled separately so ok to watch for other errors like this
+                push!(tasks, task)
+            end
         end
     end
     isempty(tasks) && notify(interrupted_or_done)
@@ -1130,14 +1142,14 @@ function _color_string(cstr::String, col::Union{Int64, Symbol}, hascolor)
 end
 
 # Can be merged with `maybe_cachefile_lock` in loading?
-function precompile_pkgs_maybe_cachefile_lock(f, io::IO, print_lock::ReentrantLock, fancyprint::Bool, pkg_config, pkgspidlocked, hascolor)
+function precompile_pkgs_maybe_cachefile_lock(f, io::IO, print_lock::ReentrantLock, fancyprint::Bool, pkg_config, pkgspidlocked, hascolor, ignore_loaded::Bool)
     if !(isdefined(Base, :mkpidlock_hook) && isdefined(Base, :trymkpidlock_hook) && Base.isdefined(Base, :parse_pidfile_hook))
         return f()
     end
     pkg, config = pkg_config
     flags, cacheflags = config
     stale_age = Base.compilecache_pidlock_stale_age
-    pidfile = Base.compilecache_pidfile_path(pkg, flags=cacheflags)
+    pidfile = Base.compilecache_pidfile_path(pkg; flags=cacheflags, ignore_loaded)
     cachefile = @invokelatest Base.trymkpidlock_hook(f, pidfile; stale_age)
     if cachefile === false
         pid, hostname, age = @invokelatest Base.parse_pidfile_hook(pidfile)

@@ -3832,8 +3832,12 @@ global parse_pidfile_hook::Any
 # The preferences hash is only known after precompilation so just assume no preferences.
 # Also ignore the active project, which means that if all other conditions are equal,
 # the same package cannot be precompiled from different projects and/or different preferences at the same time.
-compilecache_pidfile_path(pkg::PkgId; flags::CacheFlags=CacheFlags()) = compilecache_path(pkg, UInt64(0); project="", flags) * ".pidfile"
-
+function compilecache_pidfile_path(pkg::PkgId; flags::CacheFlags=CacheFlags(), ignore_loaded=false)
+    return string(compilecache_path(pkg, UInt64(0); project="", flags),
+            "_",
+            ignore_loaded ? "1" : "0",
+            ".pidfile")
+end
 const compilecache_pidlock_stale_age = 10
 
 # Allows processes to wait if another process is precompiling a given source already.
@@ -3844,9 +3848,9 @@ const compilecache_pidlock_stale_age = 10
 # seconds if the process does still exist.
 # If the lock is held by another host, it will conservatively wait `stale_age * 5`
 # seconds since processes cannot be checked remotely
-function maybe_cachefile_lock(f, pkg::PkgId, srcpath::String; stale_age=compilecache_pidlock_stale_age)
+function maybe_cachefile_lock(f, pkg::PkgId, srcpath::String; stale_age=compilecache_pidlock_stale_age, ignore_loaded=false)
     if @isdefined(mkpidlock_hook) && @isdefined(trymkpidlock_hook) && @isdefined(parse_pidfile_hook)
-        pidfile = compilecache_pidfile_path(pkg)
+        pidfile = compilecache_pidfile_path(pkg; ignore_loaded)
         cachefile = @invokelatest trymkpidlock_hook(f, pidfile; stale_age)
         if cachefile === false
             pid, hostname, age = @invokelatest parse_pidfile_hook(pidfile)
