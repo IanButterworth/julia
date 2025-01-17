@@ -210,8 +210,10 @@ function format_bytes(bytes; binary=true) # also used by InteractiveUtils
     end
 end
 
-function time_print(io::IO, elapsedtime, bytes=0, gctime=0, allocs=0, lock_conflicts=0, compile_time=0, recompile_time=0, newline=false;
-                    msg::Union{String,Nothing}=nothing)
+function time_string(td::NamedTuple, msg::Union{String,Nothing}=nothing)
+    return time_string(td.elapsedtime, td.bytes, td.gctime, td.allocs, td.lock_conflicts, td.compile_time, td.recompile_time, msg)
+end
+function time_string(elapsedtime, bytes=0, gctime=0, allocs=0, lock_conflicts=0, compile_time=0, recompile_time=0, msg::Union{String,Nothing}=nothing)
     timestr = Ryu.writefixed(Float64(elapsedtime/1e9), 6)
     str = sprint() do io
         if msg isa String
@@ -256,10 +258,20 @@ function time_print(io::IO, elapsedtime, bytes=0, gctime=0, allocs=0, lock_confl
             print(io, ": ", perc < 1 ? "<1" : Ryu.writefixed(perc, 0), "% of which was recompilation")
         end
         parens && print(io, ")")
-        newline && print(io, "\n")
     end
-    print(io, str)
-    nothing
+    return str
+end
+
+function time_print(io::IO, td::NamedTuple, newline=false; msg::Union{String,Nothing}=nothing)
+    str = time_string(td, msg)
+    newline ? println(io, str) : print(io, str)
+    return nothing
+end
+function time_print(io::IO, elapsedtime, bytes=0, gctime=0, allocs=0, lock_conflicts=0, compile_time=0, recompile_time=0, newline=false;
+                    msg::Union{String,Nothing}=nothing)
+    str = time_string(elapsedtime, bytes, gctime, allocs, lock_conflicts, compile_time, recompile_time, msg)
+    newline ? println(io, str) : print(io, str)
+    return nothing
 end
 
 function timev_print(elapsedtime, diff::GC_Diff, lock_conflicts, compile_times; msg::Union{String,Nothing}=nothing)
