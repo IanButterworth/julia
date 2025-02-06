@@ -1170,11 +1170,11 @@ function find_source_file(path::AbstractString)
     return isfile(base_path) ? normpath(base_path) : nothing
 end
 
-function cache_file_entry(pkg::PkgId)
+function cache_file_entry(pkg::PkgId, version::VersionNumber=VERSION)
     uuid = pkg.uuid
     return joinpath(
         "compiled",
-        "v$(VERSION.major).$(VERSION.minor)",
+        "v$(version.major).$(version.minor)",
         uuid === nothing ? ""       : pkg.name),
         uuid === nothing ? pkg.name : package_slug(uuid)
 end
@@ -3242,10 +3242,21 @@ function compilecache(pkg::PkgId, path::String, internal_stderr::IO = stderr, in
             # inherit permission from the source file (and make them writable)
             chmod(tmppath, filemode(path) & 0o777 | 0o200)
 
-            # prune the directory with cache files
+            # prune the directory with cache files and enforce the limit set by `MAX_NUM_PRECOMPILE_FILES`
+            # i.e. env var `JULIA_MAX_NUM_PRECOMPILE_FILES`, across all julia version caches in the depot,
+            # otherwise the limit would be per julia version, which is less helpful to the user
             if pkg.uuid !== nothing
-                entrypath, entryfile = cache_file_entry(pkg)
-                cachefiles = filter!(x -> startswith(x, entryfile * "_") && endswith(x, ".ji"), readdir(cachepath))
+                cache_dir_root = joinpath(DEPOT_PATH[1], "compiled")
+                julia_versions_with_cache_dirs = filter(startswith("v"), readdir(cache_dir_root))
+                cachefiles = String[]
+                for version_string in julia_versions_with_cache_dirs
+                    version = tryparse(VersionNumber, version_string)
+                    version === nothing && continue
+                    entrypath, entryfile = cache_file_entry(pkg, version)
+                    version_cachepath = joinpath(DEPOT_PATH[1], entrypath)
+                    isdir(version_cachepath) || continue
+                    append!(cachefiles, filter!(x -> startswith(x, entryfile * "_") && endswith(x, ".ji"), readdir(version_cachepath)))
+                end
                 if length(cachefiles) >= MAX_NUM_PRECOMPILE_FILES[]
                     idx = findmin(mtime.(joinpath.(cachepath, cachefiles)))[2]
                     evicted_cachefile = joinpath(cachepath, cachefiles[idx])
