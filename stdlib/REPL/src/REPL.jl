@@ -1642,7 +1642,17 @@ function setup_interface(
                     # execute the statement
                     terminal = LineEdit.terminal(s) # This is slightly ugly but ok for now
                     raw!(terminal, false) && disable_bracketed_paste(terminal)
-                    @invokelatest LineEdit.mode(s).on_done(s, LineEdit.buffer(s), true)
+
+                    # Keymap functions are `@spawn :interactive`-ed but the execution must be on
+                    # the main thread, as user code might expect that i.e. GLFW.jl needs that
+                    task = @task begin
+                        @invokelatest LineEdit.mode(s).on_done(s, LineEdit.buffer(s), true)
+                    end
+                    task.sticky = true
+                    ccall(:jl_set_task_tid, Cvoid, (Any, Cint), task, 0)
+                    schedule(task)
+                    wait(task)
+
                     raw!(terminal, true) && enable_bracketed_paste(terminal)
                     LineEdit.push_undo(s) # when the last line is incomplete
                 end
