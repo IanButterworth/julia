@@ -2753,6 +2753,69 @@ function _require_from_serialized(uuidkey::PkgId, path::String, ocachepath::Unio
     end
 end
 
+function invalidation_leaves(listi, liste)
+    umis = Set{Core.MethodInstance}()
+    # `queued` is a queue of length 0 or 1 of invalidated MethodInstances.
+    # We wait to read the `depth` to find out if it's a leaf.
+    queued, depth = nothing, 0
+    function cachequeued(item, nextdepth)
+        if queued !== nothing && nextdepth <= depth
+            push!(umis, queued)
+        end
+        queued, depth = item, nextdepth
+    end
+
+    # Process method insertion/deletion events
+    i, ilast = firstindex(listi), lastindex(listi)
+    while i <= ilast
+        item = listi[i]
+        if isa(item, Core.MethodInstance)
+            if i < lastindex(listi)
+                nextitem = listi[i+1]
+                if nextitem == "invalidate_mt_cache"
+                    cachequeued(nothing, 0)
+                    i += 2
+                    continue
+                end
+                if nextitem ∈ ("jl_method_table_disable", "jl_method_table_insert")
+                    cachequeued(nothing, 0)
+                    push!(umis, item)
+                end
+                if isa(nextitem, Integer)
+                    cachequeued(item, nextitem)
+                    i += 2
+                    continue
+                end
+            end
+        end
+        if (isa(item, Method) || isa(item, Type)) && queued !== nothing
+            push!(umis, queued)
+            queued, depth = nothing, 0
+        end
+        i += 1
+    end
+
+    # Process edge-validation events
+    i, ilast = firstindex(liste), lastindex(liste)
+    while i <= ilast
+        tag = liste[i + 1]   # the tag is always second
+        if tag == "method_globalref"
+            push!(umis, Core.Compiler.get_ci_mi(liste[i + 2]))
+            i += 4
+        elseif tag == "insert_backedges_callee"
+            push!(umis, Core.Compiler.get_ci_mi(liste[i + 2]))
+            i += 4
+        elseif tag == "verify_methods"
+            push!(umis, Core.Compiler.get_ci_mi(liste[i]))
+            i += 3
+        else
+            error("Unknown tag found in invalidation list: ", tag)
+        end
+    end
+
+    return umis
+end
+
 # load a serialized file directly from append_bundled_depot_path for uuidkey without stalechecks
 """
     require_stdlib(package_uuidkey::PkgId, ext::Union{Nothing, String}=nothing)
@@ -2794,7 +2857,26 @@ end
       [1] https://github.com/JuliaLang/Pkg.jl/issues/4017#issuecomment-2377589989
       [2] https://github.com/JuliaLang/StyledStrings.jl/issues/91#issuecomment-2379602914
 """
-function require_stdlib(package_uuidkey::PkgId, ext::Union{Nothing, String}=nothing)
+function require_stdlib(pkg::PkgId, ext::Union{Nothing, String}=nothing)
+    listi = ccall(:jl_debug_method_invalidation, Any, (Cint,), 1)
+    liste = Base.StaticData.debug_method_invalidation(true)
+    m = _require_stdlib(pkg, ext)
+    ccall(:jl_debug_method_invalidation, Any, (Cint,), 0)
+    Base.StaticData.debug_method_invalidation(false)
+    invalidated = invalidation_leaves(collect(listi), collect(liste))
+    isempty(invalidated) && return m
+    @info "Eagerly recompiling $(length(invalidated)) methods that were invalidated during loading $(pkg.name) and its deps"
+    t = time()
+    for i in collect(invalidated)
+        @info i
+        precompile(i)
+    end
+    t = time() - t
+    @info "took $t seconds"
+    return m
+end
+
+function _require_stdlib(package_uuidkey::PkgId, ext::Union{Nothing, String}=nothing)
     if generating_output(#=incremental=#true)
         # Otherwise this would lead to awkward dependency issues by loading a package that isn't in the Project/Manifest
         error("This interactive function requires a stdlib to be loaded, and package code should instead use it directly from that stdlib.")
