@@ -129,6 +129,7 @@ JL_DLLEXPORT void jl_init_options(void)
                         JL_OPTIONS_POLLY_ON, // polly
                         NULL, // trace_compile
                         NULL, // trace_dispatch
+                        NULL, // trace_loading
                         JL_OPTIONS_FAST_MATH_DEFAULT,
                         0,    // worker
                         NULL, // cookie
@@ -329,6 +330,8 @@ static const char opts_hidden[]  =
     "                                               a trailing comment if color is not supported\n"
     " --trace-compile-timing                        If --trace-compile is enabled show how long each took\n"
     "                                               to compile in ms\n"
+    " --trace-loading={stderr|name}                 Print granular loading information and timing for\n"
+    "                                               package images, system images, and cache validation\n"
     " --task-metrics={yes|no*}                      Enable collection of per-task timing data.\n"
     " --image-codegen                               Force generate code in imaging mode\n"
     " --permalloc-pkgimg={yes|no*}                  Copy the data section of package images into memory\n\n"
@@ -375,6 +378,7 @@ JL_DLLEXPORT void jl_parse_opts(int *argcp, char ***argvp)
            opt_trace_compile,
            opt_trace_compile_timing,
            opt_trace_dispatch,
+           opt_trace_loading,
            opt_task_metrics,
            opt_math_mode,
            opt_worker,
@@ -460,6 +464,7 @@ JL_DLLEXPORT void jl_parse_opts(int *argcp, char ***argvp)
         { "trace-compile",   required_argument, 0, opt_trace_compile },
         { "trace-compile-timing",  no_argument, 0, opt_trace_compile_timing },
         { "trace-dispatch",  required_argument, 0, opt_trace_dispatch },
+        { "trace-loading",   required_argument, 0, opt_trace_loading },
         { "task-metrics",    required_argument, 0, opt_task_metrics },
         { "math-mode",       required_argument, 0, opt_math_mode },
         { "handle-signals",  required_argument, 0, opt_handle_signals },
@@ -942,6 +947,11 @@ restart_switch:
          case opt_trace_dispatch:
             jl_options.trace_dispatch = strdup(optarg);
             if (!jl_options.trace_dispatch)
+                jl_errorf("fatal error: failed to allocate memory: %s", strerror(errno));
+            break;
+        case opt_trace_loading:
+            jl_options.trace_loading = strdup(optarg);
+            if (!jl_options.trace_loading)
                 jl_errorf("fatal error: failed to allocate memory: %s", strerror(errno));
             break;
         case opt_math_mode:

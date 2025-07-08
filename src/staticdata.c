@@ -86,6 +86,35 @@ External links:
 #include "valgrind.h"
 #include "julia_assert.h"
 
+// Loading tracing infrastructure
+jl_mutex_t trace_loading_out_lock;
+
+static void trace_loading_printf(const char *format, ...)
+{
+    static ios_t f_trace_loading;
+    static JL_STREAM* s_trace_loading = NULL;
+
+    JL_LOCK(&trace_loading_out_lock);
+    if (s_trace_loading == NULL) {
+        const char *t = jl_options.trace_loading;
+        if (!strncmp(t, "stderr", 6)) {
+            s_trace_loading = JL_STDERR;
+        }
+        else {
+            if (ios_file(&f_trace_loading, t, 1, 1, 1, 1) == NULL)
+                jl_errorf("cannot open trace loading file \"%s\" for writing", t);
+            s_trace_loading = (JL_STREAM*) &f_trace_loading;
+        }
+    }
+    va_list args;
+    va_start(args, format);
+    jl_vprintf(s_trace_loading, format, args);
+    va_end(args);
+    if (s_trace_loading != JL_STDERR)
+        ios_flush(&f_trace_loading);
+    JL_UNLOCK(&trace_loading_out_lock);
+}
+
 static const size_t WORLD_AGE_REVALIDATION_SENTINEL = 0x1;
 JL_DLLEXPORT size_t jl_require_world = ~(size_t)0;
 JL_DLLEXPORT _Atomic(size_t) jl_first_image_replacement_world = ~(size_t)0;
@@ -4390,13 +4419,20 @@ static jl_value_t *jl_restore_package_image_from_stream(ios_t *f, jl_image_t *im
 {
     JL_TIMING(LOAD_IMAGE, LOAD_Pkgimg);
     jl_timing_printf(JL_TIMING_DEFAULT_BLOCK, pkgname);
+
+    uint64_t start_time = jl_hrtime();
+
     uint64_t checksum = 0;
     int64_t dataendpos = 0;
     int64_t datastartpos = 0;
-    jl_value_t *verify_fail = jl_validate_cache_file(f, depmods, &checksum, &dataendpos, &datastartpos);
 
-    if (verify_fail)
+    uint64_t validation_start = jl_hrtime();
+    jl_value_t *verify_fail = jl_validate_cache_file(f, depmods, &checksum, &dataendpos, &datastartpos);
+    uint64_t validation_time = jl_hrtime() - validation_start;
+
+    if (verify_fail) {
         return verify_fail;
+    }
 
     assert(datastartpos > 0 && datastartpos < dataendpos);
     needs_permalloc = jl_options.permalloc_pkgimg || needs_permalloc;
@@ -4406,6 +4442,12 @@ static jl_value_t *jl_restore_package_image_from_stream(ios_t *f, jl_image_t *im
     jl_svec_t *cachesizes_sv = NULL;
     JL_GC_PUSH8(&restored, &init_order, &extext_methods, &internal_methods, &new_ext_cis, &method_roots_list, &edges, &cachesizes_sv);
 
+    uint64_t data_load_time = 0;
+    uint64_t checksum_time = 0;
+    uint64_t restore_time = 0;
+    pkgcachesizes cachesizes;
+    memset(&cachesizes, 0, sizeof(cachesizes));
+
     { // make a permanent in-memory copy of f (excluding the header)
         ios_bufmode(f, bm_none);
         JL_SIGATOMIC_BEGIN();
@@ -4413,23 +4455,39 @@ static jl_value_t *jl_restore_package_image_from_stream(ios_t *f, jl_image_t *im
         char *sysimg;
         int success = !needs_permalloc;
         ios_seek(f, datastartpos);
-        if (needs_permalloc)
+
+        uint64_t data_load_start = jl_hrtime();
+        if (needs_permalloc) {
             sysimg = (char*)jl_gc_perm_alloc(len, 0, 64, 0);
-        else
+        } else {
             sysimg = &f->buf[f->bpos];
+        }
         if (needs_permalloc)
             success = ios_readall(f, sysimg, len) == len;
+        data_load_time = jl_hrtime() - data_load_start;
+
+        uint64_t checksum_start = jl_hrtime();
         if (!success || jl_crc32c(0, sysimg, len) != (uint32_t)checksum) {
+            checksum_time = jl_hrtime() - checksum_start;
+            if (jl_options.trace_loading != NULL) {
+                uint64_t elapsed_time = jl_hrtime() - start_time;
+                trace_loading_printf("[trace-loading] Package image loading failed: %s (%.3f ms) - Checksum verification failed\n",
+                                    pkgname ? pkgname : "<unknown>", elapsed_time / 1e6);
+            }
             restored = jl_get_exceptionf(jl_errorexception_type, "Error reading package image file.");
             JL_SIGATOMIC_END();
         }
         else {
+            checksum_time = jl_hrtime() - checksum_start;
+
             if (needs_permalloc)
                 ios_close(f);
             ios_static_buffer(f, sysimg, len);
-            pkgcachesizes cachesizes;
+
+            uint64_t restore_start = jl_hrtime();
             jl_restore_system_image_from_stream_(f, image, depmods, checksum, (jl_array_t**)&restored, &init_order, &extext_methods, &internal_methods, &new_ext_cis, &method_roots_list,
                                                  &edges, &cachesizes);
+            restore_time = jl_hrtime() - restore_start;
             JL_SIGATOMIC_END();
 
             // Add roots to methods
@@ -4483,6 +4541,22 @@ static jl_value_t *jl_restore_package_image_from_stream(ios_t *f, jl_image_t *im
         }
     }
 
+    uint64_t elapsed_time = jl_hrtime() - start_time;
+    if (jl_options.trace_loading != NULL) {
+        trace_loading_printf("┌ %s pkgimage loaded: %.1f ms\n"
+                             "│   Cache validation:       %.2f ms\n"
+                             "│   Data loading/mapping:   %.2f ms, %ld bytes, permalloc: %s\n"
+                             "│   Checksum verification:  %.2f ms\n"
+                             "│   Image restoration:      %.2f ms\n"
+                             "└   Cache sizes:            sysdata: %zu, isbitsdata: %zu, symbols: %zu\n",
+                             pkgname ? pkgname : "<unknown>", elapsed_time / 1e6,
+                             validation_time / 1e6,
+                             data_load_time / 1e6, (long)(dataendpos - datastartpos), needs_permalloc ? "yes" : "no",
+                             checksum_time / 1e6,
+                             restore_time / 1e6,
+                             cachesizes.sysdata, cachesizes.isbitsdata, cachesizes.symboldata);
+    }
+
     JL_GC_POP();
     return restored;
 }
@@ -4525,6 +4599,8 @@ JL_DLLEXPORT void jl_restore_system_image(jl_image_t *image, jl_image_buf_t buf)
     if (buf.kind == JL_IMAGE_KIND_SO)
         assert(image->fptrs.ptrs); // jl_init_processor_sysimg should already be run
 
+    uint64_t start_time = jl_hrtime();
+
     JL_SIGATOMIC_BEGIN();
     ios_static_buffer(&f, (char *)buf.data, buf.size);
 
@@ -4533,6 +4609,13 @@ JL_DLLEXPORT void jl_restore_system_image(jl_image_t *image, jl_image_buf_t buf)
 
     ios_close(&f);
     JL_SIGATOMIC_END();
+
+    uint64_t elapsed_time = jl_hrtime() - start_time;
+    if (jl_options.trace_loading != NULL)
+        trace_loading_printf("┌ System image restored: %.3f ms\n"
+                             "└   %zu bytes\n",
+                             elapsed_time / 1e6,
+                             buf.size);
 }
 
 JL_DLLEXPORT jl_value_t *jl_restore_package_image_from_file(const char *fname, jl_array_t *depmods, int completeinfo, const char *pkgname, int ignore_native)

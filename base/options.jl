@@ -36,6 +36,7 @@ struct JLOptions
     polly::Int8
     trace_compile::Ptr{UInt8}
     trace_dispatch::Ptr{UInt8}
+    trace_loading::Ptr{UInt8}
     fast_math::Int8
     worker::Int8
     cookie::Ptr{UInt8}

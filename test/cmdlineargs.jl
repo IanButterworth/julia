@@ -873,6 +873,18 @@ let exename = `$(Base.julia_cmd()) --startup-file=no --color=no`
         @test occursin("precompile(Tuple{typeof(Main.foo), Int", _stderr)
     end
 
+    # --trace-loading
+    let
+        io = IOBuffer()
+        v = writereadpipeline(
+            "println(1 + 1)",
+            `$exename --trace-loading=stderr -i`,
+            stderr=io)
+        _stderr = String(take!(io))
+        # Basic test that trace loading produces some output and has correct format
+        @test occursin("[trace-loading]", _stderr)
+    end
+
     # test passing arguments
     mktempdir() do dir
         testfile, io = mktemp(dir)

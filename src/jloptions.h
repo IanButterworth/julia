@@ -40,6 +40,7 @@ typedef struct {
     int8_t polly;
     const char *trace_compile;
     const char *trace_dispatch;
+    const char *trace_loading;
     int8_t fast_math;
     int8_t worker;
     const char *cookie;
