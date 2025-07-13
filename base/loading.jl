@@ -3,6 +3,21 @@
 # Base.require is the implementation for the `import` statement
 const require_lock = ReentrantLock()
 
+# Loading tracing infrastructure
+function trace_loading_printf(msg::String)
+    trace_option = JLOptions().trace_loading
+    if trace_option != C_NULL
+        trace_str = unsafe_string(trace_option)
+        if trace_str == "stderr"
+            print(stderr, msg)
+        else
+            open(trace_str, "a") do f
+                print(f, msg)
+            end
+        end
+    end
+end
+
 # Cross-platform case-sensitive path canonicalization
 
 if Sys.isunix() && !Sys.isapple()
@@ -1247,11 +1262,17 @@ const TIMING_IMPORTS = Threads.Atomic{Int}(0)
 function _include_from_serialized(pkg::PkgId, path::String, ocachepath::Union{Nothing, String}, depmods::Vector{Any}; register::Bool=true)
     assert_havelock(require_lock)
     timing_imports = TIMING_IMPORTS[] > 0
+    trace_option = JLOptions().trace_loading
+    
     try
         if timing_imports
             t_before = time_ns()
             cumulative_compile_timing(true)
             t_comp_before = cumulative_compile_time_ns()
+        end
+        
+        if trace_option != C_NULL
+            trace_start_time = time_ns()
         end
 
         for i in eachindex(depmods)
@@ -1266,15 +1287,27 @@ function _include_from_serialized(pkg::PkgId, path::String, ocachepath::Union{No
         ignore_native = false
         unlock(require_lock) # temporarily _unlock_ during these operations
         sv = try
+            if trace_option != C_NULL
+                restore_start_time = time_ns()
+            end
+            
             if ocachepath !== nothing
                 @debug "Loading object cache file $ocachepath for $(repr("text/plain", pkg))"
-                ccall(:jl_restore_package_image_from_file, Any, (Cstring, Any, Cint, Cstring, Cint),
+                result = ccall(:jl_restore_package_image_from_file, Any, (Cstring, Any, Cint, Cstring, Cint),
                     ocachepath, depmods, #=completeinfo=#false, pkg.name, ignore_native)
             else
                 @debug "Loading cache file $path for $(repr("text/plain", pkg))"
-                ccall(:jl_restore_incremental, Any, (Cstring, Any, Cint, Cstring),
+                result = ccall(:jl_restore_incremental, Any, (Cstring, Any, Cint, Cstring),
                     path, depmods, #=completeinfo=#false, pkg.name)
             end
+            
+            if trace_option != C_NULL
+                restore_elapsed_time = (time_ns() - restore_start_time) / 1e6
+                cache_type = ocachepath !== nothing ? "object cache" : "incremental cache"
+                trace_loading_printf("│   Cache restoration ($cache_type): $(round(restore_elapsed_time, digits=2)) ms\n")
+            end
+            
+            result
         finally
             lock(require_lock)
         end
@@ -1287,9 +1320,20 @@ function _include_from_serialized(pkg::PkgId, path::String, ocachepath::Union{No
         ext_edges = sv[4]::Union{Nothing,Vector{Any}}
         extext_methods = sv[5]::Vector{Any}
         internal_methods = sv[6]::Vector{Any}
+        
+        if trace_option != C_NULL
+            backedge_start_time = time_ns()
+        end
+        
         Compiler.@zone "CC: INSERT_BACKEDGES" begin
             StaticData.insert_backedges(edges, ext_edges, extext_methods, internal_methods)
         end
+        
+        if trace_option != C_NULL
+            backedge_elapsed_time = (time_ns() - backedge_start_time) / 1e6
+            trace_loading_printf("│   Backedge insertion: $(round(backedge_elapsed_time, digits=2)) ms\n")
+        end
+        
         restored = register_restored_modules(sv, pkg, path)
 
         for M in restored
@@ -1300,6 +1344,11 @@ function _include_from_serialized(pkg::PkgId, path::String, ocachepath::Union{No
                     elapsed_time = time_ns() - t_before
                     comp_time, recomp_time = cumulative_compile_time_ns() .- t_comp_before
                     print_time_imports_report(M, elapsed_time, comp_time, recomp_time)
+                end
+                if trace_option != C_NULL
+                    trace_elapsed_time = (time_ns() - trace_start_time) / 1e6  # Convert to milliseconds
+                    cache_type = ocachepath !== nothing ? "object cache" : "precompiled cache"
+                    trace_loading_printf("└ $(pkg.name) loaded from $cache_type: $(round(trace_elapsed_time, digits=1)) ms\n")
                 end
                 return M
             end
@@ -1399,6 +1448,11 @@ function register_restored_modules(sv::SimpleVector, pkg::PkgId, path::String)
 
     inits = sv[2]::Vector{Any}
     if !isempty(inits)
+        trace_option = JLOptions().trace_loading
+        if trace_option != C_NULL
+            init_start_time = time_ns()
+        end
+        
         unlock(require_lock) # temporarily _unlock_ during these callbacks
         try
             for (i, mod) in pairs(inits)
@@ -1406,6 +1460,11 @@ function register_restored_modules(sv::SimpleVector, pkg::PkgId, path::String)
             end
         finally
             lock(require_lock)
+        end
+        
+        if trace_option != C_NULL
+            init_elapsed_time = (time_ns() - init_start_time) / 1e6
+            trace_loading_printf("│   Module initialization: $(round(init_elapsed_time, digits=2)) ms\n")
         end
     end
     return restored
@@ -2460,6 +2519,11 @@ end
 __require(uuidkey::PkgId) = @lock require_lock _require_prelocked(uuidkey)
 function _require_prelocked(uuidkey::PkgId, env=nothing)
     assert_havelock(require_lock)
+    trace_option = JLOptions().trace_loading
+    if trace_option != C_NULL
+        start_time = time_ns()
+    end
+    
     m = start_loading(uuidkey, UInt128(0), true)
     if m === nothing
         last = toplevel_load[]
@@ -2475,6 +2539,12 @@ function _require_prelocked(uuidkey::PkgId, env=nothing)
         # After successfully loading, notify downstream consumers
         run_package_callbacks(uuidkey)
     end
+    
+    if trace_option != C_NULL
+        elapsed_time = (time_ns() - start_time) / 1e6  # Convert to milliseconds
+        trace_loading_printf("└ $(uuidkey.name) and its deps loaded: $(round(elapsed_time, digits=1)) ms\n")
+    end
+    
     return m
 end
 
@@ -2584,8 +2654,19 @@ disable_parallel_precompile::Bool = false
 function __require_prelocked(pkg::PkgId, env)
     assert_havelock(require_lock)
 
+    trace_option = JLOptions().trace_loading
+    if trace_option != C_NULL
+        locate_start_time = time_ns()
+    end
+
     # perform the search operation to select the module file require intends to load
     path = locate_package(pkg, env)
+    
+    if trace_option != C_NULL
+        locate_elapsed_time = (time_ns() - locate_start_time) / 1e6
+        trace_loading_printf("│   Package location: $(round(locate_elapsed_time, digits=2)) ms\n")
+    end
+    
     if path === nothing
         throw(ArgumentError("""
             Package $(repr("text/plain", pkg)) is required but does not seem to be installed:
@@ -2598,8 +2679,18 @@ function __require_prelocked(pkg::PkgId, env)
     reasons = Dict{String,Int}()
     # attempt to load the module file via the precompile cache locations
     if JLOptions().use_compiled_modules != 0
+        if trace_option != C_NULL
+            cache_search_start_time = time_ns()
+        end
+        
         @label load_from_cache
         loaded = _require_search_from_serialized(pkg, path, UInt128(0), true; reasons)
+        
+        if trace_option != C_NULL
+            cache_search_elapsed_time = (time_ns() - cache_search_start_time) / 1e6
+            trace_loading_printf("│   Cache search: $(round(cache_search_elapsed_time, digits=2)) ms\n")
+        end
+        
         if loaded isa Module
             return loaded
         end
@@ -2690,8 +2781,17 @@ function __require_prelocked(pkg::PkgId, env)
     end
     unlock(require_lock)
     try
+        if trace_option != C_NULL
+            source_include_start_time = time_ns()
+        end
+        
         include(__toplevel__, path)
         loaded = maybe_root_module(pkg)
+        
+        if trace_option != C_NULL
+            source_include_elapsed_time = (time_ns() - source_include_start_time) / 1e6
+            trace_loading_printf("│   Source file inclusion: $(round(source_include_elapsed_time, digits=2)) ms\n")
+        end
     finally
         lock(require_lock)
         if uuid !== old_uuid
@@ -2977,6 +3077,11 @@ const newly_inferred = CodeInstance[]
 function include_package_for_output(pkg::PkgId, input::String, depot_path::Vector{String}, dl_load_path::Vector{String}, load_path::Vector{String},
                                     concrete_deps::typeof(_concrete_dependencies), source::Union{Nothing,String})
 
+    trace_option = JLOptions().trace_loading
+    if trace_option != C_NULL
+        include_start_time = time_ns()
+    end
+
     @lock require_lock begin
     m = start_loading(pkg, UInt128(0), false)
     @assert m === nothing
@@ -3015,6 +3120,12 @@ function include_package_for_output(pkg::PkgId, input::String, depot_path::Vecto
     # in the output. We removed it above to avoid including any code we may
     # have compiled for error handling and validation.
     ccall(:jl_set_newly_inferred, Cvoid, (Any,), newly_inferred)
+    
+    if trace_option != C_NULL
+        include_elapsed_time = (time_ns() - include_start_time) / 1e6  # Convert to milliseconds
+        trace_loading_printf("└ $(pkg.name) source loaded: $(round(include_elapsed_time, digits=1)) ms\n")
+    end
+    
     @lock require_lock end_loading(pkg, m)
     # insert_extension_triggers(pkg)
     # run_package_callbacks(pkg)
@@ -3169,6 +3280,11 @@ function compilecache(pkg::PkgId, path::String, internal_stderr::IO = stderr, in
                       reasons::Union{Dict{String,Int},Nothing}=Dict{String,Int}(), loadable_exts::Union{Vector{PkgId},Nothing}=nothing)
 
     @nospecialize internal_stderr internal_stdout
+    trace_option = JLOptions().trace_loading
+    if trace_option != C_NULL
+        compile_start_time = time_ns()
+    end
+    
     # decide where to put the resulting cache file
     cachepath = compilecache_dir(pkg)
 
@@ -3274,6 +3390,12 @@ function compilecache(pkg::PkgId, path::String, internal_stderr::IO = stderr, in
             # but force=true means it will fall back to non atomic
             # move if the initial rename fails.
             mv(tmppath, cachefile; force=true)
+            
+            if trace_option != C_NULL
+                compile_elapsed_time = (time_ns() - compile_start_time) / 1e6  # Convert to milliseconds
+                trace_loading_printf("│ $(pkg.name) precompiled: $(round(compile_elapsed_time, digits=1)) ms\n")
+            end
+            
             return cachefile, ocachefile
         end
     finally
