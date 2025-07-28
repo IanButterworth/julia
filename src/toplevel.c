@@ -899,7 +899,7 @@ static jl_value_t *jl_parse_eval_all(jl_module_t *module, jl_value_t *text,
             jl_rethrow();
         else
             jl_rethrow_other(jl_new_struct(jl_loaderror_type, filename, result,
-                                           jl_current_exception(ct)));
+                                           jl_current_exception(ct), jl_box_ulong(ct->ptls->bt_size)));
     }
     jl_lineno = last_lineno;
     jl_filename = last_filename;

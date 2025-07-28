@@ -457,10 +457,14 @@ end
 
 abstract type WrappedException <: Exception end
 
+raw_catch_backtrace() = ccall(:jl_get_backtrace, Ref{SimpleVector}, ()) # bt, bt2
 struct LoadError <: WrappedException
     file::AbstractString
     line::Int
     error
+    backtrace_size::UInt
+    LoadError(file::AbstractString, line::Int, error) = new(file, line, error, UInt(0))
+    LoadError(file::AbstractString, line::Int, error, backtrace_size::UInt) = new(file, line, error, backtrace_size)
 end
 
 struct InitError <: WrappedException

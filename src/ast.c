@@ -1149,7 +1149,7 @@ static jl_value_t *jl_invoke_julia_macro(jl_array_t *args, jl_module_t *inmodule
                 margs[0] = jl_cstr_to_string("<macrocall>");
             margs[1] = jl_fieldref(lno, 0); // extract and allocate line number
             jl_rethrow_other(jl_new_struct(jl_loaderror_type, margs[0], margs[1],
-                                           jl_current_exception(ct)));
+                                           jl_current_exception(ct), jl_box_ulong(ct->ptls->bt_size)));
         }
     }
     ct->world_age = last_age;

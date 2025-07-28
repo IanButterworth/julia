@@ -2333,7 +2333,11 @@ function require(into::Module, mod::Symbol)
     if world == typemax(UInt)
         world = get_world_counter()
     end
-    return Compiler.@zone "LOAD_Require" invoke_in_world(world, __require, into, mod)
+    return try
+        Compiler.@zone "LOAD_Require" invoke_in_world(world, __require, into, mod)
+    catch ex
+        ex isa LoadError ? throw_loaderror(ex) : rethrow()
+    end
 end
 
 function check_for_hint(into, mod)
@@ -2809,6 +2813,18 @@ function require_stdlib(package_uuidkey::PkgId, ext::Union{Nothing, String}, fro
     end # release lock
 end
 
+function throw_loaderror(err::LoadError)
+    # LoadError hides loading internals
+    if err.backtrace_size > 0
+        bt1, bt2 = Core.raw_catch_backtrace()
+        @info "Resizing backtrace to match LoadError" length(bt1) length(bt2) err.backtrace_size
+        resize!(bt1, err.backtrace_size)
+        resize!(bt2, err.backtrace_size)
+    end
+    # Forward the error to the user
+    rethrow(err.error)
+end
+
 # relative-path load
 
 """
@@ -2851,7 +2867,9 @@ function include_string(mapexpr::Function, mod::Module, code::AbstractString,
     catch exc
         # TODO: Now that stacktraces are more reliable we should remove
         # LoadError and expose the real error type directly.
-        rethrow(LoadError(filename, loc.line, exc))
+        backtrace_size = length(Core.raw_catch_backtrace()[1])
+        @show backtrace_size
+        rethrow(LoadError(filename, loc.line, exc, UInt(backtrace_size)))
     end
 end
 
@@ -3001,6 +3019,7 @@ function include_package_for_output(pkg::PkgId, input::String, depot_path::Vecto
     try
         Base.include(Base.__toplevel__, input)
     catch ex
+        ex isa LoadError && throw_loaderror(ex)
         precompilableerror(ex) || rethrow()
         @debug "Aborting `create_expr_cache'" exception=(ErrorException("Declaration of __precompile__(false) not allowed"), catch_backtrace())
         exit(125) # we define status = 125 means PrecompileableError

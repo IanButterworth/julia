@@ -131,7 +131,7 @@ end
 Get the backtrace of the current exception, for use within `catch` blocks.
 """
 function catch_backtrace()
-    bt, bt2 = ccall(:jl_get_backtrace, Ref{SimpleVector}, ())
+    bt, bt2 = Core.raw_catch_backtrace()
     return _reformat_bt(bt::Vector{Ptr{Cvoid}}, bt2::Vector{Any})
 end
 
