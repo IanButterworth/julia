@@ -36,6 +36,34 @@ const record_passes = OncePerProcess{Bool}() do
     return Base.get_bool_env("JULIA_TEST_RECORD_PASSES", false)
 end
 
+# Testset filtering functionality
+"""
+    testset_filter()
+
+Get the current testset filter string from the JULIA_TEST_TESTSET_FILTER environment variable.
+Returns `nothing` if no filter is set.
+"""
+testset_filter() = get(ENV, "JULIA_TEST_TESTSET_FILTER", nothing)
+
+"""
+    set_filtering_disabled(disabled::Bool)
+
+Set whether testset filtering should be disabled. This is used internally
+to disable filtering when we're inside a testset that already matches the filter.
+"""
+function set_filtering_disabled(disabled::Bool)
+    task_local_storage()[:__TESTSET_FILTERING_DISABLED__] = disabled
+end
+
+"""
+    is_filtering_disabled()
+
+Check if testset filtering is currently disabled.
+"""
+function is_filtering_disabled()
+    get(task_local_storage(), :__TESTSET_FILTERING_DISABLED__, false)
+end
+
 #-----------------------------------------------------------------------
 
 # Backtrace utility functions
@@ -317,6 +345,23 @@ function Base.show(io::IO, t::Broken)
     end
 end
 
+"""
+    Test.Skipped <: Test.Result
+
+The test was skipped due to testset filtering.
+"""
+struct Skipped <: Result
+    test_type::Symbol
+    orig_expr
+end
+
+function Base.show(io::IO, t::Skipped)
+    printstyled(io, "Test Skipped\n"; bold=true, color=:light_black)
+    if !(t.orig_expr === nothing)
+        print(io, "  Reason: ", t.orig_expr)
+    end
+end
+
 # Types that appear in TestSetException.errors_and_fails we convert eagerly into strings
 # other types we convert lazily
 function Serialization.serialize(s::Serialization.AbstractSerializer, t::Pass)
@@ -331,6 +376,13 @@ function Serialization.serialize(s::Serialization.AbstractSerializer, t::Pass)
 end
 
 function Serialization.serialize(s::Serialization.AbstractSerializer, t::Broken)
+    Serialization.serialize_type(s, typeof(t))
+    Serialization.serialize(s, t.test_type)
+    Serialization.serialize(s, t.orig_expr === nothing ? nothing : string(t.orig_expr))
+    nothing
+end
+
+function Serialization.serialize(s::Serialization.AbstractSerializer, t::Skipped)
     Serialization.serialize_type(s, typeof(t))
     Serialization.serialize(s, t.test_type)
     Serialization.serialize(s, t.orig_expr === nothing ? nothing : string(t.orig_expr))
@@ -1240,6 +1292,8 @@ struct FailFastError <: Exception end
 
 # For a broken result, simply store the result
 record(ts::DefaultTestSet, t::Broken) = (push!(ts.results, t); t)
+# For a skipped result, simply store the result
+record(ts::DefaultTestSet, t::Skipped) = (push!(ts.results, t); t)
 # For a passed result, do not store the result since it uses a lot of memory, unless
 # `record_passes()` is true. i.e. set env var `JULIA_TEST_RECORD_PASSES=true` before running any testsets
 function record(ts::DefaultTestSet, t::Pass)
@@ -1337,11 +1391,13 @@ function print_test_results(ts::AbstractTestSet, depth_pad=0)
     total_fail   = tc.fails  + tc.cumulative_fails
     total_error  = tc.errors + tc.cumulative_errors
     total_broken = tc.broken + tc.cumulative_broken
+    total_skipped = tc.skipped + tc.cumulative_skipped
     dig_pass   = total_pass   > 0 ? ndigits(total_pass)   : 0
     dig_fail   = total_fail   > 0 ? ndigits(total_fail)   : 0
     dig_error  = total_error  > 0 ? ndigits(total_error)  : 0
     dig_broken = total_broken > 0 ? ndigits(total_broken) : 0
-    total = total_pass + total_fail + total_error + total_broken
+    dig_skipped = total_skipped > 0 ? ndigits(total_skipped) : 0
+    total = total_pass + total_fail + total_error + total_broken + total_skipped
     dig_total = total > 0 ? ndigits(total) : 0
     # For each category, take max of digits and header width if there are
     # tests of that type
@@ -1349,6 +1405,7 @@ function print_test_results(ts::AbstractTestSet, depth_pad=0)
     fail_width   = dig_fail   > 0 ? max(length("Fail"),   dig_fail)   : 0
     error_width  = dig_error  > 0 ? max(length("Error"),  dig_error)  : 0
     broken_width = dig_broken > 0 ? max(length("Broken"), dig_broken) : 0
+    skipped_width = dig_skipped > 0 ? max(length("Skipped"), dig_skipped) : 0
     total_width  = max(textwidth("Total"),  dig_total)
     duration_width = max(textwidth("Time"), textwidth(tc.duration))
     # Calculate the alignment of the test result counts by
@@ -1368,6 +1425,9 @@ function print_test_results(ts::AbstractTestSet, depth_pad=0)
     if broken_width > 0
         printstyled(lpad("Broken", broken_width, " "), "  "; bold=true, color=Base.warn_color())
     end
+    if skipped_width > 0
+        printstyled(lpad("Skipped", skipped_width, " "), "  "; bold=true, color=:light_black)
+    end
     if total_width > 0 || total == 0
         printstyled(lpad("Total", total_width, " "), "  "; bold=true, color=Base.info_color())
     end
@@ -1377,9 +1437,9 @@ function print_test_results(ts::AbstractTestSet, depth_pad=0)
     end
     println()
     # Recursively print a summary at every level
-    print_counts(ts, depth_pad, align, pass_width, fail_width, error_width, broken_width, total_width, duration_width, timing)
+    print_counts(ts, depth_pad, align, pass_width, fail_width, error_width, broken_width, skipped_width, total_width, duration_width, timing)
     # Print the RNG of the outer testset if there are failures
-    if total != total_pass + total_broken
+    if total != total_pass + total_broken + total_skipped
         rng = get_rng(ts)
         if !isnothing(rng)
             println("RNG of the outermost testset: ", rng)
@@ -1407,14 +1467,15 @@ function finish(ts::DefaultTestSet; print_results::Bool=TESTSET_PRINT_ENABLE[])
     total_fail   = tc.fails  + tc.cumulative_fails
     total_error  = tc.errors + tc.cumulative_errors
     total_broken = tc.broken + tc.cumulative_broken
-    total = total_pass + total_fail + total_error + total_broken
+    total_skipped = tc.skipped + tc.cumulative_skipped
+    total = total_pass + total_fail + total_error + total_broken + total_skipped
 
     if print_results
         print_test_results(ts)
     end
 
     # Finally throw an error as we are the outermost test set
-    if total != total_pass + total_broken
+    if total != total_pass + total_broken + total_skipped
         # Get all the error/failures and bring them along for the ride
         efs = filter_errors(ts)
         throw(TestSetException(total_pass, total_fail, total_error, total_broken, efs))
@@ -1488,10 +1549,12 @@ Fields:
  * `fails`: The number of failing `@test` invocations.
  * `errors`: The number of erroring `@test` invocations.
  * `broken`: The number of broken `@test` invocations.
+ * `skipped`: The number of skipped `@test` invocations.
  * `passes`: The cumulative number of passing `@test` invocations.
  * `fails`: The cumulative number of failing `@test` invocations.
  * `errors`: The cumulative number of erroring `@test` invocations.
  * `broken`: The cumulative number of broken `@test` invocations.
+ * `skipped`: The cumulative number of skipped `@test` invocations.
  * `duration`: The total duration the `AbstractTestSet` in question ran for, as a formatted `String`.
 """
 struct TestCounts
@@ -1500,10 +1563,12 @@ struct TestCounts
     fails::Int
     errors::Int
     broken::Int
+    skipped::Int
     cumulative_passes::Int
     cumulative_fails::Int
     cumulative_errors::Int
     cumulative_broken::Int
+    cumulative_skipped::Int
     duration::String
 end
 
@@ -1521,27 +1586,29 @@ reporting `x` for failures and `?s` for the duration.
 """
 function get_test_counts end
 
-get_test_counts(ts::AbstractTestSet) = TestCounts(false, 0,0,0,0,0,0,0,0, format_duration(ts))
+get_test_counts(ts::AbstractTestSet) = TestCounts(false, 0,0,0,0,0,0,0,0,0,0, format_duration(ts))
 
 function get_test_counts(ts::DefaultTestSet)
-    passes, fails, errors, broken = ts.n_passed, 0, 0, 0
+    passes, fails, errors, broken, skipped = ts.n_passed, 0, 0, 0, 0
     # cumulative results
-    c_passes, c_fails, c_errors, c_broken = 0, 0, 0, 0
+    c_passes, c_fails, c_errors, c_broken, c_skipped = 0, 0, 0, 0, 0
     for t in ts.results
-        isa(t, Fail)   && (fails  += 1)
-        isa(t, Error)  && (errors += 1)
-        isa(t, Broken) && (broken += 1)
+        isa(t, Fail)    && (fails   += 1)
+        isa(t, Error)   && (errors  += 1)
+        isa(t, Broken)  && (broken  += 1)
+        isa(t, Skipped) && (skipped += 1)
         if isa(t, AbstractTestSet)
             tc = get_test_counts(t)::TestCounts
             c_passes += tc.passes + tc.cumulative_passes
             c_fails  += tc.fails + tc.cumulative_fails
             c_errors += tc.errors + tc.cumulative_errors
             c_broken += tc.broken + tc.cumulative_broken
+            c_skipped += tc.skipped + tc.cumulative_skipped
         end
     end
     duration = format_duration(ts)
     ts.anynonpass = (fails + errors + c_fails + c_errors > 0)
-    return TestCounts(true, passes, fails, errors, broken, c_passes, c_fails, c_errors, c_broken, duration)
+    return TestCounts(true, passes, fails, errors, broken, skipped, c_passes, c_fails, c_errors, c_broken, c_skipped, duration)
 end
 
 """
@@ -1573,13 +1640,13 @@ results(::AbstractTestSet) = ()
 # Recursive function that prints out the results at each level of
 # the tree of test sets
 function print_counts(ts::AbstractTestSet, depth, align,
-                      pass_width, fail_width, error_width, broken_width, total_width, duration_width, showtiming)
+                      pass_width, fail_width, error_width, broken_width, skipped_width, total_width, duration_width, showtiming)
     # Count results by each type at this level, and recursively
     # through any child test sets
     tc = get_test_counts(ts)
     fallbackstr = tc.customized ? " " : "x"
-    subtotal = tc.passes + tc.fails + tc.errors + tc.broken +
-               tc.cumulative_passes + tc.cumulative_fails + tc.cumulative_errors + tc.cumulative_broken
+    subtotal = tc.passes + tc.fails + tc.errors + tc.broken + tc.skipped +
+               tc.cumulative_passes + tc.cumulative_fails + tc.cumulative_errors + tc.cumulative_broken + tc.cumulative_skipped
     # Print test set header, with an alignment that ensures all
     # the test results appear above each other
     print(rpad(string("  "^depth, ts.description), align, " "), " | ")
@@ -1616,7 +1683,15 @@ function print_counts(ts::AbstractTestSet, depth, align,
         printstyled(lpad(fallbackstr, broken_width, " "), "  ", color=Base.warn_color())
     end
 
-    if n_passes == 0 && n_fails == 0 && n_errors == 0 && n_broken == 0
+    n_skipped = tc.skipped + tc.cumulative_skipped
+    if n_skipped > 0
+        printstyled(lpad(string(n_skipped), skipped_width, " "), "  ", color=:light_black)
+    elseif skipped_width > 0
+        # None skipped at this level, but some at another level
+        printstyled(lpad(fallbackstr, skipped_width, " "), "  ", color=:light_black)
+    end
+
+    if n_passes == 0 && n_fails == 0 && n_errors == 0 && n_broken == 0 && n_skipped == 0
         total_str = tc.customized ? string(subtotal) : "?"
         printstyled(lpad(total_str, total_width, " "), "  ", color=Base.info_color())
     else
@@ -1630,14 +1705,416 @@ function print_counts(ts::AbstractTestSet, depth, align,
 
     # Only print results at lower levels if we had failures or if the user
     # wants. Requires the given `AbstractTestSet` to have a vector of results
-    if ((n_passes + n_broken != subtotal) || print_verbose(ts))
+    if ((n_passes + n_broken + n_skipped != subtotal) || print_verbose(ts))
         for t in results(ts)
             if isa(t, AbstractTestSet)
                 print_counts(t, depth + 1, align,
-                    pass_width, fail_width, error_width, broken_width, total_width, duration_width, ts.showtiming)
+                    pass_width, fail_width, error_width, broken_width, skipped_width, total_width, duration_width, ts.showtiming)
             end
         end
     end
+end
+
+#-----------------------------------------------------------------------
+# Testset filtering helper functions
+
+"""
+    get_testset_description(ts::AbstractTestSet)
+
+Get the description of a testset for filtering purposes.
+"""
+get_testset_description(ts::DefaultTestSet) = ts.description
+get_testset_description(ts::ContextTestSet) = string(ts.context_name)
+get_testset_description(ts::AbstractTestSet) = ""  # fallback for other testset types
+
+"""
+    should_skip_testset(ts::AbstractTestSet)
+
+Check if a testset should be skipped based on the JULIA_TEST_TESTSET_FILTER environment variable.
+"""
+function should_skip_testset(ts::AbstractTestSet)
+    filter_str = testset_filter()
+    if filter_str === nothing
+        return false
+    end
+    description = get_testset_description(ts)
+    return !contains(description, filter_str)
+end
+
+# Overload for when we have the description as a string directly
+function should_skip_testset(description::AbstractString)
+    filter_str = testset_filter()
+    return filter_str !== nothing && !contains(description, filter_str)
+end
+
+"""
+    has_matching_nested_testset(expr, source_file=nothing)
+
+Recursively search through an expression to find any nested @testset calls
+that match the current filter. Returns true if any nested testset would match.
+source_file should be the file containing the expression for relative path resolution.
+"""
+function has_matching_nested_testset(expr, source_file=nothing)
+    filter_str = testset_filter()
+    if filter_str === nothing
+        return false
+    end
+
+    return _search_for_matching_testsets(expr, filter_str, source_file)
+end
+
+function _search_for_matching_testsets(expr, filter_str, source_file=nothing)
+    if isa(expr, Expr)
+        # Check if this is a @testset macro call
+        if expr.head == :macrocall && length(expr.args) >= 2
+            macro_name = expr.args[1]
+            if (isa(macro_name, Symbol) && string(macro_name) == "@testset") ||
+               (isa(macro_name, GlobalRef) && macro_name.name == Symbol("@testset"))
+                # Extract the description from the @testset call
+                desc = _extract_testset_description(expr)
+                if desc !== nothing && contains(desc, filter_str)
+                    return true
+                end
+            end
+        end
+
+        # Check if this is an include() call - if so, assume it might contain matches
+        # We'll let the include run and apply filtering to whatever testsets it contains
+        if expr.head === :call && length(expr.args) >= 2 && expr.args[1] === :include
+            return true  # Always assume includes might contain matching tests
+        end
+
+        # Recursively search all subexpressions
+        for arg in expr.args
+            if _search_for_matching_testsets(arg, filter_str, source_file)
+                return true
+            end
+        end
+    elseif isa(expr, QuoteNode) && isa(expr.value, Expr)
+        # Handle quoted expressions
+        return _search_for_matching_testsets(expr.value, filter_str, source_file)
+    end
+
+    return false
+end
+
+function _extract_testset_description(expr::Expr)
+    # @testset "description" begin ... end
+    # @testset TestSetType "description" begin ... end
+    # @testset for ... "description" begin ... end
+    # Look for string literals in the macro arguments, skipping the macro name and source location
+    for i in 2:length(expr.args)
+        arg = expr.args[i]
+
+        # Skip LineNumberNode
+        isa(arg, LineNumberNode) && continue
+
+        # Direct string literal
+        if isa(arg, String)
+            return arg
+        end
+
+        # String interpolation expression
+        if isa(arg, Expr) && arg.head === :string
+            # For simple cases, try to evaluate the string
+            # For complex interpolations, just check if any part matches
+            parts = String[]
+            for part in arg.args
+                if isa(part, String)
+                    push!(parts, part)
+                else
+                    # For interpolated parts, we can't evaluate them at macro expansion time
+                    # So we'll be conservative and just look for string literals
+                    push!(parts, "")
+                end
+            end
+            return join(parts)
+        end
+
+        # Handle quoted strings
+        if isa(arg, QuoteNode) && isa(arg.value, String)
+            return arg.value
+        end
+
+        # Skip type names and other non-string arguments
+        if isa(arg, Symbol) || (isa(arg, Expr) && arg.head in (:., :block, :for, :let))
+            continue
+        end
+    end
+    return nothing
+end
+
+"""
+    should_skip_testset_with_lookahead(description::AbstractString, tests_expr)
+
+Check if a testset should be skipped, considering both the current testset description
+and whether any nested testsets would match the filter.
+"""
+function should_skip_testset_with_lookahead(description::AbstractString, tests_expr)
+    filter_str = testset_filter()
+    if filter_str === nothing
+        return false
+    end
+
+    # If this testset matches, don't skip
+    if contains(description, filter_str)
+        return false
+    end
+
+    # If any nested testset matches, don't skip this parent
+    if has_matching_nested_testset(tests_expr)
+        return false
+    end
+
+    # No matches found, skip this testset
+    return true
+end
+
+"""
+    record_skipped_testset(ts::AbstractTestSet, tests_expr, source_file=nothing)
+
+Record all tests in a testset as skipped by parsing the test expression
+and counting the @test, @test_throws, etc. macros.
+"""
+function record_skipped_testset(ts::AbstractTestSet, tests_expr, source_file=nothing)
+    count = count_tests_in_expr(tests_expr, source_file)
+    for i in 1:count
+        record(ts, Skipped(:testset_filtered, "testset filtered"))
+    end
+end
+
+# Runtime filtering function that generates the appropriate code
+function filter_tests_at_runtime(tests_expr, desc_expr)
+    # This function returns an expression that will be evaluated at runtime
+    # to selectively execute only the matching tests
+    quote
+        local filter_str = testset_filter()
+        local current_desc = $desc_expr
+        
+        if filter_str === nothing || contains(current_desc, filter_str)
+            # No filter or current testset matches - run everything
+            $(tests_expr)
+        else
+            # Filter content - only run matching nested testsets
+            $(filter_runtime_content(tests_expr))
+        end
+    end
+end
+
+# Generate filtered content that only includes nested @testset calls and include() calls, not other statements
+function generate_filtered_content(expr)
+    if !isa(expr, Expr) || expr.head != :block
+        return expr
+    end
+    
+    # Extract only the @testset macro calls and include() calls from the block
+    filtered_statements = []
+    
+    for stmt in expr.args
+        if isa(stmt, LineNumberNode)
+            # Keep line numbers for proper error reporting
+            push!(filtered_statements, stmt)
+        elseif is_testset_call(stmt)
+            # This is a nested @testset - include it
+            push!(filtered_statements, stmt)
+        elseif isa(stmt, Expr) && stmt.head === :call && length(stmt.args) >= 2 && stmt.args[1] === :include
+            # This is an include() call - include it to allow filtering within included files
+            push!(filtered_statements, stmt)
+        end
+        # Skip all other statements (assignments, non-include function calls, @test, etc.)
+    end
+    
+    return Expr(:block, filtered_statements...)
+end
+
+function filter_testset_call_content_at_macro_time(expr, filter_str)
+    if !is_testset_call(expr)
+        return expr
+    end
+    
+    # Find and filter the body while preserving other arguments
+    filtered_args = []
+    for i in 1:length(expr.args)
+        arg = expr.args[i]
+        if isa(arg, Expr) && arg.head == :block
+            # This is the body - filter it
+            filtered_body = filter_expr_content_at_macro_time(arg, filter_str)
+            push!(filtered_args, filtered_body)
+        else
+            # Keep other arguments (macro name, description, etc.)
+            push!(filtered_args, arg)
+        end
+    end
+    
+    return Expr(expr.head, filtered_args...)
+end
+
+function filter_expr_content(expr, filter_str)
+    if !isa(expr, Expr)
+        return expr
+    end
+    
+    if expr.head == :block
+        # Filter block statements
+        filtered_args = []
+        for arg in expr.args
+            if isa(arg, LineNumberNode)
+                # Always keep line number nodes
+                push!(filtered_args, arg)
+            elseif is_testset_call(arg)
+                # Check if this testset or its children match
+                testset_desc = extract_testset_description_from_call(arg)
+                if testset_desc !== nothing && contains(testset_desc, filter_str)
+                    # This testset matches, include it
+                    push!(filtered_args, arg)
+                elseif has_matching_nested_testset_in_call(arg, filter_str)
+                    # This testset has matching children, include it but filter its content
+                    filtered_testset = filter_testset_call_content(arg, filter_str)
+                    push!(filtered_args, filtered_testset)
+                end
+                # If neither this testset nor its children match, skip it entirely
+            else
+                # For non-testset statements, skip them if we're filtering
+                # (they would only run if the parent testset matched, which it doesn't)
+                continue
+            end
+        end
+        return Expr(:block, filtered_args...)
+    else
+        # For non-block expressions, recurse through arguments
+        filtered_args = [filter_expr_content(arg, filter_str) for arg in expr.args]
+        return Expr(expr.head, filtered_args...)
+    end
+end
+
+function is_testset_call(expr)
+    return isa(expr, Expr) && expr.head == :macrocall && 
+           length(expr.args) >= 2 && 
+           (string(expr.args[1]) == "@testset" || 
+            (isa(expr.args[1], GlobalRef) && expr.args[1].name == Symbol("@testset")))
+end
+
+function extract_testset_description_from_call(expr)
+    if !is_testset_call(expr)
+        return nothing
+    end
+    
+    # Look for string description in the macro arguments
+    for i in 2:length(expr.args)
+        arg = expr.args[i]
+        isa(arg, LineNumberNode) && continue
+        
+        if isa(arg, String)
+            return arg
+        elseif isa(arg, Expr) && arg.head === :string
+            # Handle string interpolation - for filtering purposes, 
+            # check if any string parts contain the filter
+            parts = String[]
+            for part in arg.args
+                if isa(part, String)
+                    push!(parts, part)
+                end
+            end
+            return join(parts, "")
+        end
+    end
+    return nothing
+end
+
+function has_matching_nested_testset_in_call(expr, filter_str)
+    if !is_testset_call(expr)
+        return false
+    end
+    
+    # Find the body of the testset (usually the last argument)
+    for i in length(expr.args):-1:1
+        arg = expr.args[i]
+        if isa(arg, Expr) && arg.head == :block
+            return _search_for_matching_testsets(arg, filter_str)
+        end
+    end
+    return false
+end
+
+function filter_testset_call_content(expr, filter_str)
+    if !is_testset_call(expr)
+        return expr
+    end
+    
+    # Find and filter the body while preserving other arguments
+    filtered_args = []
+    for i in 1:length(expr.args)
+        arg = expr.args[i]
+        if isa(arg, Expr) && arg.head == :block
+            # This is the body - filter it
+            filtered_body = filter_expr_content(arg, filter_str)
+            push!(filtered_args, filtered_body)
+        else
+            # Keep other arguments (macro name, description, etc.)
+            push!(filtered_args, arg)
+        end
+    end
+    
+    return Expr(expr.head, filtered_args...)
+end
+
+"""
+    count_tests_in_expr(expr, source_file=nothing)
+
+Count the number of @test macros (@test, @test_throws, etc.) in an expression.
+"""
+function count_tests_in_expr(expr, source_file=nothing)
+    count = 0
+    if isa(expr, Expr)
+        if expr.head == :macrocall && length(expr.args) >= 1
+            macro_name = expr.args[1]
+            # Check for test macros
+            if isa(macro_name, Symbol)
+                name_str = string(macro_name)
+                if startswith(name_str, "@test")
+                    count += 1
+                end
+            elseif isa(macro_name, GlobalRef) && isa(macro_name.name, Symbol)
+                name_str = string(macro_name.name)
+                if startswith(name_str, "@test")
+                    count += 1
+                end
+            end
+        elseif expr.head === :call && length(expr.args) >= 2 && expr.args[1] === :include
+            # For includes, we can't know the exact count ahead of time
+            # The actual filtering will happen when the included testsets run
+            # So we just return 0 here - the skipped count will be handled by the included testsets themselves
+            count += 0
+        end
+
+        # Recursively count in subexpressions
+        for arg in expr.args
+            count += count_tests_in_expr(arg, source_file)
+        end
+    elseif isa(expr, QuoteNode) && isa(expr.value, Expr)
+        count += count_tests_in_expr(expr.value, source_file)
+    end
+
+    return count
+end
+
+"""
+    count_tests_in_included_file(filepath::String)
+
+Count the number of @test macros in an included file.
+"""
+function count_tests_in_included_file(filepath::String)
+    try
+        if isfile(filepath)
+            content = read(filepath, String)
+            parsed = Meta.parse("begin\n$content\nend")
+            return count_tests_in_expr(parsed)
+        end
+    catch
+        # If we can't parse the file, assume a reasonable default
+        return 1
+    end
+    return 0
 end
 
 #-----------------------------------------------------------------------
@@ -1915,35 +2392,86 @@ function testset_beginend_call(args, tests, source)
             $(testsettype)($desc; $options...)
         end
         push_testset(ts)
-        # we reproduce the logic of guardseed, but this function
-        # cannot be used as it changes slightly the semantic of @testset,
-        # by wrapping the body in a function
+
+        # Set up RNG state variables (needed for both paths)
         local default_rng_orig = copy(default_rng())
         local tls_seed_orig = copy(Random.get_tls_seed())
         local ts_rng = get_rng(ts)
         local tls_seed = isnothing(ts_rng) ? set_rng!(ts, tls_seed_orig) : ts_rng
-        try
-            # default RNG is reset to its state from last `seed!()` to ease reproduce a failed test
-            copy!(Random.default_rng(), tls_seed)
-            copy!(Random.get_tls_seed(), Random.default_rng())
-            let
-                $(esc(tests))
+
+        # Apply filtering to the testset content with precise control
+        local filter_str = testset_filter()
+        local desc_str = string($desc)  # Convert description to string for comparison
+        local filtering_disabled = is_filtering_disabled()
+        local should_skip_this = filter_str !== nothing && !filtering_disabled && !contains(desc_str, filter_str)
+        local has_matching_children = filter_str !== nothing && !filtering_disabled && has_matching_nested_testset($(QuoteNode(tests)), $(QuoteNode(source)))
+        
+        if filter_str !== nothing && should_skip_this && !has_matching_children
+            # Skip this testset entirely - no matches in this or children
+            try
+                record_skipped_testset(ts, $(QuoteNode(tests)), $(QuoteNode(source)))
+            finally
+                copy!(default_rng(), default_rng_orig)
+                copy!(Random.get_tls_seed(), tls_seed_orig)
+                pop_testset()
+                ret = finish(ts)
             end
-        catch err
-            err isa InterruptException && rethrow()
-            # something in the test block threw an error. Count that as an
-            # error in this test set
-            trigger_test_failure_break(err)
-            if is_failfast_error(err)
-                get_testset_depth() > 1 ? rethrow() : failfast_print()
-            else
-                record(ts, Error(:nontest_error, Expr(:tuple), err, Base.current_exceptions(), $(QuoteNode(source)), nothing))
+        elseif filter_str !== nothing && should_skip_this && has_matching_children
+            # This testset doesn't match but has matching children
+            # Run only the matching nested testsets, skip direct content
+            try
+                copy!(Random.default_rng(), tls_seed)
+                copy!(Random.get_tls_seed(), Random.default_rng())
+                let
+                    $(esc(generate_filtered_content(tests)))
+                end
+            catch err
+                err isa InterruptException && rethrow()
+                record(ts, Error(:nontest_error, Expr(:block), err, [], $(QuoteNode(source))))
+            finally
+                copy!(default_rng(), default_rng_orig)
+                copy!(Random.get_tls_seed(), tls_seed_orig)
+                pop_testset()
+                ret = finish(ts)
             end
-        finally
-            copy!(default_rng(), default_rng_orig)
-            copy!(Random.get_tls_seed(), tls_seed_orig)
-            pop_testset()
-            ret = finish(ts)
+        else
+            # Normal execution - either no filter, filtering disabled, or this testset matches
+            local was_filtering_disabled = filtering_disabled
+            if filter_str !== nothing && !filtering_disabled && contains(desc_str, filter_str)
+                # This testset matches the filter - disable filtering for children
+                set_filtering_disabled(true)
+            end
+            
+            # we reproduce the logic of guardseed, but this function
+            # cannot be used as it changes slightly the semantic of @testset,
+            # by wrapping the body in a function
+            try
+                # default RNG is reset to its state from last `seed!()` to ease reproduce a failed test
+                copy!(Random.default_rng(), tls_seed)
+                copy!(Random.get_tls_seed(), Random.default_rng())
+                let
+                    $(esc(tests))
+                end
+            catch err
+                err isa InterruptException && rethrow()
+                # something in the test block threw an error. Count that as an
+                # error in this test set
+                trigger_test_failure_break(err)
+                if is_failfast_error(err)
+                    get_testset_depth() > 1 ? rethrow() : failfast_print()
+                else
+                    record(ts, Error(:nontest_error, Expr(:tuple), err, Base.current_exceptions(), $(QuoteNode(source)), nothing))
+                end
+            finally
+                # Restore previous filtering state
+                if filter_str !== nothing && !was_filtering_disabled && contains(desc_str, filter_str)
+                    set_filtering_disabled(was_filtering_disabled)
+                end
+                copy!(default_rng(), default_rng_orig)
+                copy!(Random.get_tls_seed(), tls_seed_orig)
+                pop_testset()
+                ret = finish(ts)
+            end
         end
         ret
     end
@@ -2015,19 +2543,26 @@ function testset_forloop(args, testloop, source)
         end
         push_testset(ts)
         first_iteration = false
-        try
-            $(esc(tests))
-        catch err
-            err isa InterruptException && rethrow()
-            # Something in the test block threw an error. Count that as an
-            # error in this test set
-            trigger_test_failure_break(err)
-            if is_failfast_error(err)
-                get_testset_depth() > 1 ? rethrow() : failfast_print()
-            else
-                record(ts, Error(:nontest_error, Expr(:tuple), err, Base.current_exceptions(), $(QuoteNode(source)), nothing))
+
+        # Check if this testset should be skipped due to filtering
+        # For loop testsets, we need to check the runtime description
+        if should_skip_testset(ts)
+            record_skipped_testset(ts, $(QuoteNode(tests)))
+        else
+            try
+                $(esc(tests))
+            catch err
+                err isa InterruptException && rethrow()
+                # Something in the test block threw an error. Count that as an
+                # error in this test set
+                trigger_test_failure_break(err)
+                if is_failfast_error(err)
+                    get_testset_depth() > 1 ? rethrow() : failfast_print()
+                else
+                    record(ts, Error(:nontest_error, Expr(:tuple), err, Base.current_exceptions(), $(QuoteNode(source)), nothing))
+                end
             end
-        end
+        end  # end of the else block for filtering
     end
     quote
         local arr = Vector{Any}()
