@@ -1770,10 +1770,37 @@ function _search_for_matching_testsets(expr, filter_str, source_file=nothing)
             macro_name = expr.args[1]
             if (isa(macro_name, Symbol) && string(macro_name) == "@testset") ||
                (isa(macro_name, GlobalRef) && macro_name.name == Symbol("@testset"))
+                
+                # Check if this is a @testset ... for ... construct
+                # If so, be conservative and assume it might contain matches
+                for i in 3:length(expr.args)  # Skip macro name and line number
+                    arg = expr.args[i]
+                    if isa(arg, Expr) && arg.head === :for
+                        # This is a @testset ... for ... construct
+                        # Be conservative and assume it might contain matching testsets
+                        return true
+                    end
+                end
+                
                 # Extract the description from the @testset call
                 desc = _extract_testset_description(expr)
-                if desc !== nothing && contains(desc, filter_str)
-                    return true
+                if desc !== nothing
+                    if desc === :__INTERPOLATED_STRING__
+                        # This testset has an interpolated name we can't evaluate
+                        # Be conservative and assume it might contain matches
+                        return true
+                    elseif contains(string(desc), filter_str)
+                        return true
+                    end
+                end
+                
+                # Also check if this @testset has any arguments that might contain nested testsets
+                # This handles other complex cases
+                for i in 3:length(expr.args)  # Skip macro name and line number
+                    arg = expr.args[i]
+                    if _search_for_matching_testsets(arg, filter_str, source_file)
+                        return true
+                    end
                 end
             end
         end
@@ -1782,6 +1809,17 @@ function _search_for_matching_testsets(expr, filter_str, source_file=nothing)
         # We'll let the include run and apply filtering to whatever testsets it contains
         if expr.head === :call && length(expr.args) >= 2 && expr.args[1] === :include
             return true  # Always assume includes might contain matching tests
+        end
+
+        # Handle for loops specially - they contain testsets in their body
+        if expr.head === :for
+            # For loops have the structure: Expr(:for, iterator_part, body)
+            if length(expr.args) >= 2
+                # Search in the body of the for loop
+                if _search_for_matching_testsets(expr.args[2], filter_str, source_file)
+                    return true
+                end
+            end
         end
 
         # Recursively search all subexpressions
@@ -1817,18 +1855,26 @@ function _extract_testset_description(expr::Expr)
         # String interpolation expression
         if isa(arg, Expr) && arg.head === :string
             # For simple cases, try to evaluate the string
-            # For complex interpolations, just check if any part matches
+            # For complex interpolations, check if any part matches
+            has_interpolation = false
             parts = String[]
             for part in arg.args
                 if isa(part, String)
                     push!(parts, part)
                 else
                     # For interpolated parts, we can't evaluate them at macro expansion time
-                    # So we'll be conservative and just look for string literals
+                    # Mark that this string has interpolation
+                    has_interpolation = true
                     push!(parts, "")
                 end
             end
-            return join(parts)
+            # If this string has interpolation, we need to be conservative
+            # Return a special marker to indicate interpolated string
+            if has_interpolation
+                return :__INTERPOLATED_STRING__
+            else
+                return join(parts)
+            end
         end
 
         # Handle quoted strings
@@ -1919,6 +1965,9 @@ function generate_filtered_content(expr)
             push!(filtered_statements, stmt)
         elseif isa(stmt, Expr) && stmt.head === :call && length(stmt.args) >= 2 && stmt.args[1] === :include
             # This is an include() call - include it to allow filtering within included files
+            push!(filtered_statements, stmt)
+        elseif isa(stmt, Expr) && stmt.head === :for
+            # This is a for loop that might contain testsets - include it
             push!(filtered_statements, stmt)
         end
         # Skip all other statements (assignments, non-include function calls, @test, etc.)
@@ -2545,10 +2594,40 @@ function testset_forloop(args, testloop, source)
         first_iteration = false
 
         # Check if this testset should be skipped due to filtering
-        # For loop testsets, we need to check the runtime description
-        if should_skip_testset(ts)
+        # For loop testsets, we need to check the runtime description with advanced filtering logic
+        local filter_str = testset_filter()
+        local desc_str = get_testset_description(ts)
+        local filtering_disabled = is_filtering_disabled()
+        local should_skip_this = filter_str !== nothing && !filtering_disabled && !contains(desc_str, filter_str)
+        local has_matching_children = filter_str !== nothing && !filtering_disabled && has_matching_nested_testset($(QuoteNode(tests)), $(QuoteNode(source)))
+        
+        if filter_str !== nothing && should_skip_this && !has_matching_children
+            # Skip this testset entirely - no matches in this or children
             record_skipped_testset(ts, $(QuoteNode(tests)))
+        elseif filter_str !== nothing && should_skip_this && has_matching_children
+            # This testset doesn't match but has matching children
+            # Run only the matching nested testsets, skip direct content
+            try
+                $(esc(generate_filtered_content(tests)))
+            catch err
+                err isa InterruptException && rethrow()
+                # Something in the test block threw an error. Count that as an
+                # error in this test set
+                trigger_test_failure_break(err)
+                if is_failfast_error(err)
+                    get_testset_depth() > 1 ? rethrow() : failfast_print()
+                else
+                    record(ts, Error(:nontest_error, Expr(:tuple), err, Base.current_exceptions(), $(QuoteNode(source)), nothing))
+                end
+            end
         else
+            # Normal execution - either no filter, filtering disabled, or this testset matches
+            local was_filtering_disabled = filtering_disabled
+            if filter_str !== nothing && !filtering_disabled && contains(desc_str, filter_str)
+                # This testset matches the filter - disable filtering for children
+                set_filtering_disabled(true)
+            end
+            
             try
                 $(esc(tests))
             catch err
@@ -2561,8 +2640,13 @@ function testset_forloop(args, testloop, source)
                 else
                     record(ts, Error(:nontest_error, Expr(:tuple), err, Base.current_exceptions(), $(QuoteNode(source)), nothing))
                 end
+            finally
+                # Restore previous filtering state
+                if filter_str !== nothing && !was_filtering_disabled && contains(desc_str, filter_str)
+                    set_filtering_disabled(was_filtering_disabled)
+                end
             end
-        end  # end of the else block for filtering
+        end  # end of the filtering logic
     end
     quote
         local arr = Vector{Any}()
