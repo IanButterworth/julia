@@ -9,6 +9,7 @@ using JuliaSyntaxHighlighting: highlight
 using Base.Threads
 using Dates
 using InteractiveUtils: clipboard
+using UUIDs: uuid4, UUID
 
 export HistoryFile, HistEntry, update!, runsearch
 

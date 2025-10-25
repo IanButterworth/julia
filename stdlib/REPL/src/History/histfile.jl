@@ -32,20 +32,28 @@ Create a handle to the history file at `path`, and store the `HistEntry` records
 
 See also: `update!(::HistoryFile)`.
 """
-struct HistoryFile <: AbstractVector{HistEntry}
+mutable struct HistoryFile <: AbstractVector{HistEntry}
     path::String
     file::Base.Filesystem.File
     lock::ReentrantLock
     records::Vector{HistEntry}
+    session_uuid::Union{Nothing,UUID}
+    main_history_path::Union{Nothing,String}
 end
 
 HistoryFile(path::String) = HistoryFile(
-    path, Base.Filesystem.open(path, HIST_OPEN_FLAGS, 0o640), ReentrantLock(), [])
+    path, Base.Filesystem.open(path, HIST_OPEN_FLAGS, 0o640), ReentrantLock(), [], nothing, nothing)
 
 function HistoryFile()
     nofile = Base.Filesystem.File(Base.Filesystem.INVALID_OS_HANDLE)
     nofile.open = false
-    HistoryFile("", nofile, ReentrantLock(), [])
+    HistoryFile("", nofile, ReentrantLock(), [], nothing, nothing)
+end
+
+function HistoryFile(main_path::String, session_uuid::UUID)
+    session_path = string(splitext(main_path)[1], "_", replace(string(session_uuid), "-" => ""), ".jl")
+    HistoryFile(session_path, Base.Filesystem.open(session_path, HIST_OPEN_FLAGS, 0o640), 
+                ReentrantLock(), [], session_uuid, main_path)
 end
 
 Base.lock(hist::HistoryFile) = lock(hist.lock)
@@ -69,7 +77,42 @@ function ensureopen(hist::HistoryFile)
     end
 end
 
-Base.close(hist::HistoryFile) = close(hist.file)
+Base.close(hist::HistoryFile) = begin
+    if !isnothing(hist.session_uuid) && !isnothing(hist.main_history_path)
+        try
+            merge_session_history(hist)
+        catch err
+            @error "Failed to merge session history" exception=(err, catch_backtrace())
+        finally
+            close(hist.file)
+            try
+                rm(hist.path; force=true)
+            catch
+            end
+        end
+    else
+        close(hist.file)
+    end
+end
+
+function merge_session_history(hist::HistoryFile)
+    isempty(hist.records) && return
+    main_file = Base.Filesystem.open(hist.main_history_path, HIST_OPEN_FLAGS, 0o640)
+    try
+        for entry in hist.records
+            content = IOBuffer()
+            write(content, "# time: ",
+                  Dates.format(entry.date, REPL_DATE_FORMAT), "Z\n",
+                  "# mode: ", String(entry.mode), '\n',
+                  "# session: ", string(hist.session_uuid), '\n')
+            replace(content, entry.content, r"^"ms => "\t")
+            write(content, '\n')
+            unsafe_write(main_file, pointer(content.data), position(content) % UInt, Int64(-1))
+        end
+    finally
+        close(main_file)
+    end
+end
 
 """
     update!(hist::HistoryFile) -> HistoryFile

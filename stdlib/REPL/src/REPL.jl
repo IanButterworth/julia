@@ -41,6 +41,7 @@ end
 using Base.Meta, Sockets, StyledStrings
 using JuliaSyntaxHighlighting
 using Dates: now, UTC
+using UUIDs
 import InteractiveUtils
 import FileWatching
 import Base.JuliaSyntax: kind, @K_str, @KSet_str, Tokenize.tokenize
@@ -1348,7 +1349,13 @@ function setup_interface(
         try
             path = find_hist_file()
             mkpath(dirname(path))
-            hp.history = HistoryFile(path)
+            hist_is_overridden = haskey(ENV, "JULIA_HISTORY")
+            if hist_is_overridden
+                hp.history = HistoryFile(path)
+            else
+                session_uuid = Base.UUID(UUIDs.uuid4())
+                hp.history = HistoryFile(path, session_uuid)
+            end
             errormonitor(@async history_do_initialize(hp))
             finalizer(replc) do replc
                 close(hp.history)
