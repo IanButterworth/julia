@@ -9734,10 +9734,12 @@ static jl_llvm_functions_t
                 StoreInst *scope_store = ctx.builder.CreateAlignedStore(scope_boxed, scope_ptr, ctx.types().alignof_ptr);
                 jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_gcframe).decorateInst(current_scope);
                 jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_gcframe).decorateInst(scope_store);
-                // GC preserve the scope, since it is not rooted in the `jl_handler_t *`
-                // and may be removed from jl_current_task by any nested block and then
-                // replaced later
-                Value *scope_token = ctx.builder.CreateCall(prepare_call(gc_preserve_begin_func), {scope_boxed});
+                // GC preserve BOTH old and new scope. The old scope is stored in
+                // jl_handler_t::scope which is not traced by GC. If an exception occurs,
+                // jl_eh_restore_state will restore the old scope, so it must remain valid.
+                // The new scope also needs preservation since it may be removed from
+                // jl_current_task by any nested block and then replaced later.
+                Value *scope_token = ctx.builder.CreateCall(prepare_call(gc_preserve_begin_func), {scope_boxed, current_scope});
                 ctx.scope_restore[cursor] = std::make_pair(scope_token, current_scope);
             }
         }
