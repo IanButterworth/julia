@@ -524,7 +524,7 @@ function stop_background_precompile(; graceful::Bool = true)
     end
 end
 
-function monitor_background_precompile(io::IO = stderr)
+function monitor_background_precompile(io::IO = stderr, detachable::Bool = true)
     local task
     local completed_at
     local result_msg
@@ -569,6 +569,7 @@ function monitor_background_precompile(io::IO = stderr)
 
     # Channel to signal early exit
     exit_requested = Ref(false)
+    cancel_requested = Ref(false)
 
     # Start a task to listen for keypresses
     key_task = if isinteractive() && stdin isa Base.TTY
@@ -577,10 +578,14 @@ function monitor_background_precompile(io::IO = stderr)
             Base.Terminals.raw!(term, true)
 
             try
-                while !istaskdone(task) && !exit_requested[]
+                while !istaskdone(task) && !exit_requested[] && !cancel_requested[]
                     # Just read directly - this blocks until a key is pressed
                     c = read(stdin, Char)
-                    if c == 'd' || c == 'D'
+                    if c == 'c' || c == 'C'
+                        cancel_requested[] = true
+                        println(io)  # newline after keypress
+                        break
+                    elseif detachable && (c == 'd' || c == 'D')
                         exit_requested[] = true
                         println(io)  # newline after keypress
                         break
@@ -603,7 +608,7 @@ function monitor_background_precompile(io::IO = stderr)
 
     # Wait for completion while periodically showing new output
     return try
-        while !istaskdone(task) && !exit_requested[]
+        while !istaskdone(task) && !exit_requested[] && !cancel_requested[]
             # Check for new output or wait briefly
             local had_output = false
             lock(BACKGROUND_PRECOMPILE.lock) do
@@ -631,6 +636,20 @@ function monitor_background_precompile(io::IO = stderr)
                     end
                 end
             end
+        end
+
+        # If user requested cancel, stop the background task
+        if cancel_requested[]
+            key_task !== nothing && wait(key_task)
+            lock(BACKGROUND_PRECOMPILE.lock) do
+                if BACKGROUND_PRECOMPILE.task !== nothing && !istaskdone(BACKGROUND_PRECOMPILE.task)
+                    schedule(BACKGROUND_PRECOMPILE.task, InterruptException(); error = true)
+                end
+            end
+            # Clear to end of screen to remove any partial output
+            print(io, "\e[J")
+            printpkgstyle(io, :Info, "Canceling precompilation...\e[J", color = Base.info_color())
+            return
         end
 
         # If user requested exit, clean up and return
@@ -754,11 +773,13 @@ function precompilepkgs(pkgs::Union{Vector{String}, Vector{PkgId}}=String[];
                         manifest::Bool=false,
                         ignore_loaded::Bool=true,
                         mode::Symbol=:foreground)  # :foreground or :background
-    @debug "precompilepkgs called with" pkgs internal_call strict warn_loaded timing _from_loading configs fancyprint manifest ignore_loaded mode
+    # Detachable only when called from Pkg.precompile in interactive session
+    detachable = internal_call && isinteractive()
+    @debug "precompilepkgs called with" pkgs internal_call strict warn_loaded timing _from_loading configs fancyprint manifest ignore_loaded mode detachable
     # monomorphize this to avoid latency problems
     _precompilepkgs(pkgs, internal_call, strict, warn_loaded, timing, _from_loading,
                    configs isa Vector{Config} ? configs : [configs],
-                   IOContext{IO}(io), fancyprint, manifest, ignore_loaded, mode)
+                   IOContext{IO}(io), fancyprint, manifest, ignore_loaded, mode, detachable)
 end
 
 function launch_background_precompile(pkgs::Union{Vector{String}, Vector{PkgId}},
@@ -771,7 +792,8 @@ function launch_background_precompile(pkgs::Union{Vector{String}, Vector{PkgId}}
                                        io::IO,
                                        fancyprint::Bool,
                                        manifest::Bool,
-                                       ignore_loaded::Bool)
+                                       ignore_loaded::Bool,
+                                       detachable::Bool)
     # Stop any existing background precompilation
     lock(BACKGROUND_PRECOMPILE.lock) do
         if BACKGROUND_PRECOMPILE.task !== nothing && !istaskdone(BACKGROUND_PRECOMPILE.task)
@@ -810,7 +832,7 @@ function launch_background_precompile(pkgs::Union{Vector{String}, Vector{PkgId}}
                 wrapper_io = IOContext(notifying_io, :color => true, :force_fancyprint => true)
 
                 do_precompile(pkg_names, internal_call, strict, warn_loaded, timing, _from_loading,
-                             configs, wrapper_io, fancyprint, manifest, ignore_loaded)
+                             configs, wrapper_io, fancyprint, manifest, ignore_loaded, detachable)
 
                 result_msg = "Background precompilation completed successfully"
             catch e
@@ -863,14 +885,15 @@ function _precompilepkgs(pkgs::Union{Vector{String}, Vector{PkgId}},
                          fancyprint′::Bool,
                          manifest::Bool,
                          ignore_loaded::Bool,
-                         mode::Symbol)
+                         mode::Symbol,
+                         detachable::Bool)
     # Always launch in background task
     launch_background_precompile(pkgs, internal_call, strict, warn_loaded, timing, _from_loading,
-                                 configs, io.io, fancyprint′, manifest, ignore_loaded)
+                                 configs, io.io, fancyprint′, manifest, ignore_loaded, detachable)
 
     # Monitor if mode is :foreground (blocks until complete or user detaches)
     if mode === :foreground
-        monitor_background_precompile(io.io)
+        monitor_background_precompile(io.io, detachable)
     end
 
     return nothing
@@ -887,7 +910,8 @@ function do_precompile(pkgs::Union{Vector{String}, Vector{PkgId}},
                         io::IOContext,
                         fancyprint′::Bool,
                         manifest::Bool,
-                        ignore_loaded::Bool)
+                        ignore_loaded::Bool,
+                        detachable::Bool)
     requested_pkgs = copy(pkgs) # for understanding user intent
     pkg_names = pkgs isa Vector{String} ? copy(pkgs) : String[pkg.name for pkg in pkgs]
     if pkgs isa Vector{PkgId}
@@ -1164,12 +1188,10 @@ function do_precompile(pkgs::Union{Vector{String}, Vector{PkgId}},
     target = Ref{Union{Nothing, String}}(nothing)
     if nconfigs == 1
         if !isempty(only(configs)[1])
-            target[] = "for configuration $(join(only(configs)[1], " ")). Press `c` to cancel, `d` to detach..."
-        else
-            target[] = "Press `c` to cancel, `d` to detach..."
+            target[] = "for configuration $(join(only(configs)[1], " "))"
         end
     else
-        target[] = "for $nconfigs compilation configurations. Press `c` to cancel, `d` to detach..."
+        target[] = "for $nconfigs compilation configurations"
     end
 
     pkg_queue = PkgConfig[]
@@ -1180,6 +1202,46 @@ function do_precompile(pkgs::Union{Vector{String}, Vector{PkgId}},
     first_started = Base.Event()
     printloop_should_exit = Ref{Bool}(!fancyprint) # exit print loop immediately if not fancy printing
     interrupted_or_done = Ref{Bool}(false)
+    cancel_event = Base.Event()
+
+    # Spawn a task to listen for keyboard input ('c' to cancel, 'd' to detach)
+    keyboard_task = if fancyprint && (stdin isa Base.TTY) && isinteractive()
+        @async begin
+            try
+                old_state = nothing
+                try
+                    old_state = ccall(:jl_tty_set_mode, Int32, (Ptr{Cvoid}, Int32), stdin.handle, 1) # raw mode
+                    old_state == -1 && error("Failed to set raw mode")
+                    while !interrupted_or_done[]
+                        if bytesavailable(stdin) > 0
+                            c = read(stdin, Char)
+                            if c == 'c' || c == 'C'
+                                # Cancel: Interrupt all subprocesses
+                                handle_interrupt(InterruptException(), false)
+                                break
+                            elseif detachable && (c == 'd' || c == 'D')
+                                # Detach: Stop monitoring but let precompilation continue
+                                interrupted_or_done[] = true
+                                printloop_should_exit[] = true
+                                break
+                            end
+                        else
+                            sleep(0.1) # Check for input every 100ms
+                        end
+                    end
+                finally
+                    if old_state !== nothing && old_state != -1
+                        ccall(:jl_tty_set_mode, Int32, (Ptr{Cvoid}, Int32), stdin.handle, 0) # cooked mode
+                    end
+                end
+            catch e
+                # Silently ignore errors in keyboard handling
+                e isa InterruptException || @debug "Error in keyboard handler" exception=e
+            end
+        end
+    else
+        nothing
+    end
 
     ansi_moveup(n::Int) = string("\e[", n, "A")
     ansi_movecol1 = "\e[1G"
@@ -1199,6 +1261,8 @@ function do_precompile(pkgs::Union{Vector{String}, Vector{PkgId}},
             interrupted[] = true
         end
         interrupted_or_done[] = true
+        # Signal all subprocesses to terminate
+        notify(cancel_event)
         # notify all Event sources
         for (pkg_config, evt) in was_processed
             notify(evt)
@@ -1225,8 +1289,17 @@ function do_precompile(pkgs::Union{Vector{String}, Vector{PkgId}},
             wait(first_started)
             (isempty(pkg_queue) || interrupted_or_done[]) && return
             @lock print_lock begin
-                if target[] !== nothing
-                    printpkgstyle(logio, :Precompiling, target[])
+                if target[] !== nothing || keyboard_task !== nothing
+                    msg = something(target[], "")
+                    if keyboard_task !== nothing
+                        if detachable
+                            instructions = "Press `c` to cancel, `d` to detach..."
+                        else
+                            instructions = "Press `c` to cancel..."
+                        end
+                        msg = isempty(msg) ? instructions : msg * ". " * instructions
+                    end
+                    printpkgstyle(logio, :Precompiling, msg)
                 end
                 if fancyprint
                     print(logio, ansi_disablecursor)
@@ -1410,7 +1483,7 @@ function do_precompile(pkgs::Union{Vector{String}, Vector{PkgId}},
                                 # loading already took the cachefile_lock and printed logmsg for its explicit requests
                                 t = @elapsed ret = begin
                                     Base.compilecache(pkg, sourcespec, std_pipe, std_pipe, !ignore_loaded;
-                                                      flags=flags_, cacheflags, loadable_exts)
+                                                      flags=flags_, cacheflags, loadable_exts, cancel_event)
                                 end
                             else
                                 # allows processes to wait if another process is precompiling a given package to
@@ -1432,7 +1505,7 @@ function do_precompile(pkgs::Union{Vector{String}, Vector{PkgId}},
                                         @debug "Precompiling $(repr("text/plain", pkg))"
                                     end
                                     Base.compilecache(pkg, sourcespec, std_pipe, std_pipe, !ignore_loaded;
-                                                      flags=flags_, cacheflags, loadable_exts)
+                                                      flags=flags_, cacheflags, loadable_exts, cancel_event)
                                 end
                             end
                             if ret isa Exception
@@ -1591,10 +1664,6 @@ function do_precompile(pkgs::Union{Vector{String}, Vector{PkgId}},
             println(io, str)
         end
     end
-    # Done cleanup and sub-process output, now ensure caller aborts too with the right error
-    if interrupted[]
-        throw(InterruptException())
-    end
     # Fail noisily now with failed_deps if any.
     # Include all messages from compilecache since any might be relevant in the failure.
     if !isempty(failed_deps)
@@ -1614,6 +1683,21 @@ function do_precompile(pkgs::Union{Vector{String}, Vector{PkgId}},
         else
             throw(PkgPrecompileError(err_msg))
         end
+    end
+    # Clean up keyboard listener task if it was started
+    if keyboard_task !== nothing && !istaskdone(keyboard_task)
+        try
+            # Ensure interrupted_or_done is set so keyboard task will exit
+            interrupted_or_done[] = true
+            # Give it a moment to exit gracefully
+            wait(keyboard_task; timeout=0.5)
+        catch
+            # If it doesn't exit, that's fine
+        end
+    end
+    # After all cleanup and output, throw InterruptException if user cancelled
+    if interrupted[]
+        throw(InterruptException())
     end
     return collect(String, Iterators.flatten((v for (pkgid, v) in cachepath_cache if pkgid in requested_pkgids)))
 end
