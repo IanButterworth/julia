@@ -642,13 +642,13 @@ function monitor_background_precompile(io::IO = stderr, detachable::Bool = true)
         if cancel_requested[]
             key_task !== nothing && wait(key_task)
             lock(BACKGROUND_PRECOMPILE.lock) do
-                if BACKGROUND_PRECOMPILE.task !== nothing && !istaskdone(BACKGROUND_PRECOMPILE.task)
-                    schedule(BACKGROUND_PRECOMPILE.task, InterruptException(); error = true)
-                end
+                BACKGROUND_PRECOMPILE.cancel_requested = true
             end
             # Clear to end of screen to remove any partial output
             print(io, "\e[J")
             printpkgstyle(io, :Info, "Canceling precompilation...\e[J", color = Base.info_color())
+            # Wait for task to finish canceling
+            wait(task)
             return
         end
 
@@ -1216,13 +1216,25 @@ function do_precompile(pkgs::Union{Vector{String}, Vector{PkgId}},
                         if bytesavailable(stdin) > 0
                             c = read(stdin, Char)
                             if c == 'c' || c == 'C'
-                                # Cancel: Interrupt all subprocesses
-                                handle_interrupt(InterruptException(), false)
+                                # Cancel: Signal all subprocesses to terminate
+                                interrupted_or_done[] = true
+                                printloop_should_exit[] = true
+                                notify(cancel_event)
+                                for (pkg_config, evt) in was_processed
+                                    notify(evt)
+                                end
+                                notify(first_started)
+                                @lock print_lock begin
+                                    printpkgstyle(logio, :Info, "Canceling precompilation..." * ansi_cleartoendofline, color = Base.info_color())
+                                end
                                 break
                             elseif detachable && (c == 'd' || c == 'D')
                                 # Detach: Stop monitoring but let precompilation continue
                                 interrupted_or_done[] = true
                                 printloop_should_exit[] = true
+                                @lock print_lock begin
+                                    printpkgstyle(logio, :Info, "Detached from precompilation" * ansi_cleartoendofline, color = Base.info_color())
+                                end
                                 break
                             end
                         else
