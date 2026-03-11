@@ -705,6 +705,57 @@ function _precompilepkgs(pkgs::Union{Vector{String}, Vector{PkgId}},
         for (name, uuid) in env.project_deps if !Base.in_sysimage(Base.PkgId(uuid, name))
     ]
 
+    # If not precompiling the full workspace manifest, prune the dependency graph
+    # to only packages reachable from the active project's dependencies.
+    # In a workspace with a shared Manifest.toml, env.deps contains packages from
+    # all sub-environments. Without this pruning, extensions with cross-environment
+    # triggers would be included in project_deps and pull in unrelated packages.
+    # This is done before extension edge injection so that the expensive indirect
+    # dependency expansion and extension logic only runs on the relevant subgraph.
+    if !manifest
+        if isempty(pkg_names)
+            pkg_names = [pkg.name for pkg in project_deps]
+        end
+        keep = Set{Base.PkgId}()
+        for dep_pkgid in keys(direct_deps)
+            if dep_pkgid.name in pkg_names
+                push!(keep, dep_pkgid)
+                collect_all_deps(direct_deps, dep_pkgid, keep)
+            end
+        end
+        # Also keep packages that were explicitly requested as PkgIds (for extensions)
+        if pkgs isa Vector{PkgId}
+            for requested_pkgid in requested_pkgids
+                if haskey(direct_deps, requested_pkgid)
+                    push!(keep, requested_pkgid)
+                    collect_all_deps(direct_deps, requested_pkgid, keep)
+                end
+            end
+        end
+        for ext in keys(ext_to_parent)
+            if haskey(direct_deps, ext) && all(d -> d in keep, direct_deps[ext])
+                push!(keep, ext)
+            end
+        end
+        filter!(d -> first(d) in keep, direct_deps)
+        filter!(d -> first(d) in keep, ext_to_parent)
+        filter!(d -> first(d) in keep, triggers)
+        for (_, exts) in parent_to_exts
+            filter!(ext -> ext in keep, exts)
+        end
+        filter!(d -> !isempty(last(d)), parent_to_exts)
+        if isempty(direct_deps)
+            if _from_loading
+                # if called from loading precompilation it may be a package from another environment stack so
+                # don't error and allow serial precompilation to try
+                # TODO: actually handle packages from other envs in the stack
+                return
+            else
+                return
+            end
+        end
+    end
+
     # consider exts of project deps to be project deps so that errors are reported
     append!(project_deps, keys(filter(d->last(d).name in keys(env.project_deps), ext_to_parent)))
 
@@ -815,48 +866,6 @@ function _precompilepkgs(pkgs::Union{Vector{String}, Vector{PkgId}},
     end
     if !isempty(circular_deps)
         @warn excluded_circular_deps_explanation(io, ext_to_parent, circular_deps, cycles)
-    end
-
-    # If you have a workspace and want to precompile all projects in it, look through all packages in the manifest
-    # instead of collecting from a project i.e. not filter out packages that are in the current project.
-    # i.e. Pkg sets manifest to true for workspace precompile requests
-    # TODO: rename `manifest`?
-    if !manifest
-        if isempty(pkg_names)
-            pkg_names = [pkg.name for pkg in project_deps]
-        end
-        keep = Set{Base.PkgId}()
-        for dep_pkgid in keys(direct_deps)
-            if dep_pkgid.name in pkg_names
-                push!(keep, dep_pkgid)
-                collect_all_deps(direct_deps, dep_pkgid, keep)
-            end
-        end
-        # Also keep packages that were explicitly requested as PkgIds (for extensions)
-        if pkgs isa Vector{PkgId}
-            for requested_pkgid in requested_pkgids
-                if haskey(direct_deps, requested_pkgid)
-                    push!(keep, requested_pkgid)
-                    collect_all_deps(direct_deps, requested_pkgid, keep)
-                end
-            end
-        end
-        for ext in keys(ext_to_parent)
-            if issubset(collect_all_deps(direct_deps, ext), keep) # if all extension deps are kept
-                push!(keep, ext)
-            end
-        end
-        filter!(d->in(first(d), keep), direct_deps)
-        if isempty(direct_deps)
-            if _from_loading
-                # if called from loading precompilation it may be a package from another environment stack so
-                # don't error and allow serial precompilation to try
-                # TODO: actually handle packages from other envs in the stack
-                return
-            else
-                return
-            end
-        end
     end
 
     target = Ref{Union{Nothing, String}}(nothing)

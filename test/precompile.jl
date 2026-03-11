@@ -2864,4 +2864,125 @@ precompile_test_harness("Preferences hash collision (issue #59344), part 2") do 
     end
 end
 
+# Workspace sub-environment precompilation should not precompile packages from other sub-environments
+@testset "workspace sub-environment precompilation scoping" begin
+    mkdepottempdir() do depot
+        workspace_path = joinpath(depot, "workspace")
+        mkpath(workspace_path)
+
+        # Foo: a package with an extension triggered by Bar
+        foo_path = joinpath(workspace_path, "Foo")
+        mkpath(joinpath(foo_path, "src"))
+        mkpath(joinpath(foo_path, "ext"))
+        write(joinpath(foo_path, "Project.toml"),
+              """
+              name = "Foo"
+              uuid = "ab000000-0000-0000-0000-000000000001"
+              version = "0.1.0"
+
+              [weakdeps]
+              Bar = "ab000000-0000-0000-0000-000000000002"
+
+              [extensions]
+              FooBarExt = "Bar"
+              """)
+        write(joinpath(foo_path, "src", "Foo.jl"),
+              """
+              module Foo
+              greet() = "hello from Foo"
+              end
+              """)
+        write(joinpath(foo_path, "ext", "FooBarExt.jl"),
+              """
+              module FooBarExt
+              using Foo, Bar
+              end
+              """)
+
+        # Bar: a package that only the BarEnv sub-environment depends on
+        bar_path = joinpath(workspace_path, "Bar")
+        mkpath(joinpath(bar_path, "src"))
+        write(joinpath(bar_path, "Project.toml"),
+              """
+              name = "Bar"
+              uuid = "ab000000-0000-0000-0000-000000000002"
+              version = "0.1.0"
+              """)
+        write(joinpath(bar_path, "src", "Bar.jl"),
+              """
+              module Bar
+              greet() = "hello from Bar"
+              end
+              """)
+
+        # FooEnv: a sub-environment that only depends on Foo
+        fooenv_path = joinpath(workspace_path, "FooEnv")
+        mkpath(fooenv_path)
+        write(joinpath(fooenv_path, "Project.toml"),
+              """
+              [deps]
+              Foo = "ab000000-0000-0000-0000-000000000001"
+              """)
+
+        # BarEnv: a sub-environment that depends on both Foo and Bar
+        barenv_path = joinpath(workspace_path, "BarEnv")
+        mkpath(barenv_path)
+        write(joinpath(barenv_path, "Project.toml"),
+              """
+              [deps]
+              Foo = "ab000000-0000-0000-0000-000000000001"
+              Bar = "ab000000-0000-0000-0000-000000000002"
+              """)
+
+        # Workspace root Project.toml
+        write(joinpath(workspace_path, "Project.toml"),
+              """
+              [workspace]
+              projects = ["FooEnv", "BarEnv"]
+              """)
+
+        # Shared Manifest.toml at workspace root (contains all packages)
+        write(joinpath(workspace_path, "Manifest.toml"),
+              """
+              manifest_format = "2.0"
+
+              [[deps.Bar]]
+              path = "Bar"
+              uuid = "ab000000-0000-0000-0000-000000000002"
+              version = "0.1.0"
+
+              [[deps.Foo]]
+              deps = ["Bar"]
+              weakdeps = ["Bar"]
+              path = "Foo"
+              uuid = "ab000000-0000-0000-0000-000000000001"
+              version = "0.1.0"
+
+              [deps.Foo.extensions]
+              FooBarExt = "Bar"
+              """)
+
+        original_depot_path = copy(Base.DEPOT_PATH)
+        old_proj = Base.active_project()
+        try
+            push!(empty!(DEPOT_PATH), depot)
+            # Activate FooEnv (only depends on Foo, not Bar)
+            Base.set_active_project(fooenv_path)
+
+            io = IOBuffer()
+            ioc = IOContext(io, :color => false)
+            Base.Precompilation.precompilepkgs(; io=ioc, fancyprint=false)
+            output = String(take!(io))
+
+            # Foo should be precompiled
+            @test occursin("Foo", output)
+            # Bar should NOT be precompiled (it's in another sub-environment)
+            @test !occursin("Bar", output)
+        finally
+            Base.set_active_project(old_proj)
+            append!(empty!(DEPOT_PATH), original_depot_path)
+        end
+    end
+end
+
 finish_precompile_test!()
