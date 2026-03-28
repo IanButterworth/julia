@@ -122,9 +122,6 @@ inline void add_fn_attrs_for_effects(CallInst *CI, uint32_t effects) JL_NOTSAFEP
     if (auto *F = dyn_cast_or_null<Function>(CI->getCalledFunction())) {
         if (F->isDeclaration()) {
             F->addFnAttrs(attrs);
-            // speculatable is only valid on declarations, not call sites.
-            if (!has_user_ptr && is_nothrow && is_terminates)
-                F->addFnAttr(Attribute::Speculatable);
             if (is_nothrow && !F->hasUWTable())
                 F->addFnAttr(Attribute::get(F->getContext(), Attribute::UWTable, uint64_t(llvm::UWTableKind::Async)));
             if (!has_user_ptr && is_notaskstate) {

@@ -308,7 +308,8 @@ macro _total_meta()
         #=:noub=#true,
         #=:noub_if_noinbounds=#false,
         #=:consistent_overlay=#false,
-        #=:nortcall=#true))
+        #=:nortcall=#true,
+        #=:cheap=#true))
 end
 # can be used in place of `@assume_effects :foldable` (supposed to be used for bootstrapping)
 macro _foldable_meta()
@@ -323,7 +324,8 @@ macro _foldable_meta()
         #=:noub=#true,
         #=:noub_if_noinbounds=#false,
         #=:consistent_overlay=#false,
-        #=:nortcall=#true))
+        #=:nortcall=#true,
+        #=:cheap=#false))
 end
 
 macro inline()   Expr(:meta, :inline)   end

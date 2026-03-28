@@ -35,6 +35,9 @@ The output represents the state of different effect properties in the following 
 9. `:nortcall` (`r`):
     - `+r` (green): `true`
     - `-r` (red): `false`
+10. `cheap` (`p`):
+    - `+p` (green): `true`
+    - `-p` (red): `false`
 """
 
 """
@@ -101,6 +104,9 @@ following meanings:
 - `nortcall::Bool`: this method does not call `Core.Compiler.return_type`,
   and it is guaranteed that any other methods this method might call also do not call
   `Core.Compiler.return_type`.
+- `cheap::Bool`: this method is computationally cheap (O(1) with a small constant),
+  meaning it is safe to speculatively execute even when the result may not be needed.
+  Tainted by loops and calls to non-cheap functions.
 
 Note that the representations above are just internal implementation details and thus likely
 to change in the future. See [`Base.@assume_effects`](@ref) for more detailed explanation
@@ -126,6 +132,7 @@ struct Effects
     noub::UInt8
     nonoverlayed::UInt8
     nortcall::Bool
+    cheap::Bool
     function Effects(
         consistent::UInt8,
         effect_free::UInt8,
@@ -135,7 +142,8 @@ struct Effects
         inaccessiblememonly::UInt8,
         noub::UInt8,
         nonoverlayed::UInt8,
-        nortcall::Bool)
+        nortcall::Bool,
+        cheap::Bool)
         return new(
             consistent,
             effect_free,
@@ -145,7 +153,8 @@ struct Effects
             inaccessiblememonly,
             noub,
             nonoverlayed,
-            nortcall)
+            nortcall,
+            cheap)
     end
 end
 
@@ -175,12 +184,12 @@ const NOUB_IF_NOINBOUNDS = 0x01 << 1
 # :nonoverlayed bits
 const CONSISTENT_OVERLAY = 0x01 << 1
 
-const EFFECTS_TOTAL   = Effects(ALWAYS_TRUE,  ALWAYS_TRUE,  true,  true,  true,  ALWAYS_TRUE,  ALWAYS_TRUE,  ALWAYS_TRUE, true)
-const EFFECTS_THROWS  = Effects(ALWAYS_TRUE,  ALWAYS_TRUE,  false, true,  true,  ALWAYS_TRUE,  ALWAYS_TRUE,  ALWAYS_TRUE, true)
-const EFFECTS_UNKNOWN = Effects(ALWAYS_FALSE, ALWAYS_FALSE, false, false, false, ALWAYS_FALSE, ALWAYS_FALSE, ALWAYS_TRUE, false) # unknown mostly, but it's not overlayed at least (e.g. it's not a call)
+const EFFECTS_TOTAL   = Effects(ALWAYS_TRUE,  ALWAYS_TRUE,  true,  true,  true,  ALWAYS_TRUE,  ALWAYS_TRUE,  ALWAYS_TRUE, true, true)
+const EFFECTS_THROWS  = Effects(ALWAYS_TRUE,  ALWAYS_TRUE,  false, true,  true,  ALWAYS_TRUE,  ALWAYS_TRUE,  ALWAYS_TRUE, true, true)
+const EFFECTS_UNKNOWN = Effects(ALWAYS_FALSE, ALWAYS_FALSE, false, false, false, ALWAYS_FALSE, ALWAYS_FALSE, ALWAYS_TRUE, false, false) # unknown mostly, but it's not overlayed at least (e.g. it's not a call)
 
 function Effects(effects::Effects=Effects(
-    ALWAYS_FALSE, ALWAYS_FALSE, false, false, false, ALWAYS_FALSE, ALWAYS_FALSE, ALWAYS_FALSE, false);
+    ALWAYS_FALSE, ALWAYS_FALSE, false, false, false, ALWAYS_FALSE, ALWAYS_FALSE, ALWAYS_FALSE, false, false);
     consistent::UInt8 = effects.consistent,
     effect_free::UInt8 = effects.effect_free,
     nothrow::Bool = effects.nothrow,
@@ -189,7 +198,8 @@ function Effects(effects::Effects=Effects(
     inaccessiblememonly::UInt8 = effects.inaccessiblememonly,
     noub::UInt8 = effects.noub,
     nonoverlayed::UInt8 = effects.nonoverlayed,
-    nortcall::Bool = effects.nortcall)
+    nortcall::Bool = effects.nortcall,
+    cheap::Bool = effects.cheap)
     return Effects(
         consistent,
         effect_free,
@@ -199,7 +209,8 @@ function Effects(effects::Effects=Effects(
         inaccessiblememonly,
         noub,
         nonoverlayed,
-        nortcall)
+        nortcall,
+        cheap)
 end
 
 function is_better_effects(new::Effects, old::Effects)
@@ -269,6 +280,11 @@ function is_better_effects(new::Effects, old::Effects)
     elseif new.nortcall != old.nortcall
         return false
     end
+    if new.cheap
+        any_improved |= !old.cheap
+    elseif new.cheap != old.cheap
+        return false
+    end
     return any_improved
 end
 
@@ -282,7 +298,8 @@ function merge_effects(old::Effects, new::Effects)
         merge_effectbits(old.inaccessiblememonly, new.inaccessiblememonly),
         merge_effectbits(old.noub, new.noub),
         merge_effectbits(old.nonoverlayed, new.nonoverlayed),
-        merge_effectbits(old.nortcall, new.nortcall))
+        merge_effectbits(old.nortcall, new.nortcall),
+        merge_effectbits(old.cheap, new.cheap))
 end
 
 function merge_effectbits(old::UInt8, new::UInt8)
@@ -303,6 +320,7 @@ is_noub(effects::Effects)                = effects.noub === ALWAYS_TRUE
 is_noub_if_noinbounds(effects::Effects)  = effects.noub === NOUB_IF_NOINBOUNDS
 is_nonoverlayed(effects::Effects)        = effects.nonoverlayed === ALWAYS_TRUE
 is_nortcall(effects::Effects)            = effects.nortcall
+is_cheap(effects::Effects)               = effects.cheap
 
 # implies `is_notaskstate` & `is_inaccessiblememonly`, but not explicitly checked here
 is_foldable(effects::Effects, check_rtcall::Bool=false) =
@@ -345,7 +363,8 @@ function encode_effects(e::Effects)
            ((e.inaccessiblememonly % UInt32) << 8)  |
            ((e.noub                % UInt32) << 10) |
            ((e.nonoverlayed        % UInt32) << 12) |
-           ((e.nortcall            % UInt32) << 14)
+           ((e.nortcall            % UInt32) << 14) |
+           ((e.cheap               % UInt32) << 15)
 end
 
 function decode_effects(e::UInt32)
@@ -358,7 +377,8 @@ function decode_effects(e::UInt32)
         UInt8((e >> 8) & 0x03),
         UInt8((e >> 10) & 0x03),
         UInt8((e >> 12) & 0x03),
-        Bool((e >> 14) & 0x01))
+        Bool((e >> 14) & 0x01),
+        Bool((e >> 15) & 0x01))
 end
 
 decode_statement_effects_override(ssaflag::UInt32) =

@@ -913,11 +913,12 @@ struct EffectsOverride
     noub_if_noinbounds::Bool
     consistent_overlay::Bool
     nortcall::Bool
+    cheap::Bool
 end
 
 function EffectsOverride(
     override::EffectsOverride =
-        EffectsOverride(false, false, false, false, false, false, false, false, false, false, false);
+        EffectsOverride(false, false, false, false, false, false, false, false, false, false, false, false);
     consistent::Bool = override.consistent,
     effect_free::Bool = override.effect_free,
     nothrow::Bool = override.nothrow,
@@ -928,7 +929,8 @@ function EffectsOverride(
     noub::Bool = override.noub,
     noub_if_noinbounds::Bool = override.noub_if_noinbounds,
     consistent_overlay::Bool = override.consistent_overlay,
-    nortcall::Bool = override.nortcall)
+    nortcall::Bool = override.nortcall,
+    cheap::Bool = override.cheap)
     return EffectsOverride(
         consistent,
         effect_free,
@@ -940,10 +942,11 @@ function EffectsOverride(
         noub,
         noub_if_noinbounds,
         consistent_overlay,
-        nortcall)
+        nortcall,
+        cheap)
 end
 
-const NUM_EFFECTS_OVERRIDES = 11 # sync with julia.h
+const NUM_EFFECTS_OVERRIDES = 12 # sync with julia.h
 
 function compute_assumed_setting(override::EffectsOverride, @nospecialize(setting), val::Bool=true)
     if isexpr(setting, :call) && setting.args[1] === :(!)
@@ -969,6 +972,8 @@ function compute_assumed_setting(override::EffectsOverride, @nospecialize(settin
         return EffectsOverride(override; noub = val)
     elseif setting === :noub_if_noinbounds
         return EffectsOverride(override; noub_if_noinbounds = val)
+    elseif setting === :cheap
+        return EffectsOverride(override; cheap = val)
     elseif setting === :foldable
         consistent = effect_free = terminates_globally = noub = nortcall = val
         return EffectsOverride(override; consistent, effect_free, terminates_globally, noub, nortcall)
@@ -977,10 +982,10 @@ function compute_assumed_setting(override::EffectsOverride, @nospecialize(settin
         return EffectsOverride(override; effect_free, nothrow, terminates_globally)
     elseif setting === :total
         consistent = effect_free = nothrow = terminates_globally = notaskstate =
-            inaccessiblememonly = noub = nortcall = val
+            inaccessiblememonly = noub = nortcall = cheap = val
         return EffectsOverride(override;
             consistent, effect_free, nothrow, terminates_globally, notaskstate,
-            inaccessiblememonly, noub, nortcall)
+            inaccessiblememonly, noub, nortcall, cheap)
     end
     return nothing
 end
@@ -998,6 +1003,7 @@ function encode_effects_override(eo::EffectsOverride)
     eo.noub_if_noinbounds  && (e |= (0x0001 << 8))
     eo.consistent_overlay  && (e |= (0x0001 << 9))
     eo.nortcall            && (e |= (0x0001 << 10))
+    eo.cheap               && (e |= (0x0001 << 11))
     return e
 end
 
@@ -1013,7 +1019,8 @@ function decode_effects_override(e::UInt16)
         !iszero(e & (0x0001 << 7)),
         !iszero(e & (0x0001 << 8)),
         !iszero(e & (0x0001 << 9)),
-        !iszero(e & (0x0001 << 10)))
+        !iszero(e & (0x0001 << 10)),
+        !iszero(e & (0x0001 << 11)))
 end
 
 function form_purity_expr(override::EffectsOverride)

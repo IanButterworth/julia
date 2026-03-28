@@ -561,6 +561,9 @@ function adjust_effects(ipo_effects::Effects, def::Method)
     if is_effect_overridden(override, :nortcall)
         ipo_effects = Effects(ipo_effects; nortcall=true)
     end
+    if is_effect_overridden(override, :cheap)
+        ipo_effects = Effects(ipo_effects; cheap=true)
+    end
     return ipo_effects
 end
 

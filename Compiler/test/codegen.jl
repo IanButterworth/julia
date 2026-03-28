@@ -1144,6 +1144,7 @@ _pure_effects_licmcallee(1.0); _pure_effects_licmloop(Float64[0.0], 1.0)
     @test occursin("nounwind", ir_attrs)
     @test occursin("willreturn", ir_attrs)
     @test occursin("memory(argmem: read)", ir_attrs)
+    @test occursin("speculatable", ir_attrs)
 
     # LICM: loop-invariant pure call hoisted out of loop
     ir_licm = get_llvm(_pure_effects_licmloop, Tuple{Vector{Float64}, Float64}, true, false, true)

@@ -1496,3 +1496,38 @@ function null_offset(offset)
     Ptr{UInt8}(C_NULL) + offset
 end
 @test null_offset(Int(100)) == Ptr{UInt8}(UInt(100))
+
+# cheap effect: builtins and intrinsics are cheap, loops are not
+let effects = Base.infer_effects((Float64,)) do x
+        x * x + 1.0
+    end
+    @test Compiler.is_cheap(effects)
+end
+function _loop_not_cheap(n::Int)
+    s = 0
+    for i in 1:n
+        s += i
+    end
+    return s
+end
+let effects = Base.infer_effects(_loop_not_cheap, (Int,))
+    @test !Compiler.is_cheap(effects)
+end
+@noinline _cheap_callee(x::Float64) = x * x
+function _cheap_caller(x::Float64)
+    return _cheap_callee(x) + 1.0
+end
+let effects = Base.infer_effects(_cheap_caller, (Float64,))
+    @test Compiler.is_cheap(effects)
+end
+# @assume_effects :cheap overrides the inference result
+Base.@assume_effects :cheap function _forced_cheap_loop(n::Int)
+    s = 0
+    for i in 1:n
+        s += i
+    end
+    return s
+end
+let effects = Base.infer_effects(_forced_cheap_loop, (Int,))
+    @test Compiler.is_cheap(effects)
+end

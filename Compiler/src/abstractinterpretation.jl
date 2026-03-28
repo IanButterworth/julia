@@ -4183,6 +4183,9 @@ function handle_control_backedge!(interp::AbstractInterpreter, frame::InferenceS
         else
             merge_effects!(interp, frame, Effects(EFFECTS_TOTAL; terminates=false))
         end
+        if !is_effect_overridden(frame, :cheap)
+            merge_effects!(interp, frame, Effects(EFFECTS_TOTAL; cheap=false))
+        end
     end
     return nothing
 end

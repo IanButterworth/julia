@@ -266,11 +266,12 @@ typedef union __jl_purity_overrides_t {
         uint16_t ipo_noub_if_noinbounds  : 1;
         uint16_t ipo_consistent_overlay  : 1;
         uint16_t ipo_nortcall            : 1;
+        uint16_t ipo_cheap               : 1;
     } overrides;
     uint16_t bits;
 } _jl_purity_overrides_t;
 
-#define NUM_EFFECTS_OVERRIDES 11
+#define NUM_EFFECTS_OVERRIDES 12
 #define NUM_IR_FLAGS 3
 
 // This type describes a single function body
@@ -488,6 +489,8 @@ typedef struct _jl_code_instance_t {
     //     uint8_t inaccessiblememonly : 2;
     //     uint8_t noub                : 2;
     //     uint8_t nonoverlayed        : 2;
+    //     uint8_t nortcall            : 1;
+    //     uint8_t cheap               : 1;
 
     // compilation state cache
     // these time fields have units of seconds (60 ns minimum resolution and 18 hour maximum saturates to Infinity) and are stored in Float16 format
