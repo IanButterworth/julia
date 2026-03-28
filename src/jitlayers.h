@@ -122,9 +122,16 @@ inline void add_fn_attrs_for_effects(CallInst *CI, uint32_t effects) JL_NOTSAFEP
     if (auto *F = dyn_cast_or_null<Function>(CI->getCalledFunction())) {
         if (F->isDeclaration()) {
             F->addFnAttrs(attrs);
-            // speculatable is only valid on declarations, not call sites.
-            if (!has_user_ptr && is_nothrow && is_terminates)
-                F->addFnAttr(Attribute::Speculatable);
+            // N.B. We do not emit `speculatable` here. While Julia's effects
+            // system can prove a function is pure (nothrow + terminates +
+            // effect_free + consistent), `speculatable` tells LLVM it may
+            // freely execute the call even when the result is unused.
+            // SimplifyCFG uses this to speculate calls past branches, which
+            // causes severe regressions when expensive-but-pure functions
+            // like `exp()` are speculated onto hot paths (3.7x on ziggurat).
+            // Neither Clang nor Rust emit `speculatable` on user functions,
+            // LLVM strips it when lowering intrinsics to library calls, and
+            // the LLVM developers confirmed they never infer `speculatable`.
             if (is_nothrow && !F->hasUWTable())
                 F->addFnAttr(Attribute::get(F->getContext(), Attribute::UWTable, uint64_t(llvm::UWTableKind::Async)));
             if (!has_user_ptr && is_notaskstate) {
