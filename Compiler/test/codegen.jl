@@ -1114,3 +1114,17 @@ loop_preserve_any_ea(10)
     ir = get_llvm(f_srettest, Tuple{Float32}, true, true, true)
     @test occursin(r"sret\([^)]+\) align \d+", ir)
 end
+
+# ipo_purity_bits are translated into LLVM call-site attributes
+function _fib_cse_test(n::Int)
+    n <= 1 && return n
+    n == 2 && return 1
+    return _fib_cse_test(n-1) + _fib_cse_test(n-2)
+end
+_bench_cse_test() = _fib_cse_test(40)
+_fib_cse_test(5); _bench_cse_test()
+@testset "effects to LLVM attributes" begin
+    # CSE: duplicate fib call eliminated by GVN using memory(argmem: read)
+    ir_bench = get_llvm(_bench_cse_test, Tuple{}, true, false, true)
+    @test count(r"call (swiftcc )?i\d+ @j__fib", ir_bench) == 3  # 4 calls reduced to 3
+end
