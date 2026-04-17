@@ -1932,6 +1932,7 @@ JL_DLLEXPORT jl_code_info_t *jl_copy_code_info(jl_code_info_t *src);
 JL_DLLEXPORT size_t jl_get_world_counter(void) JL_NOTSAFEPOINT;
 JL_DLLEXPORT size_t jl_get_tls_world_age(void) JL_NOTSAFEPOINT;
 JL_DLLEXPORT void jl_drop_all_caches(void);
+JL_DLLEXPORT void jl_method_instance_invalidate_caches(jl_method_instance_t *mi, size_t world);
 JL_DLLEXPORT jl_value_t *jl_box_bool(int8_t x) JL_NOTSAFEPOINT;
 JL_DLLEXPORT jl_value_t *jl_box_int8(int8_t x) JL_NOTSAFEPOINT;
 JL_DLLEXPORT jl_value_t *jl_box_uint8(uint8_t x) JL_NOTSAFEPOINT;

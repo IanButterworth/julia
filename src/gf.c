@@ -5268,8 +5268,11 @@ JL_DLLEXPORT void jl_extern_c(jl_value_t *name, jl_value_t *declrt, jl_tupletype
     JL_GC_POP();
 }
 
-// Drop all method caches and increment world age as if adding a method that intersects everything
-static void invalidate_method_instance_caches(jl_method_instance_t *mi, size_t world)
+// Drop cached native code and inferred IR for a single MethodInstance by
+// setting `max_world` on each live CodeInstance in its cache chain. This does
+// NOT bump the global world counter and does NOT propagate to backedges,
+// making it a pure cache flush suitable for compilation benchmarking.
+JL_DLLEXPORT void jl_method_instance_invalidate_caches(jl_method_instance_t *mi, size_t world)
 {
     if ((jl_value_t*)mi == jl_nothing)
         return;
@@ -5295,12 +5298,12 @@ static int invalidate_all_specializations(jl_typemap_entry_t *def, void *closure
         size_t i, l = jl_svec_len(specializations);
         for (i = 0; i < l; i++) {
             jl_method_instance_t *mi = (jl_method_instance_t*)jl_svecref(specializations, i);
-            invalidate_method_instance_caches(mi, world);
+            jl_method_instance_invalidate_caches(mi, world);
         }
     }
     else if (specializations != NULL) {
         jl_method_instance_t *mi = (jl_method_instance_t*)specializations;
-        invalidate_method_instance_caches(mi, world);
+        jl_method_instance_invalidate_caches(mi, world);
     }
     JL_UNLOCK(&method->writelock);
     return 1;

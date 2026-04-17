@@ -627,3 +627,30 @@ let
     @test rettype_side_effect == "blah"
     ccall(:strlen, rettype_with_side_effect(), (Cstring,), "xx")
 end
+
+# Base.Experimental.record_calls / invalidate_calls: scoped cache invalidation
+# used by BenchmarkTools-style compilation benchmarks. Must drop cached native
+# code without bumping world age or touching backedges.
+module CompileRecordTest
+using Test
+recorded_target(x) = x * x + 1
+recorded_target(1.0)  # force compile
+let mis = Base.@record_calls recorded_target(1.0)
+    @test length(mis) == 1
+    mi = mis[1]
+    @test mi isa Core.MethodInstance
+    ci = @atomic mi.cache
+    @test ci !== nothing
+    @test (@atomic ci.max_world) == typemax(UInt)
+    world_before = Base.get_world_counter()
+    Base.invalidate_calls(mis)
+    # World counter must not move (this is the key distinction from ordinary invalidation)
+    @test Base.get_world_counter() == world_before
+    # Cached CodeInstance is now capped
+    @test (@atomic ci.max_world) < typemax(UInt)
+    # Next call re-specializes; a fresh CodeInstance appears on the cache chain
+    recorded_target(1.0)
+    ci2 = @atomic mi.cache
+    @test ci2 !== ci || (@atomic ci2.max_world) == typemax(UInt)
+end
+end

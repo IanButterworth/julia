@@ -87,6 +87,63 @@ function method_instance(@nospecialize(f), @nospecialize(t);
     return method_instance(tt; world, method_table)
 end
 
+"""
+    Base.record_calls(f, types::Type{<:Tuple}) -> Vector{Core.MethodInstance}
+
+Return the `MethodInstance`s that must be invalidated in order to force
+recompilation of the call `f(args...)` where `types === Tuple{map(typeof, args)...}`.
+
+Only the entry-point `MethodInstance` is returned: the next dispatch to it
+will re-infer and re-codegen along with any callees that are inlined into
+it. Callees that are not inlined remain cached, so invalidating the returned
+instances measures the cost of compiling `f` itself (with its inlining
+decisions) rather than of rebuilding the entire transitive call tree.
+
+See also [`Base.invalidate_calls`](@ref), [`Base.@record_calls`](@ref).
+"""
+function record_calls(@nospecialize(f), @nospecialize(types::Type{<:Tuple}))
+    mi = method_instance(f, types)
+    mi === nothing && error("could not resolve MethodInstance for ", f, " with argument types ", types)
+    return Core.MethodInstance[mi]
+end
+
+"""
+    Base.@record_calls f(args...)
+
+Convenience macro equivalent to `Base.record_calls(f, Tuple{map(Core.Typeof, args)...})`.
+"""
+macro record_calls(ex)
+    Meta.isexpr(ex, :call) || error("@record_calls expects a call expression, got $(ex)")
+    f = ex.args[1]
+    args = ex.args[2:end]
+    types = Expr(:curly, :Tuple, (:(Core.Typeof($(esc(a)))) for a in args)...)
+    return :(record_calls($(esc(f)), $types))
+end
+
+"""
+    Base.invalidate_calls(mis)
+
+Invalidate the cached native code and inferred IR for each `MethodInstance`
+in `mis`, forcing a recompile the next time each is dispatched. This is a
+pure cache flush: it does not bump the global world counter and does not
+propagate to backedges, so other code compiled against `mis` is unaffected.
+
+Intended for statistical benchmarking of compilation time. See also
+[`Base.record_calls`](@ref).
+"""
+function invalidate_calls(mis)
+    world = get_world_counter()
+    # Cap cache validity *below* the current world so dispatch at this world
+    # re-enters codegen. We do NOT bump the global world counter (that would
+    # force everything else to reinfer too).
+    cap = world == 0 ? UInt(0) : world - UInt(1)
+    for mi in mis
+        mi isa Core.MethodInstance || throw(ArgumentError(string("expected Core.MethodInstance, got ", typeof(mi))))
+        ccall(:jl_method_instance_invalidate_caches, Cvoid, (Any, Csize_t), mi, cap)
+    end
+    return nothing
+end
+
 default_debug_info_kind() = unsafe_load(cglobal(:jl_default_debug_info_kind, Cint))
 
 # this type mirrors jl_cgparams_t (documented in julia.h)
