@@ -1262,7 +1262,7 @@ See also [`readdir`](@ref), [`DirEntry`](@ref), [`walkdir`](@ref).
 ```julia
 # short-circuit a huge directory
 for entry in scandir(DirEntry, "/very/large/dir")
-    isfile(entry) && entry.name == "needle.txt" && break
+    isfile(entry) && basename(entry) == "needle.txt" && break
 end
 
 # deterministic cleanup
@@ -1368,9 +1368,9 @@ function _walkdir(chnl, path, topdown, follow_symlinks, onerror)
     for entry in entries
         # If we're not following symlinks, then treat all symlinks as files
         if (!follow_symlinks && something(tryf(islink, entry), true)) || !something(tryf(isdir, entry), false)
-            push!(files, entry.name)
+            push!(files, basename(entry))
         else
-            push!(dirs, entry.name)
+            push!(dirs, basename(entry))
         end
     end
 
