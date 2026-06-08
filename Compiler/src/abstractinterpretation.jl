@@ -4942,7 +4942,7 @@ function typeinf(interp::AbstractInterpreter, frame::InferenceState{I}) where {I
         elseif isdefined(nextstates[nextstateid], :result) || !isempty(callee.ip)
             # Next make progress on this frame
             prev = length(callee.tasks) + 1
-            nextstates[nextstateid] = typeinf_local(interp, callee, nextstates[nextstateid])
+            nextstates[nextstateid] = @zone "CC: ABSTRACT_EVAL" typeinf_local(interp, callee, nextstates[nextstateid])
             reverse!(callee.tasks, prev)
         elseif callee.cycleid == length(callstack)
             # With no active ip's and no cycles, frame is done

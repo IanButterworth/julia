@@ -139,15 +139,13 @@ function finish!(interp::AbstractInterpreter, caller::InferenceState, validation
         end
         inferred_result = nothing
         debuginfo = nothing
-        const_flag = is_result_constabi_eligible(result)
         discard_src = caller.cache_mode === CACHE_MODE_NULL || (const_flag && may_discard_trees(interp))
         if !discard_src
-            inferred_result = transform_result_for_cache(interp, result, edges)
+            inferred_result = @zone "CC: IR_TO_CI" transform_result_for_cache(interp, result, edges)
             if inferred_result !== nothing
-                result.src = inferred_result
-                debuginfo = get_debuginfo(inferred_result)
                 # Inlining may fast-path the global cache via InferenceResult, so store it back here
                 result.src = inferred_result
+                debuginfo = get_debuginfo(inferred_result)
             else
                 if isa(result.src, OptimizationState)
                     debuginfo = get_debuginfo(ir_to_codeinf!(result.src))
@@ -162,7 +160,7 @@ function finish!(interp::AbstractInterpreter, caller::InferenceState, validation
                     resize!(inferred_result.slottypes::Vector{Any}, nslots)
                     resize!(inferred_result.slotnames, nslots)
                 end
-                inferred_result = maybe_compress_codeinfo(interp, mi, inferred_result)
+                inferred_result = @zone "CC: COMPRESS" maybe_compress_codeinfo(interp, mi, inferred_result)
             elseif ci.owner === nothing
                 # The global cache can only handle objects that codegen understands (nothing or CodeInfo)
                 inferred_result = nothing
@@ -178,7 +176,7 @@ function finish!(interp::AbstractInterpreter, caller::InferenceState, validation
         if max_world >= validation_world
             # if we can record all of the backedges in the global reverse-cache,
             # we can now widen our applicability in the global cache too
-            store_backedges(ci, edges)
+            @zone "CC: BACKEDGES" store_backedges(ci, edges)
         end
         ipo_effects = encode_effects(result.ipo_effects)
         time_now = _time_ns()
@@ -272,7 +270,7 @@ end
 
 function finish_nocycle(interp::AbstractInterpreter, frame::InferenceState{I}, time_before::UInt64) where {I<:AbstractInterpreter}
     opt_cache = IdDict{MethodInstance,CodeInstance}()
-    finishinfer!(frame, interp::I, frame.cycleid, opt_cache)
+    @zone "CC: FINISHINFER" finishinfer!(frame, interp::I, frame.cycleid, opt_cache)
     opt = frame.result.src
     if opt isa OptimizationState # implies `may_optimize(interp) === true`
         optimize(interp::I, opt::OptimizationState{I}, frame.result)
@@ -282,7 +280,7 @@ function finish_nocycle(interp::AbstractInterpreter, frame::InferenceState{I}, t
     end
     empty!(opt_cache)
     validation_world = get_world_counter()
-    finish!(interp::I, frame, validation_world, time_before)
+    @zone "CC: FINISH" finish!(interp::I, frame, validation_world, time_before)
     promotecache!(interp::I, frame)
     if isdefined(frame.result, :ci)
         # After validation, under the world_counter_lock, set max_world to typemax(UInt) for all dependencies
@@ -316,7 +314,7 @@ function finish_cycle(interp::AbstractInterpreter, frames::Vector{AbsIntState{I}
     for frameid = cycleid:length(frames)
         caller = frames[frameid]::InferenceState
         adjust_cycle_frame!(caller, world, cycle_valid_worlds, cycle_valid_effects)
-        finishinfer!(caller, caller.interp::I, cycleid, opt_cache)
+        @zone "CC: FINISHINFER" finishinfer!(caller, caller.interp::I, cycleid, opt_cache)
         time_now = _time_ns()
         caller.time_self_ns += (time_now - time_before)
         time_before = time_now
@@ -349,7 +347,7 @@ function finish_cycle(interp::AbstractInterpreter, frames::Vector{AbsIntState{I}
         caller.time_caches = time_caches
         caller.time_paused = time_paused
         update_valid_age!(caller, world, cycle_valid_worlds)
-        finish!(caller.interp::I, caller, validation_world, time_before)
+        @zone "CC: FINISH" finish!(caller.interp::I, caller, validation_world, time_before)
         if isdefined(caller.result, :ci)
             push!(cis, caller.result.ci)
         end
