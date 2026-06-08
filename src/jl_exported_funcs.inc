@@ -524,6 +524,9 @@
     YY(jl_get_llvm_module) \
     YY(jl_get_LLVM_VERSION) \
     YY(jl_dump_native) \
+    YY(jl_dump_native_prepare) \
+    YY(jl_dump_native_emit) \
+    YY(jl_dump_native_finish) \
     YY(jl_get_llvm_gvs) \
     YY(jl_get_llvm_gv_inits) \
     YY(jl_get_llvm_external_fns) \

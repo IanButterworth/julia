@@ -13,6 +13,11 @@
 JL_DLLEXPORT void jl_dump_native_fallback(void *native_code,
         const char *bc_fname, const char *unopt_bc_fname, const char *obj_fname, const char *asm_fname,
         ios_t *z, ios_t *s) UNAVAILABLE
+JL_DLLEXPORT void *jl_dump_native_prepare_fallback(void *native_code,
+        const char *bc_fname, const char *unopt_bc_fname, const char *obj_fname, const char *asm_fname,
+        jl_emission_params_t *params) UNAVAILABLE
+JL_DLLEXPORT void jl_dump_native_emit_fallback(void *native_state) UNAVAILABLE
+JL_DLLEXPORT void jl_dump_native_finish_fallback(void *native_state, ios_t *z, ios_t *s) UNAVAILABLE
 JL_DLLEXPORT void jl_get_llvm_gvs_fallback(void *native_code, size_t *num, void **gvs) UNAVAILABLE
 JL_DLLEXPORT void jl_get_llvm_gv_inits_fallback(void *native_code, size_t *num, void **inits) UNAVAILABLE
 JL_DLLEXPORT void jl_get_llvm_external_fns_fallback(void *native_code, size_t *num, void **gvs) UNAVAILABLE

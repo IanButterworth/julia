@@ -154,19 +154,17 @@ JL_DLLEXPORT void jl_write_compiler_output(void)
         free(s);
     }
 
-    // jl_dump_native writes the clone_targets into `s`
+    // jl_dump_native_finish writes the clone_targets into `s`
     // We need to postpone the srctext writing after that.
     if (native_code) {
         ios_t *targets = outputji ? &f : NULL;
-        // jl_dump_native will close and free z when appropriate
-        // this is a horrible abstraction, but
-        // this helps reduce live memory significantly
-        jl_dump_native(native_code,
-                        jl_options.outputbc,
-                        jl_options.outputunoptbc,
-                        jl_options.outputo,
-                        jl_options.outputasm,
-                        z, targets, NULL);
+        // `native_code` is the emit-state handle returned by
+        // jl_create_system_image, which started code emission concurrently with
+        // serialization. Complete native dumping now: this embeds the serialized
+        // image `z`, writes the clone_targets into `targets`, and assembles the
+        // output archive. jl_dump_native_finish will close and free z when
+        // appropriate, which helps reduce live memory significantly.
+        jl_dump_native_finish(native_code, z, targets);
         jl_postoutput_hook();
     }
 

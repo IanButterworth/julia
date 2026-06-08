@@ -2210,6 +2210,11 @@ JL_DLLIMPORT void *jl_emit_native(jl_array_t *codeinfos, LLVMOrcThreadSafeModule
 JL_DLLIMPORT void jl_dump_native(void *native_code,
         const char *bc_fname, const char *unopt_bc_fname, const char *obj_fname, const char *asm_fname,
         ios_t *z, ios_t *s, jl_emission_params_t *params);
+JL_DLLIMPORT void *jl_dump_native_prepare(void *native_code,
+        const char *bc_fname, const char *unopt_bc_fname, const char *obj_fname, const char *asm_fname,
+        jl_emission_params_t *params);
+JL_DLLIMPORT void jl_dump_native_emit(void *native_state);
+JL_DLLIMPORT void jl_dump_native_finish(void *native_state, ios_t *z, ios_t *s);
 JL_DLLIMPORT void jl_get_llvm_gvs(void *native_code, size_t *num_els, void **gvs);
 JL_DLLIMPORT void jl_get_llvm_gv_inits(void *native_code, size_t *num_els, void **inits);
 JL_DLLIMPORT void jl_get_llvm_external_fns(void *native_code, size_t *num_els,

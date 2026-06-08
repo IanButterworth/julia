@@ -2004,11 +2004,43 @@ static unsigned compute_image_thread_count(const ModuleInfo &info) {
 
 jl_emission_params_t default_emission_params = { 1 };
 
-void jl_dump_native_locked(jl_native_code_desc_t *data, const char *bc_fname,
-                           const char *unopt_bc_fname, const char *obj_fname,
-                           const char *asm_fname, ios_t *z, ios_t *s,
+// State carried from the code-emission phase (jl_dump_native_code) to the
+// finish phase (jl_dump_native_finish). Splitting native dumping into these two
+// phases allows the serialization-independent code emission to run concurrently
+// with system image serialization (which produces the sysimg bytes `z` that the
+// finish phase embeds into the output archive).
+typedef struct _jl_dump_native_state_t {
+    jl_native_code_desc_t *data;
+    const char *bc_fname;
+    const char *unopt_bc_fname;
+    const char *obj_fname;
+    const char *asm_fname;
+    int emit_metadata;
+    unsigned threads;
+    std::unique_ptr<TargetMachine> SourceTM;
+    Triple TheTriple;
+    std::optional<DataLayout> DL;
+    std::string StackProtectorGuard;
+    unsigned OverrideStackAlignment;
+    SmallVector<AOTOutputs, 16> data_outputs;
+    SmallVector<AOTOutputs, 16> metadata_outputs;
+    SmallVector<char, 0> clone_targets;
+} jl_dump_native_state_t;
+
+// Phase A of native dumping (runs on the main thread). Performs all work that
+// calls back into the Julia runtime and therefore must NOT run on a foreign
+// thread: target-machine setup, multiversioning pre-annotation of the code
+// module, and construction/emission of the metadata module (which allocates
+// Julia strings via jl_get_llvm_clone_targets / jl_expand_sysimage_keyword).
+// Leaves `dataM` annotated and ready for the pure-LLVM emit phase.
+static void jl_dump_native_prepare_locked(jl_dump_native_state_t *state,
                            jl_emission_params_t *params, Module &dataM)
 {
+    jl_native_code_desc_t *data = state->data;
+    const char *bc_fname = state->bc_fname;
+    const char *unopt_bc_fname = state->unopt_bc_fname;
+    const char *obj_fname = state->obj_fname;
+    const char *asm_fname = state->asm_fname;
     // We don't want to use MCJIT's target machine because
     // it uses the large code model and we may potentially
     // want less optimizations there.
@@ -2064,79 +2096,7 @@ void jl_dump_native_locked(jl_native_code_desc_t *data, const char *bc_fname,
         return add_output(M, *SourceTM, name, threads, !!unopt_bc_fname, !!bc_fname, !!obj_fname, !!asm_fname, module_released);
     };
 
-    SmallVector<AOTOutputs, 16> sysimg_outputs;
-    SmallVector<AOTOutputs, 16> data_outputs;
     SmallVector<AOTOutputs, 16> metadata_outputs;
-    if (z) {
-        JL_TIMING(NATIVE_AOT, NATIVE_Sysimg);
-        LLVMContext Context;
-        Context.setDiscardValueNames(true);
-        Module sysimgM("sysimg", Context);
-#if JL_LLVM_VERSION < 210000
-        sysimgM.setTargetTriple(TheTriple.str());
-#else
-        sysimgM.setTargetTriple(TheTriple);
-#endif
-        sysimgM.setDataLayout(DL);
-        sysimgM.setStackProtectorGuard(StackProtectorGuard);
-        sysimgM.setOverrideStackAlignment(OverrideStackAlignment);
-
-        int compression = jl_options.compress_sysimage ? 15 : 0;
-        uint32_t sysimg_checksum = jl_crc32c(0, z->buf, z->size);
-        ArrayRef<char> sysimg_data{z->buf, (size_t)z->size};
-        SmallVector<char, 0> compressed_data;
-        if (compression) {
-            compressed_data.resize(ZSTD_compressBound(z->size));
-            size_t comp_size = ZSTD_compress(compressed_data.data(), compressed_data.size(),
-                                             z->buf, z->size, compression);
-            compressed_data.resize(comp_size);
-            sysimg_data = compressed_data;
-            ios_close(z);
-            free(z);
-        }
-
-        Constant *data = ConstantDataArray::get(Context, sysimg_data);
-        auto sysdata = new GlobalVariable(sysimgM, data->getType(), false,
-                                     GlobalVariable::ExternalLinkage,
-                                     data, "jl_system_image_data");
-        sysdata->setAlignment(Align(jl_page_size));
-#if JL_LLVM_VERSION >= 180000
-        sysdata->setCodeModel(CodeModel::Large);
-#else
-        if (TheTriple.isX86() && TheTriple.isArch64Bit() && TheTriple.isOSLinux())
-            sysdata->setSection(".ldata");
-#endif
-        addComdat(sysdata, TheTriple);
-        Constant *len = ConstantInt::get(sysimgM.getDataLayout().getIntPtrType(Context), sysimg_data.size());
-        addComdat(new GlobalVariable(sysimgM, len->getType(), true,
-                                     GlobalVariable::ExternalLinkage,
-                                     len, "jl_system_image_size"), TheTriple);
-        Constant *checksum_val = ConstantInt::get(Type::getInt32Ty(Context), sysimg_checksum);
-        addComdat(new GlobalVariable(sysimgM, checksum_val->getType(), true,
-                                     GlobalVariable::ExternalLinkage,
-                                     checksum_val, "jl_system_image_checksum"), TheTriple);
-
-        const char *unpack_func = compression ? "jl_image_unpack_zstd" : "jl_image_unpack_uncomp";
-        auto unpack = new GlobalVariable(sysimgM, DL.getIntPtrType(Context), true,
-                                         GlobalVariable::ExternalLinkage, nullptr,
-                                         unpack_func);
-        addComdat(new GlobalVariable(sysimgM, PointerType::getUnqual(Context), true,
-                                     GlobalVariable::ExternalLinkage, unpack,
-                                     "jl_image_unpack"),
-                  TheTriple);
-
-        if (!compression) {
-            // Free z here, since we've copied out everything into data
-            // Results in serious memory savings
-            ios_close(z);
-            free(z);
-        }
-        compressed_data.clear();
-        // Note that we don't set z to null, this allows the check in WRITE_ARCHIVE
-        // to function as expected
-        // no need to free the module/context, destructor handles that
-        sysimg_outputs = compile(sysimgM, "sysimg", 1, [](Module &) {});
-    }
 
     const bool imaging_mode = true;
     unsigned threads = 1;
@@ -2225,19 +2185,6 @@ void jl_dump_native_locked(jl_native_code_desc_t *data, const char *bc_fname,
 
     };
 
-    {
-        // Don't use withModuleDo here since we delete the TSM midway through
-        // auto TSCtx = data->out->get_tsm().consumingModuleDo();
-        // auto lock = TSCtx.getLock();
-        // auto dataM = data->M.getModuleUnlocked();
-
-        data_outputs = compile(dataM, "text", threads, [data](Module &) {
-            // Delete data when add_output thinks it's done with it
-            // Saves memory for use when multithreading
-            delete data;
-        });
-    }
-
     if (params->emit_metadata) {
         JL_TIMING(NATIVE_AOT, NATIVE_Metadata);
         LLVMContext Context;
@@ -2320,14 +2267,139 @@ void jl_dump_native_locked(jl_native_code_desc_t *data, const char *bc_fname,
                                             }),
                                             "jl_image_pointers");
             addComdat(pointers, TheTriple);
-            if (s) {
-                write_int32(s, data.size());
-                ios_write(s, (const char *)data.data(), data.size());
-            }
+            // Stash the clone-target descriptor; it is written into the .ji
+            // stream by the finish phase (after the .ji body has been written).
+            state->clone_targets.assign(data.begin(), data.end());
         }
 
         // no need to free module/context, destructor handles that
         metadata_outputs = compile(metadataM, "data", 1, [](Module &) {});
+    }
+
+    state->threads = threads;
+    state->SourceTM = std::move(SourceTM);
+    state->TheTriple = TheTriple;
+    state->DL = DL;
+    state->StackProtectorGuard = StackProtectorGuard;
+    state->OverrideStackAlignment = OverrideStackAlignment;
+    state->metadata_outputs = std::move(metadata_outputs);
+}
+
+// Phase B of native dumping (safe to run on a background thread). Performs only
+// the pure-LLVM optimization + object emission of the code module; it does not
+// call into the Julia runtime, so it can overlap with system image
+// serialization running on the main thread.
+static void jl_dump_native_emit_locked(jl_dump_native_state_t *state, Module &dataM)
+{
+    auto compile = [&](Module &M, StringRef name, unsigned threads, auto module_released) {
+        return add_output(M, *state->SourceTM, name, threads, !!state->unopt_bc_fname,
+                          !!state->bc_fname, !!state->obj_fname, !!state->asm_fname, module_released);
+    };
+    // Note: `data` (state->data) is intentionally NOT deleted here. The finish
+    // phase still needs it to embed the sysimg and build the output archive, and
+    // system image serialization may still be reading native-code metadata from
+    // it concurrently.
+    state->data_outputs = compile(dataM, "text", state->threads, [](Module &) {});
+}
+
+static void jl_dump_native_finish_locked(jl_dump_native_state_t *state, ios_t *z, ios_t *s)
+{
+    jl_native_code_desc_t *data = state->data;
+    const char *bc_fname = state->bc_fname;
+    const char *unopt_bc_fname = state->unopt_bc_fname;
+    const char *obj_fname = state->obj_fname;
+    const char *asm_fname = state->asm_fname;
+    unsigned threads = state->threads;
+    Triple TheTriple = state->TheTriple;
+    const DataLayout &DL = *state->DL;
+    const std::unique_ptr<TargetMachine> &SourceTM = state->SourceTM;
+    std::string StackProtectorGuard = state->StackProtectorGuard;
+    unsigned OverrideStackAlignment = state->OverrideStackAlignment;
+    SmallVector<AOTOutputs, 16> &data_outputs = state->data_outputs;
+    SmallVector<AOTOutputs, 16> &metadata_outputs = state->metadata_outputs;
+    auto compile = [&](Module &M, StringRef name, unsigned threads, auto module_released) {
+        return add_output(M, *SourceTM, name, threads, !!unopt_bc_fname, !!bc_fname, !!obj_fname, !!asm_fname, module_released);
+    };
+
+    SmallVector<AOTOutputs, 16> sysimg_outputs;
+    if (z) {
+        JL_TIMING(NATIVE_AOT, NATIVE_Sysimg);
+        LLVMContext Context;
+        Context.setDiscardValueNames(true);
+        Module sysimgM("sysimg", Context);
+#if JL_LLVM_VERSION < 210000
+        sysimgM.setTargetTriple(TheTriple.str());
+#else
+        sysimgM.setTargetTriple(TheTriple);
+#endif
+        sysimgM.setDataLayout(DL);
+        sysimgM.setStackProtectorGuard(StackProtectorGuard);
+        sysimgM.setOverrideStackAlignment(OverrideStackAlignment);
+
+        int compression = jl_options.compress_sysimage ? 15 : 0;
+        uint32_t sysimg_checksum = jl_crc32c(0, z->buf, z->size);
+        ArrayRef<char> sysimg_data{z->buf, (size_t)z->size};
+        SmallVector<char, 0> compressed_data;
+        if (compression) {
+            compressed_data.resize(ZSTD_compressBound(z->size));
+            size_t comp_size = ZSTD_compress(compressed_data.data(), compressed_data.size(),
+                                             z->buf, z->size, compression);
+            compressed_data.resize(comp_size);
+            sysimg_data = compressed_data;
+            ios_close(z);
+            free(z);
+        }
+
+        Constant *sysdata_const = ConstantDataArray::get(Context, sysimg_data);
+        auto sysdata = new GlobalVariable(sysimgM, sysdata_const->getType(), false,
+                                     GlobalVariable::ExternalLinkage,
+                                     sysdata_const, "jl_system_image_data");
+        sysdata->setAlignment(Align(jl_page_size));
+#if JL_LLVM_VERSION >= 180000
+        sysdata->setCodeModel(CodeModel::Large);
+#else
+        if (TheTriple.isX86() && TheTriple.isArch64Bit() && TheTriple.isOSLinux())
+            sysdata->setSection(".ldata");
+#endif
+        addComdat(sysdata, TheTriple);
+        Constant *len = ConstantInt::get(sysimgM.getDataLayout().getIntPtrType(Context), sysimg_data.size());
+        addComdat(new GlobalVariable(sysimgM, len->getType(), true,
+                                     GlobalVariable::ExternalLinkage,
+                                     len, "jl_system_image_size"), TheTriple);
+        Constant *checksum_val = ConstantInt::get(Type::getInt32Ty(Context), sysimg_checksum);
+        addComdat(new GlobalVariable(sysimgM, checksum_val->getType(), true,
+                                     GlobalVariable::ExternalLinkage,
+                                     checksum_val, "jl_system_image_checksum"), TheTriple);
+
+        const char *unpack_func = compression ? "jl_image_unpack_zstd" : "jl_image_unpack_uncomp";
+        auto unpack = new GlobalVariable(sysimgM, DL.getIntPtrType(Context), true,
+                                         GlobalVariable::ExternalLinkage, nullptr,
+                                         unpack_func);
+        addComdat(new GlobalVariable(sysimgM, PointerType::getUnqual(Context), true,
+                                     GlobalVariable::ExternalLinkage, unpack,
+                                     "jl_image_unpack"),
+                  TheTriple);
+
+        if (!compression) {
+            // Free z here, since we've copied out everything into data
+            // Results in serious memory savings
+            ios_close(z);
+            free(z);
+        }
+        compressed_data.clear();
+        // Note that we don't set z to null, this allows the check in WRITE_ARCHIVE
+        // to function as expected
+        // no need to free the module/context, destructor handles that
+        sysimg_outputs = compile(sysimgM, "sysimg", 1, [](Module &) {});
+    }
+
+    // Write the clone-target descriptor into the .ji stream now that the .ji
+    // body has been written. (These bytes were computed during the code phase.)
+    // Always emit the length field when metadata was produced, matching the
+    // sequential path (an empty descriptor writes a zero length).
+    if (s && state->emit_metadata) {
+        write_int32(s, state->clone_targets.size());
+        ios_write(s, state->clone_targets.data(), state->clone_targets.size());
     }
 
     {
@@ -2366,10 +2438,80 @@ void jl_dump_native_locked(jl_native_code_desc_t *data, const char *bc_fname,
         WRITE_ARCHIVE(asm_fname, asm_, "", ".s");
 #undef WRITE_ARCHIVE
     }
+
+    delete data;
+}
+
+// Phase A of native dumping: target-machine setup, multiversioning annotation of
+// the code module, and emission of the metadata module. This phase calls into
+// the Julia runtime (allocating Julia strings for the CPU target), so it must
+// run on the main thread. Returns an opaque state handle to be passed to
+// jl_dump_native_emit / jl_dump_native_finish, or NULL if no output was
+// requested (in which case `native_code` is freed).
+extern "C" JL_DLLEXPORT_CODEGEN
+void *jl_dump_native_prepare_impl(void *native_code,
+        const char *bc_fname, const char *unopt_bc_fname, const char *obj_fname,
+        const char *asm_fname,
+        jl_emission_params_t *params)
+{
+    jl_native_code_desc_t *data = (jl_native_code_desc_t*)native_code;
+    if (!bc_fname && !unopt_bc_fname && !obj_fname && !asm_fname) {
+        LLVM_DEBUG(dbgs() << "No output requested, skipping native code dump?\n");
+        delete data;
+        return NULL;
+    }
+
+    if (!params) {
+        params = &default_emission_params;
+    }
+
+    jl_dump_native_state_t *state = new jl_dump_native_state_t();
+    state->data = data;
+    state->bc_fname = bc_fname;
+    state->unopt_bc_fname = unopt_bc_fname;
+    state->obj_fname = obj_fname;
+    state->asm_fname = asm_fname;
+    state->emit_metadata = params->emit_metadata;
+    data->TSM_ref->withModuleDo([&](Module &dataM) {
+        jl_dump_native_prepare_locked(state, params, dataM);
+    });
+    return state;
+}
+
+// Phase B of native dumping: optimize and emit the code module. This is pure
+// LLVM work that does not touch the Julia runtime, so it is safe to run on a
+// background thread concurrently with system image serialization.
+extern "C" JL_DLLEXPORT_CODEGEN
+void jl_dump_native_emit_impl(void *native_state)
+{
+    if (!native_state)
+        return;
+    jl_dump_native_state_t *state = (jl_dump_native_state_t*)native_state;
+    state->data->TSM_ref->withModuleDo([&](Module &dataM) {
+        jl_dump_native_emit_locked(state, dataM);
+    });
+}
+
+// Phase C of native dumping: embed the serialized system image `z`, write the
+// clone-target descriptor into `s`, and assemble the output archive. Consumes
+// and frees the state handle (and the underlying native code descriptor).
+extern "C" JL_DLLEXPORT_CODEGEN
+void jl_dump_native_finish_impl(void *native_state, ios_t *z, ios_t *s)
+{
+    if (!native_state) {
+        // nothing was emitted (no output files were requested)
+        return;
+    }
+    jl_dump_native_state_t *state = (jl_dump_native_state_t*)native_state;
+    jl_dump_native_finish_locked(state, z, s);
+    delete state;
 }
 
 // takes the running content that has collected in the shadow module and dump it to disk
 // this builds the object file portion of the sysimage files for fast startup
+// (sequential entry point; jl_dump_native_prepare / jl_dump_native_emit /
+//  jl_dump_native_finish can be driven separately to overlap code emission with
+//  system image serialization)
 extern "C" JL_DLLEXPORT_CODEGEN
 void jl_dump_native_impl(void *native_code,
         const char *bc_fname, const char *unopt_bc_fname, const char *obj_fname,
@@ -2378,21 +2520,10 @@ void jl_dump_native_impl(void *native_code,
         jl_emission_params_t *params)
 {
     JL_TIMING(NATIVE_AOT, NATIVE_Dump);
-    jl_native_code_desc_t *data = (jl_native_code_desc_t*)native_code;
-    if (!bc_fname && !unopt_bc_fname && !obj_fname && !asm_fname) {
-        LLVM_DEBUG(dbgs() << "No output requested, skipping native code dump?\n");
-        delete data;
-        return;
-    }
-
-    if (!params) {
-        params = &default_emission_params;
-    }
-
-    data->TSM_ref->withModuleDo([&](Module &dataM) {
-        jl_dump_native_locked(data, bc_fname, unopt_bc_fname, obj_fname, asm_fname, z, s,
-                              params, dataM);
-    });
+    void *state = jl_dump_native_prepare_impl(native_code, bc_fname, unopt_bc_fname,
+                                              obj_fname, asm_fname, params);
+    jl_dump_native_emit_impl(state);
+    jl_dump_native_finish_impl(state, z, s);
 }
 
 

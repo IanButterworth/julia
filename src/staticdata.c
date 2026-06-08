@@ -3228,6 +3228,22 @@ static void jl_write_header_for_incremental(ios_t *f, jl_array_t *worklist, jl_a
     write_mod_list(f, mod_array);
 }
 
+// Argument bundle for running the pure-LLVM native code-emission phase
+// (jl_dump_native_emit) on a background thread, concurrently with system image
+// serialization. The emit phase performs only LLVM work and reads native-code
+// metadata that serialization does not mutate, so the two are safe to run in
+// parallel. The runtime-touching preparation (jl_dump_native_prepare) is done
+// on the main thread before the thread is spawned.
+typedef struct {
+    void *state;
+} jl_emit_native_thread_arg_t;
+
+static void jl_emit_native_threadfun(void *varg)
+{
+    jl_emit_native_thread_arg_t *arg = (jl_emit_native_thread_arg_t*)varg;
+    jl_dump_native_emit(arg->state);
+}
+
 JL_DLLEXPORT void jl_create_system_image(void **_native_data, jl_array_t *worklist, bool_t emit_split,
                                          ios_t **s, ios_t **z, jl_array_t **udeps JL_REQUIRE_ROOTED_SLOT, int64_t *srctextpos, jl_array_t *module_init_order)
 {
@@ -3336,11 +3352,51 @@ JL_DLLEXPORT void jl_create_system_image(void **_native_data, jl_array_t *workli
         datastartpos = ios_pos(ff);
     }
 
+    // Native code dumping is split into three phases so the expensive, pure-LLVM
+    // code-emission phase can overlap with system image serialization:
+    //   A. prepare (main thread, here): target-machine setup, multiversioning
+    //      annotation of the code module, and metadata module emission. This
+    //      calls into the Julia runtime (allocates Julia strings for the CPU
+    //      target), so it MUST run on the main thread, before serialization.
+    //   B. emit (background thread): optimize + emit the code module. Pure LLVM
+    //      work that reads only native-code metadata serialization does not
+    //      mutate, so it overlaps with jl_save_system_image_to_stream below.
+    //   C. finish (caller, later): embed the serialized image bytes `z` and
+    //      assemble the output archive.
+    void *emit_state = NULL;
+    if (_native_data != NULL && *_native_data != NULL) {
+        emit_state = jl_dump_native_prepare(*_native_data, jl_options.outputbc,
+            jl_options.outputunoptbc, jl_options.outputo, jl_options.outputasm, NULL);
+    }
+    jl_emit_native_thread_arg_t emit_arg;
+    uv_thread_t emit_thread;
+    int emit_thread_started = 0;
+    if (emit_state != NULL) {
+        emit_arg.state = emit_state;
+        if (uv_thread_create(&emit_thread, jl_emit_native_threadfun, &emit_arg) == 0)
+            emit_thread_started = 1;
+    }
+
     jl_query_cache query_cache;
     init_query_cache(&query_cache);
-    jl_save_system_image_to_stream(ff, mod_array, module_init_order, worklist, extext_methods, new_ext_cis, &query_cache);
-    if (_native_data != NULL)
+    {
+        JL_TIMING(SYSIMG_DUMP, SYSIMG_Serialize);
+        jl_save_system_image_to_stream(ff, mod_array, module_init_order, worklist, extext_methods, new_ext_cis, &query_cache);
+    }
+    if (_native_data != NULL) {
+        if (emit_thread_started) {
+            uv_thread_join(&emit_thread);
+        }
+        else if (emit_state != NULL) {
+            // Thread creation failed; run the emit phase inline now that
+            // serialization is complete.
+            jl_dump_native_emit(emit_state);
+        }
+        // Hand the emit-state handle back to the caller, which will complete
+        // native dumping via jl_dump_native_finish.
+        *_native_data = emit_state;
         native_functions = NULL;
+    }
     // make sure we don't run any Julia code concurrently before this point
     // Re-enable running julia code for postoutput hooks, atexit, etc.
     jl_gc_enable_finalizers(ct, 1);
