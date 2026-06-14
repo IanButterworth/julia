@@ -1190,6 +1190,7 @@ struct ModuleInfo {
     size_t insts;
     size_t clones;
     size_t weight;
+    size_t max_func_weight; // largest single function; sets the indivisible-partition floor
 };
 
 ModuleInfo compute_module_info(Module &M) {
@@ -1200,6 +1201,7 @@ ModuleInfo compute_module_info(Module &M) {
     info.insts = 0;
     info.clones = 0;
     info.weight = 0;
+    info.max_func_weight = 0;
     for (auto &G : M.global_values()) {
         if (G.isDeclaration()) {
             continue;
@@ -1212,6 +1214,8 @@ ModuleInfo compute_module_info(Module &M) {
             info.insts += func_info.insts;
             info.clones += func_info.clones;
             info.weight += func_info.weight;
+            if (func_info.weight > info.max_func_weight)
+                info.max_func_weight = func_info.weight;
         } else {
             info.weight += 1;
         }
@@ -2119,10 +2123,34 @@ static unsigned compute_image_thread_count(const ModuleInfo &info, bool jobserve
         ? std::max(jl_effective_threads(), 1)
         : std::max(jl_effective_threads() / 2, 1);
 
-    auto max_threads = info.globals / 100;
+    // Cap the partition (shard) count. More shards add per-shard overhead (lost
+    // cross-partition inlining), peak memory, and image fragmentation, and past
+    // a point stop speeding up codegen, so don't make more than the work
+    // supports:
+    //  - ~100 globals per shard (existing work proxy);
+    //  - the indivisible-function floor: the largest single function can't be
+    //    split, so more than weight/max_func_weight partitions just leave shards
+    //    idle while the biggest one gates the critical path;
+    //  - an absolute ceiling, mainly for high-core machines where the above are
+    //    loose; overridable via JULIA_IMAGE_MAX_PARTITIONS.
+    size_t max_threads = info.globals / 100;
+    if (info.max_func_weight)
+        max_threads = std::min(max_threads, std::max<size_t>(info.weight / info.max_func_weight, (size_t)1));
+    size_t abs_cap = 16;
+    if (auto capenv = getenv("JULIA_IMAGE_MAX_PARTITIONS")) {
+        char *endptr;
+        unsigned long requested = strtoul(capenv, &endptr, 10);
+        if (*endptr || !requested)
+            jl_safe_printf("WARNING: invalid value '%s' for JULIA_IMAGE_MAX_PARTITIONS\n", capenv);
+        else
+            abs_cap = requested;
+    }
+    max_threads = std::min(max_threads, abs_cap);
     if (max_threads < threads) {
-        LLVM_DEBUG(dbgs() << "Low global count limiting threads to " << max_threads << " (" << info.globals << "globals)\n");
-        threads = max_threads;
+        LLVM_DEBUG(dbgs() << "Limiting image threads to " << max_threads
+                          << " (globals=" << info.globals << " weight=" << info.weight
+                          << " max_func_weight=" << info.max_func_weight << ")\n");
+        threads = (unsigned)max_threads;
     }
 
     // environment variable override
