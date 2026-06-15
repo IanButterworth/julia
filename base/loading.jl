@@ -3293,6 +3293,10 @@ function include_package_for_output(pkg::PkgId, input::String, syntax_version::V
     __toplevel__.var"#_internal_julia_parse" = VersionedParse(syntax_version)
     # This one is the compatibility marker for cache loading
     __toplevel__._internal_syntax_version = cache_syntax_version(syntax_version)
+    # Skip debug-info emission for throwaway workload codegen during `include`; on
+    # failure it is re-run below with debug info for a complete backtrace.
+    retried_with_debuginfo = false
+    ccall(:jl_set_precompile_no_debuginfo, Cvoid, (Int8,), 1)
     cumulative_compile_timing(true)
     _precompile_dep_load_ns[] = 0
     _precompile_dep_load_depth[] = 0
@@ -3300,11 +3304,20 @@ function include_package_for_output(pkg::PkgId, input::String, syntax_version::V
     t_include_start = time_ns()
     t_comp_before, _ = cumulative_compile_time_ns()
     try
-        Compiler.@zone "PRECOMPILE_INCLUDE" Base.include(Base.__toplevel__, input)
-    catch ex
-        precompilableerror(ex) || rethrow()
-        @debug "Aborting `create_expr_cache'" exception=(ErrorException("Declaration of __precompile__(false) not allowed"), catch_backtrace())
-        exit(125) # we define status = 125 means PrecompileableError
+        @label do_include
+        try
+            Compiler.@zone "PRECOMPILE_INCLUDE" Base.include(Base.__toplevel__, input)
+        catch ex
+            if precompilableerror(ex)
+                @debug "Aborting `create_expr_cache'" exception=(ErrorException("Declaration of __precompile__(false) not allowed"), catch_backtrace())
+                exit(125) # we define status = 125 means PrecompileableError
+            end
+            retried_with_debuginfo && rethrow()
+            # re-run once with debug info so the propagating error has a full backtrace
+            retried_with_debuginfo = true
+            ccall(:jl_set_precompile_no_debuginfo, Cvoid, (Int8,), 0)
+            @goto do_include
+        end
     finally
         t_comp_after, _ = cumulative_compile_time_ns()
         t_include_end = time_ns()
@@ -3319,6 +3332,7 @@ function include_package_for_output(pkg::PkgId, input::String, syntax_version::V
         end
         ccall(:jl_set_newly_inferred, Cvoid, (Any,), nothing)
         keep_ir && ccall(:jl_set_precompile_keep_ir, Cvoid, (Int8,), 0)
+        ccall(:jl_set_precompile_no_debuginfo, Cvoid, (Int8,), 0)
     end
     # check that the package defined the expected module so we can give a nice error message if not
     m = maybe_root_module(pkg)

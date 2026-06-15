@@ -1074,6 +1074,11 @@ JL_DLLEXPORT void jl_set_precompile_keep_ir(int8_t v)
     jl_atomic_store_relaxed(&jl_precompile_keep_ir, v);
 }
 
+JL_DLLEXPORT void jl_set_precompile_no_debuginfo(int8_t on)
+{
+    jl_default_cgparams.debug_info_level = on ? 0 : (int)jl_options.debug_level;
+}
+
 static int invalidate_all_entries(jl_typemap_entry_t *entry, void *env)
 {
     jl_atomic_store_relaxed(&entry->max_world, 0);
