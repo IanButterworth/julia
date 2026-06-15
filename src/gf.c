@@ -1074,9 +1074,59 @@ JL_DLLEXPORT void jl_set_precompile_keep_ir(int8_t v)
     jl_atomic_store_relaxed(&jl_precompile_keep_ir, v);
 }
 
-JL_DLLEXPORT void jl_set_precompile_no_debuginfo(int8_t on)
+// Parallel precompile inference (prototype): when on, a worker runs workload code
+// in the interpreter during `include` (so the main thread never blocks on codegen)
+// and hands each dispatched method instance to a consumer thread to infer
+// concurrently for the cache. See `include_package_for_output`.
+static _Atomic(int8_t) jl_precompile_parallel_infer = 0;
+static _Atomic(size_t) jl_precompile_ninterp = 0; // methods enqueued for async inference
+static arraylist_t jl_infer_queue;
+static uv_mutex_t jl_infer_queue_lock;
+static int jl_infer_queue_init = 0;
+
+JL_DLLEXPORT void jl_set_precompile_parallel_infer(int8_t on)
 {
-    jl_default_cgparams.debug_info_level = on ? 0 : (int)jl_options.debug_level;
+    if (on && !jl_infer_queue_init) {
+        arraylist_new(&jl_infer_queue, 0);
+        uv_mutex_init(&jl_infer_queue_lock);
+        jl_infer_queue_init = 1;
+    }
+    if (on)
+        jl_atomic_store_relaxed(&jl_precompile_ninterp, 0);
+    jl_atomic_store_relaxed(&jl_precompile_parallel_infer, on);
+}
+
+JL_DLLEXPORT size_t jl_precompile_ninterp_count(void) { return jl_atomic_load_relaxed(&jl_precompile_ninterp); }
+
+static void jl_infer_queue_push(jl_method_instance_t *mi)
+{
+    uv_mutex_lock(&jl_infer_queue_lock);
+    arraylist_push(&jl_infer_queue, mi);
+    uv_mutex_unlock(&jl_infer_queue_lock);
+}
+
+// Pop one queued MethodInstance for a consumer to infer, or `nothing` if empty.
+JL_DLLEXPORT jl_value_t *jl_precompile_infer_take(void)
+{
+    jl_value_t *mi = jl_nothing;
+    if (jl_infer_queue_init) {
+        uv_mutex_lock(&jl_infer_queue_lock);
+        if (jl_infer_queue.len > 0)
+            mi = (jl_value_t*)arraylist_pop(&jl_infer_queue);
+        uv_mutex_unlock(&jl_infer_queue_lock);
+    }
+    return mi;
+}
+
+// Infer one MethodInstance on the calling (consumer) thread; populates newly_inferred.
+JL_DLLEXPORT void jl_precompile_infer_mi(jl_method_instance_t *mi)
+{
+    size_t world = jl_atomic_load_acquire(&jl_world_counter);
+    // Skip if already inferred (e.g. reached via another method's inference closure),
+    // so overlapping closures don't re-infer and duplicate it in newly_inferred.
+    if (jl_rettype_inferred_native(mi, world, world) != jl_nothing)
+        return;
+    jl_type_infer(mi, world, SOURCE_MODE_ABI, jl_options.trim);
 }
 
 static int invalidate_all_entries(jl_typemap_entry_t *entry, void *env)
@@ -3911,6 +3961,25 @@ static jl_code_instance_t *jl_compile_method_very_internal(jl_method_instance_t 
                 0, 1, ~(size_t)0, 0, jl_nothing, di, edges);
             jl_atomic_store_release(&codeinst->invoke, jl_fptr_interpret_call);
             jl_mi_cache_insert(mi, codeinst);
+            promote_cache_method(F, args, nargs, world, mi, mi == mi2 ? mi->specTypes : normalize_to_cacheable_sig(mi), cause);
+            return codeinst;
+        }
+    }
+
+    // Parallel precompile inference: run the method in the interpreter now (so the
+    // including thread doesn't block on codegen) and hand the method instance to a
+    // consumer thread to infer concurrently for the cache.
+    if (jl_atomic_load_relaxed(&jl_precompile_parallel_infer) && jl_is_method(def) &&
+            !jl_method_is_macro((jl_method_t*)def)) {
+        jl_code_info_t *src = jl_code_for_interpreter(mi, world);
+        if (!jl_code_requires_compiler(src, 0)) {
+            jl_code_instance_t *codeinst = jl_new_codeinst(mi, jl_nothing,
+                (jl_value_t*)jl_any_type, (jl_value_t*)jl_any_type, NULL, NULL,
+                0, 1, ~(size_t)0, 0, jl_nothing, NULL, jl_emptysvec);
+            jl_atomic_store_release(&codeinst->invoke, jl_fptr_interpret_call);
+            jl_mi_cache_insert(mi, codeinst);
+            jl_infer_queue_push(mi);
+            jl_atomic_fetch_add_relaxed(&jl_precompile_ninterp, 1);
             promote_cache_method(F, args, nargs, world, mi, mi == mi2 ? mi->specTypes : normalize_to_cacheable_sig(mi), cause);
             return codeinst;
         }

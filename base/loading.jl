@@ -3293,10 +3293,26 @@ function include_package_for_output(pkg::PkgId, input::String, syntax_version::V
     __toplevel__.var"#_internal_julia_parse" = VersionedParse(syntax_version)
     # This one is the compatibility marker for cache loading
     __toplevel__._internal_syntax_version = cache_syntax_version(syntax_version)
-    # Skip debug-info emission for throwaway workload codegen during `include`; on
-    # failure it is re-run below with debug info for a complete backtrace.
-    retried_with_debuginfo = false
-    ccall(:jl_set_precompile_no_debuginfo, Cvoid, (Int8,), 1)
+    # Parallel precompile inference (prototype): interpret workload code on this
+    # thread during `include` and infer dispatched method instances on consumer
+    # task(s) when the worker has spare threads. Toggle off with JULIA_PRECOMPILE_INTERP=0.
+    parallel_infer = Base.get_bool_env("JULIA_PRECOMPILE_INTERP", true) && Threads.nthreads() > 1
+    infer_done = Threads.Atomic{Bool}(false)
+    infer_consumers = Task[]
+    if parallel_infer
+        ccall(:jl_set_precompile_parallel_infer, Cvoid, (Int8,), 1)
+        for _ in 1:(Threads.nthreads() - 1)
+            push!(infer_consumers, Base.errormonitor(Threads.@spawn while true
+                mi = ccall(:jl_precompile_infer_take, Any, ())
+                if mi === nothing
+                    infer_done[] && break
+                    yield()
+                else
+                    ccall(:jl_precompile_infer_mi, Cvoid, (Any,), mi)
+                end
+            end))
+        end
+    end
     cumulative_compile_timing(true)
     _precompile_dep_load_ns[] = 0
     _precompile_dep_load_depth[] = 0
@@ -3304,21 +3320,19 @@ function include_package_for_output(pkg::PkgId, input::String, syntax_version::V
     t_include_start = time_ns()
     t_comp_before, _ = cumulative_compile_time_ns()
     try
-        @label do_include
-        try
-            Compiler.@zone "PRECOMPILE_INCLUDE" Base.include(Base.__toplevel__, input)
-        catch ex
-            if precompilableerror(ex)
-                @debug "Aborting `create_expr_cache'" exception=(ErrorException("Declaration of __precompile__(false) not allowed"), catch_backtrace())
-                exit(125) # we define status = 125 means PrecompileableError
-            end
-            retried_with_debuginfo && rethrow()
-            # re-run once with debug info so the propagating error has a full backtrace
-            retried_with_debuginfo = true
-            ccall(:jl_set_precompile_no_debuginfo, Cvoid, (Int8,), 0)
-            @goto do_include
-        end
+        Compiler.@zone "PRECOMPILE_INCLUDE" Base.include(Base.__toplevel__, input)
+    catch ex
+        precompilableerror(ex) || rethrow()
+        @debug "Aborting `create_expr_cache'" exception=(ErrorException("Declaration of __precompile__(false) not allowed"), catch_backtrace())
+        exit(125) # we define status = 125 means PrecompileableError
     finally
+        # Drain parallel inference before measuring or stopping recording, so the
+        # inference tail is included in the timing and newly_inferred is complete.
+        if parallel_infer
+            infer_done[] = true
+            foreach(wait, infer_consumers)
+            ccall(:jl_set_precompile_parallel_infer, Cvoid, (Int8,), 0)
+        end
         t_comp_after, _ = cumulative_compile_time_ns()
         t_include_end = time_ns()
         cumulative_compile_timing(false)
@@ -3328,11 +3342,28 @@ function include_package_for_output(pkg::PkgId, input::String, syntax_version::V
                     " include_ns=", t_include_end - t_include_start,
                     " deps_ns=", _precompile_dep_load_ns[],
                     " compilation_ns=", t_comp_after - t_comp_before,
-                    " methods=", length(newly_inferred))
+                    " methods=", length(newly_inferred),
+                    " interp=", ccall(:jl_precompile_ninterp_count, Csize_t, ()))
+        end
+        let dumppath = get(ENV, "JULIA_PRECOMP_DUMP_MIS", "")
+            if !isempty(dumppath)
+                open(dumppath, "w") do io
+                    for x in newly_inferred
+                        local mi
+                        if x isa Core.CodeInstance
+                            mi = get_ci_mi(x)
+                        elseif x isa Core.MethodInstance
+                            mi = x
+                        else
+                            continue
+                        end
+                        println(io, mi.specTypes)
+                    end
+                end
+            end
         end
         ccall(:jl_set_newly_inferred, Cvoid, (Any,), nothing)
         keep_ir && ccall(:jl_set_precompile_keep_ir, Cvoid, (Int8,), 0)
-        ccall(:jl_set_precompile_no_debuginfo, Cvoid, (Int8,), 0)
     end
     # check that the package defined the expected module so we can give a nice error message if not
     m = maybe_root_module(pkg)
@@ -3420,7 +3451,7 @@ function create_expr_cache(pkg::PkgId, input::PkgLoadSpec, output::String, outpu
            --startup-file=no --history-file=no --warn-overwrite=yes
            $(have_color === nothing ? "--color=auto" : have_color ? "--color=yes" : "--color=no")
            -`
-    cmd = addenv(cmd, "OPENBLAS_NUM_THREADS" => 1, "JULIA_NUM_THREADS" => 1)
+    cmd = addenv(cmd, "OPENBLAS_NUM_THREADS" => 1, "JULIA_NUM_THREADS" => 2) # prototype: spare thread for parallel inference
     # Only request per-package timing reports when explicitly asked for (e.g. by
     # precompilepkgs), so that the marker lines don't leak into normal load logs.
     report_timing && (cmd = addenv(cmd, "JULIA_PRECOMP_REPORT_TIMING" => 1))
