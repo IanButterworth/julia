@@ -543,8 +543,8 @@ static void generate_cfunc_thunks(jl_codegen_output_t &out) JL_CANSAFEPOINT
     DenseMap<jl_method_instance_t*, jl_code_instance_t*> compiled_mi;
     for (auto &[ci, _] : out.ci_funcs) {
         jl_method_instance_t *mi = jl_get_ci_mi(ci);
-        if ((ci->owner == jl_nothing || ci->owner == (jl_value_t*)jl_trim_sym) &&
-            jl_atomic_load_relaxed(&ci->max_world) == ~(size_t)0 && ci->def == (jl_value_t*)mi)
+        if ((jl_ci_owner(ci) == jl_nothing || jl_ci_owner(ci) == (jl_value_t*)jl_trim_sym) &&
+            jl_atomic_load_relaxed(&ci->max_world) == ~(size_t)0 && jl_ci_defobj(ci) == (jl_value_t*)mi)
             compiled_mi[mi] = ci;
     }
     size_t latestworld = jl_atomic_load_acquire(&jl_world_counter);
@@ -580,7 +580,7 @@ static void generate_cfunc_thunks(jl_codegen_output_t &out) JL_CANSAFEPOINT
                 codeinst = it->second;
                 JL_GC_PROMISE_ROOTED(codeinst);
                 const auto &decls = out.ci_funcs.find(codeinst)->second;
-                jl_value_t *astrt = codeinst->rettype;
+                jl_value_t *astrt = jl_ci_rettype(codeinst);
                 if (astrt != (jl_value_t*)jl_bottom_type &&
                     jl_type_intersection(astrt, declrt) == jl_bottom_type) {
                     // Do not warn if the function never returns since it is
@@ -589,7 +589,7 @@ static void generate_cfunc_thunks(jl_codegen_output_t &out) JL_CANSAFEPOINT
                     jl_printf(JL_STDERR, "WARNING: cfunction: return type of %s does not match\n", name_from_method_instance(mi));
                 }
                 if (decls.invoke_api == JL_INVOKE_CONST) {
-                    std::string gf_thunk_name = emit_abi_constreturn(out, cfunc.abi, codeinst->rettype_const);
+                    std::string gf_thunk_name = emit_abi_constreturn(out, cfunc.abi, jl_ci_rettype_const(codeinst));
                     auto F = out.get_module().getFunction(gf_thunk_name);
                     assert(F);
                     assign_fptr(F);

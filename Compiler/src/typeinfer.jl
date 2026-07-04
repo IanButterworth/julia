@@ -1229,6 +1229,19 @@ function completed_inference_result(interp::AbstractInterpreter, frame::Inferenc
     return LocalInferenceResult(result, proof, get_inference_world(interp))
 end
 
+function codeinst_edges_sub(existing_edge::CodeInstance, min_world::UInt, max_world::UInt,
+                            edges::Union{SimpleVector, Core.InternedCodeInstance})
+    # return if the existing edge has more restrictions than the other arguments (more edges and narrower worlds)
+    # (interned edge lists of image CodeInstances compare by identity, which
+    # can only miss a chance to reuse `existing_edge`)
+    if existing_edge.min_world >= min_world &&
+       existing_edge.max_world <= max_world &&
+       existing_edge.edges == edges
+        return true
+    end
+    return false
+end
+
 function _schedule_edge_infer_task!(caller::AbsIntState, frame::InferenceState, result::InferenceResult,
                                     method::Method, edge_ci::Union{Nothing,CodeInstance},
                                     edgecycle::Bool, edgelimited::Bool)
@@ -1414,6 +1427,12 @@ for the code of a function that inference has found to just return a constant. F
 stored - the constant is used directly. However, because this is an ABI implementation detail, it is nice to maintain
 consistency and just synthesize a CodeInfo when the reflection APIs ask for them - this function does that.
 """
+# image CodeInstances may carry their edges as a Core.InternedCodeInstance;
+# materialize before handing the list onward
+ci_edges_svec(edges::SimpleVector) = edges
+ci_edges_svec(edges::Core.InternedCodeInstance) =
+    ccall(:jl_ici_to_svec, Core.SimpleVector, (Any,), edges)
+
 function codeinfo_for_const(::AbstractInterpreter, mi::MethodInstance, worlds::WorldRange, edges::SimpleVector, @nospecialize(val))
     method = mi.def::Method
     tree = ccall(:jl_new_code_info_uninit, Ref{CodeInfo}, ())
@@ -1578,7 +1597,7 @@ function ci_get_source(interp::AbstractInterpreter, code::CodeInstance, @nospeci
         inf === nothing || return inf
     end
     if use_const_api(code)
-        return codeinfo_for_const(interp, get_ci_mi(code), WorldRange(code.min_world, code.max_world), code.edges, code.rettype_const)
+        return codeinfo_for_const(interp, get_ci_mi(code), WorldRange(code.min_world, code.max_world), ci_edges_svec(code.edges), code.rettype_const)
     end
     if isa(src, String)
         src = _uncompressed_ir(code, src)
@@ -2127,7 +2146,7 @@ function compile!(codeinfos::Vector{Any}, workqueue::CompilationQueue;
             end
             # now make sure everything has source code, if desired
             if use_const_api(callee)
-                src = codeinfo_for_const(interp, mi, WorldRange(callee.min_world, callee.max_world), callee.edges, callee.rettype_const)
+                src = codeinfo_for_const(interp, mi, WorldRange(callee.min_world, callee.max_world), ci_edges_svec(callee.edges), callee.rettype_const)
             else
                 src = get(interp.codegen, callee, nothing)
                 if src === nothing
