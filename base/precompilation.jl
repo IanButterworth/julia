@@ -33,7 +33,67 @@ function teardown_precompile_jobserver!()
     return nothing
 end
 
-# Bounds concurrently CPU-active workers. The `Base.Semaphore` enforces the
+# --- Priority semaphore ------------------------------------------------------
+#
+# Like `Base.Semaphore`, but hands a freed permit to the waiter with the highest
+# priority instead of the one that has waited longest. Ties, and waiters queued
+# while no permit is free, keep arrival order.
+#
+# A permit is handed over directly rather than being released and re-contended
+# for, so `curr_cnt` stays incremented across the handoff and there is no
+# thundering herd on release.
+mutable struct PrioritySemaphore
+    const sem_size::Int
+    const lock::ReentrantLock
+    curr_cnt::Int
+    seq::Int
+    # Sorted highest-priority-first. Kept as parallel vectors so the keys can be
+    # binary searched directly. The number of blocked waiters is bounded by the
+    # number of packages being precompiled, so insertion cost is not a concern.
+    const waiting_keys::Vector{Tuple{Int, Int}}
+    const waiting_events::Vector{Base.Event}
+end
+function PrioritySemaphore(sem_size::Int)
+    sem_size > 0 || throw(ArgumentError("PrioritySemaphore size must be > 0"))
+    return PrioritySemaphore(sem_size, ReentrantLock(), 0, 0, Tuple{Int,Int}[], Base.Event[])
+end
+
+function acquire(s::PrioritySemaphore, priority::Int)
+    event = @lock s.lock begin
+        if s.curr_cnt < s.sem_size && isempty(s.waiting_keys)
+            s.curr_cnt += 1
+            nothing
+        else
+            s.seq += 1
+            key = (priority, -s.seq) # negated so that earlier arrivals sort first
+            i = searchsortedfirst(s.waiting_keys, key, rev=true)
+            insert!(s.waiting_keys, i, key)
+            event = Base.Event()
+            insert!(s.waiting_events, i, event)
+            event
+        end
+    end
+    # Being notified means a permit has already been counted against us.
+    event === nothing || wait(event)
+    return nothing
+end
+
+function release(s::PrioritySemaphore)
+    event = @lock s.lock begin
+        s.curr_cnt > 0 || error("release count must match acquire count")
+        if isempty(s.waiting_keys)
+            s.curr_cnt -= 1
+            nothing
+        else
+            popfirst!(s.waiting_keys)
+            popfirst!(s.waiting_events)
+        end
+    end
+    event === nothing || notify(event)
+    return nothing
+end
+
+# Bounds concurrently CPU-active workers. The `PrioritySemaphore` enforces the
 # process-count cap; when the jobserver is active each worker also holds one
 # baseline token from the shared pool while CPU-active, balancing worker
 # baselines and imaging codegen threads against one budget. A worker's main
@@ -46,11 +106,11 @@ end
 # `ntokens` tracks tokens actually held, so releases only post back while it is
 # positive and tokenless acquires can never over-post.
 mutable struct WorkerLimiter
-    const sem::Base.Semaphore
+    const sem::PrioritySemaphore
     const jobserver::Bool
     @atomic ntokens::Int
 end
-WorkerLimiter(sem::Base.Semaphore, jobserver::Bool) = WorkerLimiter(sem, jobserver, 0)
+WorkerLimiter(sem::PrioritySemaphore, jobserver::Bool) = WorkerLimiter(sem, jobserver, 0)
 
 # How long an acquire keeps polling for a baseline token before proceeding
 # without one. Generous enough that it is only ever hit when the pool has been
@@ -97,13 +157,13 @@ function _jobserver_release_baseline(w::WorkerLimiter)
     end
 end
 
-function Base.acquire(w::WorkerLimiter; cancel=Returns(false))
-    Base.acquire(w.sem)
+function Base.acquire(w::WorkerLimiter, priority::Int=0; cancel=Returns(false))
+    acquire(w.sem, priority)
     if w.jobserver
         try
             _jobserver_acquire_baseline(w; cancel)
         catch
-            Base.release(w.sem)
+            release(w.sem)
             rethrow()
         end
     end
@@ -112,12 +172,12 @@ end
 
 function Base.release(w::WorkerLimiter)
     w.jobserver && _jobserver_release_baseline(w)
-    Base.release(w.sem)
+    release(w.sem)
     return nothing
 end
 
-function Base.acquire(f, w::WorkerLimiter; cancel=Returns(false))
-    Base.acquire(w; cancel)
+function Base.acquire(f, w::WorkerLimiter, priority::Int=0; cancel=Returns(false))
+    Base.acquire(w, priority; cancel)
     try
         return f()
     finally
@@ -2097,7 +2157,7 @@ end
 #   - `nothing`: cache already existed
 #   - `Tuple{String, Union{Nothing, String}}`: this process just compiled
 #   - `Exception`: compilation failed
-function precompile_pkgs_maybe_cachefile_lock(f, s::PrecompileSession, pkg_config, job::PrecompileJob, fullname)
+function precompile_pkgs_maybe_cachefile_lock(f, s::PrecompileSession, pkg_config, job::PrecompileJob, fullname, priority::Int=0)
     if !(isdefined(Base, :mkpidlock_hook) && isdefined(Base, :trymkpidlock_hook) && Base.isdefined(Base, :parse_pidfile_hook))
         return f()
     end
@@ -2125,21 +2185,68 @@ function precompile_pkgs_maybe_cachefile_lock(f, s::PrecompileSession, pkg_confi
             # wait until the lock is available
             cachefile = @invokelatest Base.mkpidlock_hook(() -> begin
                     job.lock_holder = ""
-                    Base.acquire(f, s.parallel_limiter; cancel=() -> should_stop(s))
+                    Base.acquire(f, s.parallel_limiter, priority; cancel=() -> should_stop(s))
                 end,
                 pidfile; stale_age)
         finally
-            Base.acquire(s.parallel_limiter; cancel=() -> should_stop(s)) # re-acquire so the outer release is balanced
+            Base.acquire(s.parallel_limiter, priority; cancel=() -> should_stop(s)) # re-acquire so the outer release is balanced
         end
     end
     return cachefile
+end
+
+# Length of the longest chain of packages waiting downstream of each package.
+#
+# Used as the scheduling priority: a package that nothing depends on can be built
+# whenever there is a free worker, whereas one at the head of a long chain holds up
+# everything behind it, so starting the latter first shortens the tail of a run.
+# Walked iteratively over the reverse graph so that a deep graph cannot overflow
+# the stack and so that a cycle (reported separately by `detect_circular_deps!`)
+# terminates rather than recursing forever.
+function downstream_heights(direct_deps::Dict{PkgId, Vector{PkgId}})
+    dependents = Dict{PkgId, Vector{PkgId}}()
+    for (pkg, deps) in direct_deps
+        for dep in deps
+            haskey(direct_deps, dep) || continue
+            push!(get!(Vector{PkgId}, dependents, dep), pkg)
+        end
+    end
+    heights = Dict{PkgId, Int}()
+    inprogress = Set{PkgId}()
+    stack = Tuple{PkgId, Bool}[]
+    for root in keys(direct_deps)
+        haskey(heights, root) && continue
+        push!(stack, (root, false))
+        while !isempty(stack)
+            pkg, expanded = pop!(stack)
+            if expanded
+                height = 0
+                for dependent in get(dependents, pkg, ())
+                    h = get(heights, dependent, nothing)
+                    h === nothing && continue # on the stack above us, i.e. a cycle
+                    height = max(height, h + 1)
+                end
+                heights[pkg] = height
+                delete!(inprogress, pkg)
+            elseif !haskey(heights, pkg) && !(pkg in inprogress)
+                push!(inprogress, pkg)
+                push!(stack, (pkg, true))
+                for dependent in get(dependents, pkg, ())
+                    haskey(heights, dependent) || push!(stack, (dependent, false))
+                end
+            end
+        end
+    end
+    return heights
 end
 
 function spawn_precompile_tasks!(s::PrecompileSession;
         direct_deps, was_processed, configs, circular_deps,
         requested_pkgids, pkg_names, requested_pkgs, from_loading)
     batch_tasks = Task[]
+    heights = downstream_heights(direct_deps)
     for (pkg, deps) in direct_deps
+        priority = get(heights, pkg, 0)
         cachepaths = Base.find_all_in_cache_path(pkg)
         freshpaths = String[]
         @lock s.cache_lock s.cachepath_cache[pkg] = freshpaths
@@ -2187,7 +2294,7 @@ function spawn_precompile_tasks!(s::PrecompileSession;
                     push!(freshpaths, freshpath)
                 end
                 if !circular && is_stale
-                    Base.acquire(s.parallel_limiter; cancel=() -> should_stop(s))
+                    Base.acquire(s.parallel_limiter, priority; cancel=() -> should_stop(s))
                     is_serial_dep = pkg in s.serial_deps
                     is_project_dep = pkg in s.project_deps
 
@@ -2234,7 +2341,7 @@ function spawn_precompile_tasks!(s::PrecompileSession;
                                 pid = try; take!(pid_ch); catch; Int32(0); end
                                 pid > 0 && @lock s.print_lock set_pid!(job, pid)
                             end)
-                            t = @elapsed ret = precompile_pkgs_maybe_cachefile_lock(s, pkg_config, job, fullname) do
+                            t = @elapsed ret = precompile_pkgs_maybe_cachefile_lock(s, pkg_config, job, fullname, priority) do
                                 if should_stop(s)
                                     return ErrorException("canceled")
                                 end
@@ -2777,7 +2884,7 @@ function do_precompile(pkgs::Union{Vector{String}, Vector{PkgId}},
         configs, io, logio, logcalls, fancyprint, hascolor,
         warn_loaded, ignore_loaded, internal_call, strict, _from_loading,
         time_start, print_lock,
-        parallel_limiter=WorkerLimiter(Base.Semaphore(num_tasks), precompile_jobserver !== :none), num_tasks,
+        parallel_limiter=WorkerLimiter(PrioritySemaphore(num_tasks), precompile_jobserver !== :none), num_tasks,
         start_loaded_modules=Set{PkgId}(keys(Base.loaded_modules)), requested_pkgids, requested_all,
         direct_deps=graph.direct_deps,
         ext_to_parent=graph.ext_to_parent, parent_to_exts=graph.parent_to_exts,

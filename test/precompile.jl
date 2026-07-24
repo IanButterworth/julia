@@ -3674,4 +3674,56 @@ precompile_test_harness("cancellation relink under cancelled external parent") d
     end
 end
 
+# Scheduling helpers used by `Base.Precompilation.precompilepkgs`
+@testset "precompile scheduling" begin
+    let P = Base.Precompilation, PkgId = Base.PkgId
+        # `downstream_heights` measures the longest chain of packages waiting on each
+        # package, which is used as the scheduling priority.
+        A, B, C, D = PkgId("A"), PkgId("B"), PkgId("C"), PkgId("D")
+        heights = P.downstream_heights(Dict(A => PkgId[], B => [A], C => [B], D => PkgId[]))
+        @test heights[A] == 2
+        @test heights[B] == 1
+        @test heights[C] == 0
+        @test heights[D] == 0
+        # dependencies outside the graph are ignored, and cycles must terminate
+        @test P.downstream_heights(Dict(A => [PkgId("Absent")])) == Dict(A => 0)
+        X, Y = PkgId("X"), PkgId("Y")
+        @test length(P.downstream_heights(Dict(X => [Y], Y => [X]))) == 2
+
+        # `PrioritySemaphore` admits the highest-priority waiter first, arrival order
+        # breaking ties, and never exceeds its size.
+        sem = P.PrioritySemaphore(1)
+        P.acquire(sem, 0)
+        order, order_lock, tasks = Int[], ReentrantLock(), Task[]
+        for p in [1, 5, 3, 5, 2]
+            push!(tasks, Threads.@spawn begin
+                P.acquire(sem, p)
+                @lock order_lock push!(order, p)
+                P.release(sem)
+            end)
+            # let each task reach the semaphore so that arrival order is deterministic
+            timedwait(() -> (@lock sem.lock length(sem.waiting_keys)) == length(tasks), 10)
+        end
+        P.release(sem)
+        foreach(wait, tasks)
+        @test order == [5, 5, 3, 2, 1]
+        @test sem.curr_cnt == 0
+
+        sem2 = P.PrioritySemaphore(3)
+        live, peak = Threads.Atomic{Int}(0), Threads.Atomic{Int}(0)
+        @sync for i in 1:40
+            Threads.@spawn begin
+                P.acquire(sem2, i % 7)
+                Threads.atomic_max!(peak, Threads.atomic_add!(live, 1) + 1)
+                yield()
+                Threads.atomic_sub!(live, 1)
+                P.release(sem2)
+            end
+        end
+        @test peak[] <= 3
+        @test sem2.curr_cnt == 0
+        @test_throws ArgumentError P.PrioritySemaphore(0)
+    end
+end
+
 finish_precompile_test!()
