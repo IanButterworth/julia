@@ -33,6 +33,32 @@ function teardown_precompile_jobserver!()
     return nothing
 end
 
+# Whether a run with `num_tasks` workers will set up the shared CPU-thread
+# jobserver. `JULIA_IMAGE_THREADS` pins a per-worker thread count instead, unless
+# `JULIA_PRECOMPILE_THREADS` also asks for a shared budget.
+function jobserver_eligible(num_tasks::Int)
+    return num_tasks > 1 && (haskey(ENV, "JULIA_PRECOMPILE_THREADS") || !haskey(ENV, "JULIA_IMAGE_THREADS"))
+end
+
+# Rough peak RSS of a worker precompiling a large package. Only used to keep the
+# default worker count from overcommitting memory, so it is deliberately generous.
+const WORKER_RSS_ESTIMATE = 2 * 1024^3
+
+# Ceiling on the default number of concurrent workers.
+#
+# This was a flat 16, picked for stability on shared-resource systems back when
+# nothing bounded the CPU threads a worker could use. With the jobserver that is no
+# longer this cap's job: the budget of `EFFECTIVE_CPU_THREADS + 1` baseline tokens
+# already bounds CPU, and holding the worker count below it just leaves the budget
+# unfillable on a machine with many cores. What is left to bound is memory, so
+# derive the ceiling from free memory, never going below the historical 16.
+function default_task_cap(jobserver::Bool)
+    jobserver || return 16
+    free = Sys.free_memory()
+    free == 0 && return 16 # unknown, e.g. an unsupported platform
+    return max(16, Int(fld(free, WORKER_RSS_ESTIMATE)))
+end
+
 # --- Priority semaphore ------------------------------------------------------
 #
 # Like `Base.Semaphore`, but hands a freed permit to the waiter with the highest
@@ -2800,7 +2826,10 @@ function do_precompile(pkgs::Union{Vector{String}, Vector{PkgId}},
     # Windows sometimes hits a ReadOnlyMemoryError, so we halve the default number of tasks. Pkg.jl#2323
     # TODO: Investigate why this happens in windows and restore the full task limit
     default_num_tasks = Sys.iswindows() ? div(Sys.EFFECTIVE_CPU_THREADS::Int, 2) + 1 : Sys.EFFECTIVE_CPU_THREADS::Int + 1
-    default_num_tasks = min(default_num_tasks, 16) # limit for better stability on shared resource systems
+    # The jobserver, when it will be set up below, caps total CPU threads across all
+    # workers, so the worker count no longer has to stand in for a CPU limit and can
+    # be sized by memory instead.
+    default_num_tasks = min(default_num_tasks, default_task_cap(jobserver_eligible(default_num_tasks)))
     num_tasks = max(1, something(tryparse(Int, get(ENV, "JULIA_NUM_PRECOMPILE_TASKS", string(default_num_tasks))), 1))
 
     # Suppress precompilation progress messages when precompiling for loading packages, except during
@@ -2872,7 +2901,7 @@ function do_precompile(pkgs::Union{Vector{String}, Vector{PkgId}},
     #   JULIA_PRECOMPILE_THREADS=8                       -> jobserver budget = 8
     #   JULIA_IMAGE_THREADS=4                            -> no jobserver; each worker pinned to 4 threads
     #   JULIA_IMAGE_THREADS=4 JULIA_PRECOMPILE_THREADS=8 -> jobserver budget = 8 (JULIA_IMAGE_THREADS ignored here)
-    precompile_jobserver = if num_tasks > 1 && (haskey(ENV, "JULIA_PRECOMPILE_THREADS") || !haskey(ENV, "JULIA_IMAGE_THREADS"))
+    precompile_jobserver = if jobserver_eligible(num_tasks)
         default_budget = Sys.EFFECTIVE_CPU_THREADS + 1
         budget = max(1, something(tryparse(Int, get(ENV, "JULIA_PRECOMPILE_THREADS", string(default_budget))), default_budget))
         setup_precompile_jobserver!(budget)

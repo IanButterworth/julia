@@ -3723,6 +3723,21 @@ end
         @test peak[] <= 3
         @test sem2.curr_cnt == 0
         @test_throws ArgumentError P.PrioritySemaphore(0)
+
+        # The default worker cap is only relaxed above the historical 16 when the
+        # jobserver is there to bound CPU use.
+        @test P.default_task_cap(false) == 16
+        @test P.default_task_cap(true) >= 16
+        withenv("JULIA_PRECOMPILE_THREADS" => nothing, "JULIA_IMAGE_THREADS" => nothing) do
+            @test P.jobserver_eligible(2)
+            @test !P.jobserver_eligible(1)
+        end
+        withenv("JULIA_PRECOMPILE_THREADS" => nothing, "JULIA_IMAGE_THREADS" => "4") do
+            @test !P.jobserver_eligible(2)
+        end
+        withenv("JULIA_PRECOMPILE_THREADS" => "8", "JULIA_IMAGE_THREADS" => "4") do
+            @test P.jobserver_eligible(2)
+        end
     end
 end
 
