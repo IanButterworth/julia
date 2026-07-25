@@ -3677,18 +3677,48 @@ end
 # Scheduling helpers used by `Base.Precompilation.precompilepkgs`
 @testset "precompile scheduling" begin
     let P = Base.Precompilation, PkgId = Base.PkgId
-        # `downstream_heights` measures the longest chain of packages waiting on each
+        # `downstream_weights` measures the heaviest chain of packages waiting on each
         # package, which is used as the scheduling priority.
         A, B, C, D = PkgId("A"), PkgId("B"), PkgId("C"), PkgId("D")
-        heights = P.downstream_heights(Dict(A => PkgId[], B => [A], C => [B], D => PkgId[]))
-        @test heights[A] == 2
-        @test heights[B] == 1
-        @test heights[C] == 0
-        @test heights[D] == 0
-        # dependencies outside the graph are ignored, and cycles must terminate
-        @test P.downstream_heights(Dict(A => [PkgId("Absent")])) == Dict(A => 0)
+        graph = Dict(A => PkgId[], B => [A], C => [B], D => PkgId[])
+        unit = Dict(p => 1 for p in keys(graph))
+        heights = P.downstream_weights(graph, unit)
+        @test heights[A] == 3   # A itself plus the B -> C chain waiting on it
+        @test heights[B] == 2
+        @test heights[C] == 1
+        @test heights[D] == 1
+        # a heavy package outweighs a longer chain of cheap ones
+        weighted = P.downstream_weights(graph, Dict(A => 1, B => 1, C => 1, D => 100))
+        @test weighted[D] > weighted[A]
+        # missing weights count as 1, dependencies outside the graph are ignored
+        @test P.downstream_weights(Dict(A => [PkgId("Absent")]), Dict{PkgId,Int}()) == Dict(A => 1)
+        # cycles must terminate
         X, Y = PkgId("X"), PkgId("Y")
-        @test length(P.downstream_heights(Dict(X => [Y], Y => [X]))) == 2
+        @test length(P.downstream_weights(Dict(X => [Y], Y => [X]), Dict{PkgId,Int}())) == 2
+
+        # `source_weight` sums the .jl bytes under a package's source directory
+        mktempdir() do dir
+            srcdir = joinpath(dir, "src"); mkpath(srcdir)
+            write(joinpath(srcdir, "Pkg.jl"), "x"^100)
+            write(joinpath(srcdir, "more.jl"), "y"^50)
+            write(joinpath(srcdir, "data.bin"), "z"^10000) # not Julia source, ignored
+            @test P.source_weight(Base.PkgLoadSpec(joinpath(srcdir, "Pkg.jl"), VERSION)) == 150
+            @test P.source_weight(nothing) == 1
+
+            # A single-file extension shares `ext/` with its siblings, so it must be
+            # weighted by its own file rather than the whole directory.
+            extdir = joinpath(dir, "ext"); mkpath(extdir)
+            write(joinpath(extdir, "AExt.jl"), "a"^10)
+            write(joinpath(extdir, "BExt.jl"), "b"^9000)
+            aspec = Base.PkgLoadSpec(joinpath(extdir, "AExt.jl"), VERSION)
+            @test P.source_weight(aspec, true) == 10
+            @test P.source_weight(aspec, false) == 9010 # a non-extension owns its directory
+            # a directory-style extension does own its directory
+            cdir = joinpath(extdir, "CExt"); mkpath(cdir)
+            write(joinpath(cdir, "CExt.jl"), "c"^20)
+            write(joinpath(cdir, "helper.jl"), "d"^5)
+            @test P.source_weight(Base.PkgLoadSpec(joinpath(cdir, "CExt.jl"), VERSION), true) == 25
+        end
 
         # `PrioritySemaphore` admits the highest-priority waiter first, arrival order
         # breaking ties, and never exceeds its size.

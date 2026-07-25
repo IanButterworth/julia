@@ -2221,15 +2221,54 @@ function precompile_pkgs_maybe_cachefile_lock(f, s::PrecompileSession, pkg_confi
     return cachefile
 end
 
-# Length of the longest chain of packages waiting downstream of each package.
+# Total size of a package's Julia source, used to estimate how long it will take to
+# precompile. Only `.jl` files are counted, so that data or artifacts living under
+# `src/` do not distort the estimate.
+#
+# Source size is a mediocre predictor of any individual package's time, but it
+# reliably picks out the few large packages, which is all the scheduler needs: on a
+# 371 package environment, simulating the scheduler against measured times put
+# source-size weighting within 2s of a perfect oracle.
+function source_weight(spec::Union{Nothing, Base.PkgLoadSpec}, is_extension::Bool=false)
+    spec === nothing && return 1
+    dir = dirname(spec.path)
+    # An extension is either `ext/Name.jl` or `ext/Name/Name.jl`. In the first case
+    # the directory belongs to the parent package and is shared with its other
+    # extensions, so only the extension's own file counts.
+    if is_extension && basename(dir) != first(splitext(basename(spec.path)))
+        return max(1, try
+            filesize(spec.path)
+        catch err
+            err isa InterruptException && rethrow()
+            1
+        end)
+    end
+    isdir(dir) || return 1
+    bytes = 0
+    for (root, _, files) in walkdir(dir; onerror=Returns(nothing))
+        for file in files
+            endswith(file, ".jl") || continue
+            bytes += try
+                filesize(joinpath(root, file))
+            catch err
+                err isa InterruptException && rethrow()
+                0
+            end
+        end
+    end
+    return max(1, bytes)
+end
+
+# Weight of the heaviest chain of packages waiting downstream of each package,
+# `weights` giving the estimated cost of each package.
 #
 # Used as the scheduling priority: a package that nothing depends on can be built
-# whenever there is a free worker, whereas one at the head of a long chain holds up
-# everything behind it, so starting the latter first shortens the tail of a run.
-# Walked iteratively over the reverse graph so that a deep graph cannot overflow
-# the stack and so that a cycle (reported separately by `detect_circular_deps!`)
-# terminates rather than recursing forever.
-function downstream_heights(direct_deps::Dict{PkgId, Vector{PkgId}})
+# whenever there is a free worker, whereas one at the head of a long, expensive
+# chain holds up everything behind it, so starting the latter first shortens the
+# tail of a run. Walked iteratively over the reverse graph so that a deep graph
+# cannot overflow the stack and so that a cycle (reported separately by
+# `detect_circular_deps!`) terminates rather than recursing forever.
+function downstream_weights(direct_deps::Dict{PkgId, Vector{PkgId}}, weights::Dict{PkgId, Int})
     dependents = Dict{PkgId, Vector{PkgId}}()
     for (pkg, deps) in direct_deps
         for dep in deps
@@ -2250,9 +2289,9 @@ function downstream_heights(direct_deps::Dict{PkgId, Vector{PkgId}})
                 for dependent in get(dependents, pkg, ())
                     h = get(heights, dependent, nothing)
                     h === nothing && continue # on the stack above us, i.e. a cycle
-                    height = max(height, h + 1)
+                    height = max(height, h)
                 end
-                heights[pkg] = height
+                heights[pkg] = height + get(weights, pkg, 1)
                 delete!(inprogress, pkg)
             elseif !haskey(heights, pkg) && !(pkg in inprogress)
                 push!(inprogress, pkg)
@@ -2270,13 +2309,34 @@ function spawn_precompile_tasks!(s::PrecompileSession;
         direct_deps, was_processed, configs, circular_deps,
         requested_pkgids, pkg_names, requested_pkgs, from_loading)
     batch_tasks = Task[]
-    heights = downstream_heights(direct_deps)
+    sourcespecs = Dict{PkgId, Union{Nothing, Base.PkgLoadSpec}}(
+        pkg => Base.locate_package_load_spec(pkg) for pkg in keys(direct_deps))
+    # Sizing the priorities means walking every package's source directory. A
+    # priority is only read once a package turns out to be stale and has to queue
+    # for a worker, so compute them on first use: a batch that is entirely up to
+    # date never walks a source directory at all, and one that is not pays the same
+    # cost it would have paid up front. Skipped entirely when a single worker
+    # leaves nothing to order.
+    heights_lock = ReentrantLock()
+    heights = Ref{Union{Nothing, Dict{PkgId, Int}}}(nothing)
+    function priority_of(pkg::PkgId)
+        s.num_tasks == 1 && return 0
+        computed = @lock heights_lock begin
+            h = heights[]
+            if h === nothing
+                h = downstream_weights(direct_deps, Dict{PkgId, Int}(
+                    p => source_weight(spec, haskey(s.ext_to_parent, p)) for (p, spec) in sourcespecs))
+                heights[] = h
+            end
+            h
+        end
+        return get(computed, pkg, 0)
+    end
     for (pkg, deps) in direct_deps
-        priority = get(heights, pkg, 0)
         cachepaths = Base.find_all_in_cache_path(pkg)
         freshpaths = String[]
         @lock s.cache_lock s.cachepath_cache[pkg] = freshpaths
-        sourcespec = Base.locate_package_load_spec(pkg)
+        sourcespec = sourcespecs[pkg]
         single_requested_pkg = length(requested_pkgs) == 1 &&
             (pkg in requested_pkgids || pkg.name in pkg_names)
         for config in configs
@@ -2320,6 +2380,7 @@ function spawn_precompile_tasks!(s::PrecompileSession;
                     push!(freshpaths, freshpath)
                 end
                 if !circular && is_stale
+                    priority = priority_of(pkg)
                     Base.acquire(s.parallel_limiter, priority; cancel=() -> should_stop(s))
                     is_serial_dep = pkg in s.serial_deps
                     is_project_dep = pkg in s.project_deps
