@@ -2313,7 +2313,6 @@ struct matches_env {
 
 // nonzero while scanning for an activation whose typename contributors were
 // all within the loading image's dependency closure (measurement)
-static int current_activation_clean = 0;
 static int method_in_loading_closure(jl_method_t *m);
 static void record_backedge_log(jl_value_t *target, jl_value_t *invokesig, jl_value_t *caller);
 static void jl_method_table_add_backedge_batch(jl_value_t *typ, jl_value_t **callers, size_t n);
@@ -2323,11 +2322,6 @@ static int get_intersect_visitor(jl_typemap_entry_t *oldentry, struct typemap_in
 {
     struct matches_env *closure = container_of(closure0, struct matches_env, match);
     jl_method_t *oldmethod = oldentry->func.method;
-    if (current_activation_clean) {
-        jl_contrib_stats[4]++;
-        if (!method_in_loading_closure(oldmethod))
-            jl_contrib_stats[3]++; // invariant violation: clean typename, foreign method
-    }
     assert(oldentry != closure->newentry && "entry already added");
     assert(jl_atomic_load_relaxed(&oldentry->min_world) <= jl_atomic_load_relaxed(&closure->newentry->min_world) && "old method cannot be newer than new method");
     //assert(jl_atomic_load_relaxed(&oldentry->max_world) != jl_atomic_load_relaxed(&closure->newentry->min_world) && "method cannot be added at the same time as method deleted");
@@ -3099,7 +3093,6 @@ static void _typename_check_contributor(jl_typename_t *tn, int explct, void *env
     int tnclean = 1;
     for (size_t i = 2; i < l; i++) {
         if (d[i] < 0 || !blob_in_loading_closure((size_t)d[i])) {
-            jl_contrib_stats[d[i] < 0 ? 5 : 6]++; // dirty cause: session / foreign blob
             tnclean = 0;
             break;
         }
@@ -4507,10 +4500,8 @@ void jl_method_table_activate_with_cert(jl_typemap_entry_t *newentry, jl_svec_t 
             closure_clean = clean;
         }
         else {
-            jl_contrib_stats[2]++; // cannot decompose: full-table semantics
             closure_clean = 0;
         }
-        jl_contrib_stats[closure_clean ? 0 : 1]++;
     }
     jl_typemap_entry_t *replaced = NULL;
     int replaying = cert != NULL && jl_svec_len(cert) == 5 && activate_replay_mode() >= 1;
@@ -4520,18 +4511,15 @@ void jl_method_table_activate_with_cert(jl_typemap_entry_t *newentry, jl_svec_t 
     // their partial view of the intersecting set: is_replacing and the
     // missing-backedge checks are monotone in that set, so a partial view
     // can only over-invalidate, never under-invalidate.
-    current_activation_clean = closure_clean;
-    if (replaying && closure_clean && activate_replay_mode() != 2) {
+    if (replaying && closure_clean) {
         // contributor completeness (the invariant edge replay already relies
         // on): a closure-clean signature has no foreign contributor to any
         // typename it can reach, so the foreign-only scan is provably empty
         oldvalue = NULL;
-        jl_contrib_stats[27]++;
     }
     else {
         oldvalue = get_intersect_matches(jl_atomic_load_relaxed(&mt->defs), newentry, &replaced, max_world, replaying);
     }
-    current_activation_clean = 0;
     record_cert = record_cert && !replaying;
     if (replaying && replaced != NULL) {
         // a foreign method replaces this one exactly: certificate context is
