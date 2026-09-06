@@ -4436,26 +4436,32 @@ static void _typename_add_backedge_batch(jl_typename_t *tn, int explct, void *en
     JL_GC_PROMISE_ROOTED(env->typ);
     if (!explct)
         return;
+    // same two-level table as _typename_add_backedge: typename -> (signature -> callers)
     jl_genericmemory_t *allbackedges = jl_method_table->backedges;
-    jl_array_t *backedges = (jl_array_t*)jl_eqtable_get(allbackedges, (jl_value_t*)tn, NULL);
-    if (backedges == NULL) {
-        backedges = jl_alloc_vec_any(0);
-        JL_GC_PUSH1(&backedges);
-        jl_genericmemory_t *newtable = jl_eqtable_put(allbackedges, (jl_value_t*)tn, (jl_value_t*)backedges, NULL);
+    jl_genericmemory_t *table = (jl_genericmemory_t*)jl_eqtable_get(allbackedges, (jl_value_t*)tn, NULL);
+    jl_array_t *callers = table == NULL ? NULL : (jl_array_t*)jl_eqtable_get(table, env->typ, NULL);
+    if (callers == NULL) {
+        jl_array_t *newcallers = jl_alloc_vec_any(0);
+        jl_genericmemory_t *oldtable = table;
+        JL_GC_PUSH2(&newcallers, &table);
+        if (table == NULL)
+            table = (jl_genericmemory_t*)jl_an_empty_memory_any;
+        table = jl_eqtable_put(table, env->typ, (jl_value_t*)newcallers, NULL);
+        if (table != oldtable) {
+            jl_genericmemory_t *newtable = jl_eqtable_put(allbackedges, (jl_value_t*)tn, (jl_value_t*)table, NULL);
+            if (newtable != allbackedges)
+                jl_gc_write(jl_method_table, jl_method_table->backedges, jl_genericmemory_t, newtable);
+        }
         JL_GC_POP();
-        if (newtable != allbackedges)
-            jl_gc_write(jl_method_table, jl_method_table->backedges, jl_genericmemory_t, newtable);
+        callers = newcallers;
     }
-    JL_GC_PROMISE_ROOTED(backedges); // held by the method-table backedge table
-    // bulk append without the duplicate/type-reuse scans: replay callers are
-    // freshly loaded CodeInstances that cannot already be present, and the
-    // signature is an image object whose reuse would save nothing
-    size_t base = jl_array_nrows(backedges);
-    jl_array_grow_end(backedges, 2 * env->n);
-    for (size_t i = 0; i < env->n; i++) {
-        jl_array_ptr_set(backedges, base + 2 * i, env->typ);
-        jl_array_ptr_set(backedges, base + 2 * i + 1, env->callers[i]);
-    }
+    JL_GC_PROMISE_ROOTED(callers); // held by the per-typename table
+    // bulk append without the duplicate scan: replay callers are freshly loaded
+    // CodeInstances that cannot already be present
+    size_t base = jl_array_nrows(callers);
+    jl_array_grow_end(callers, env->n);
+    for (size_t i = 0; i < env->n; i++)
+        jl_array_ptr_set(callers, base + i, env->callers[i]);
 }
 
 // bulk variant of jl_method_table_add_backedge for backedge-log replay:
