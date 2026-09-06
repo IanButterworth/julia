@@ -4702,56 +4702,6 @@ void jl_method_table_activate_with_cert(jl_typemap_entry_t *newentry, jl_svec_t 
                 invalidated = 1;
             }
         }
-        jl_contrib_stats[7]++; // replayed activations
-        if (activate_replay_mode() == 2) {
-            // verify: recompute the full intersecting set and check that it is
-            // exactly certificate ∪ foreign scan, with matching flags
-            jl_typemap_entry_t *vrepl = NULL;
-            loctag = get_intersect_matches(jl_atomic_load_relaxed(&mt->defs), newentry, &vrepl, max_world, 0);
-            size_t vn = loctag == NULL ? 0 : jl_array_nrows(loctag);
-            jl_method_t **vdd = loctag == NULL ? NULL : (jl_method_t**)jl_array_ptr_data(loctag);
-            int mism = 0;
-            for (size_t i = 0; i < vn; i++) {
-                jl_method_t *m = vdd[i];
-                int found = 0;
-                for (j = 0; j < n && !found; j++)
-                    found = d[j] == m;
-                if (!found && foreign_oldvalue) {
-                    jl_method_t **fdd = (jl_method_t**)jl_array_ptr_data(foreign_oldvalue);
-                    for (size_t k = 0, fn = jl_array_nrows(foreign_oldvalue); k < fn && !found; k++)
-                        found = fdd[k] == m;
-                }
-                if (!found && !method_in_loading_closure(m)) {
-                    // a closure-owned extra only reflects the worker's legal
-                    // domination truncation (interference sets are documented
-                    // under-approximations); a foreign extra is a real hole
-                    mism++;
-                    jl_safe_printf("  vd-extra (foreign!): %s.%s\n",
-                                   jl_symbol_name(m->module->name), jl_symbol_name(m->name));
-                }
-            }
-            if (cd != jl_nothing) {
-                int32_t *vfl = jl_array_data(cflags, int32_t);
-                for (j = 0; j < n; j++) {
-                    jl_method_t *m = d[j];
-                    int ms = jl_type_morespecific(m->sig, type);
-                    int am = !ms && !jl_type_morespecific(type, m->sig);
-                    if (((vfl[j] & 1) != (ms ? 1 : 0)) || (((vfl[j] >> 1) & 1) != (am ? 1 : 0))) {
-                        mism++;
-                        if (jl_contrib_stats[4] < 20)
-                            jl_safe_printf("  flag-mismatch: %s.%s cert=%d live=(%d,%d)\n",
-                                           jl_symbol_name(m->module->name), jl_symbol_name(m->name),
-                                           (int)vfl[j], ms, am);
-                    }
-                }
-            }
-            if (mism) {
-                jl_contrib_stats[4] += mism;
-                jl_safe_printf("CERT VERIFY MISMATCH (%d) for %s.%s\n", mism,
-                               jl_symbol_name(method->module->name), jl_symbol_name(method->name));
-            }
-            loctag = NULL;
-        }
         // dispatch bits from the certificate; the foreign pass below may
         // clear LATEST_ONLY further
         oldvalue = foreign_oldvalue;
