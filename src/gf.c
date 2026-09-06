@@ -6046,7 +6046,7 @@ static jl_code_instance_t *copy_to_mi_cache(jl_method_instance_t *mi JL_PROPAGAT
             }
             JL_UNLOCK(&world_counter_lock);
         }
-        jl_gc_write(codeinst, codeinst->rettype_const, jl_value_t, codeinst2->rettype_const);
+        jl_gc_write(codeinst, codeinst->rettype_const, jl_value_t, jl_ci_rettype_const(codeinst2));
         uint8_t specsigflags;
         jl_callptr_t invoke;
         void *fptr;

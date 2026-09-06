@@ -1150,7 +1150,7 @@ function lookup_cached_edge(interp::AbstractInterpreter, method::Method,
         return return_cached_result(interp, method, local_result, nothing, caller,
             edgecycle, edgelimited), nothing
     end
-    @assert codeinst.def === mi "MethodInstance for cached edge does not match"
+    @assert ci_def(codeinst) === mi "MethodInstance for cached edge does not match"
 
     if local_result !== nothing
         return return_cached_result(interp, method, local_result, codeinst, caller,
@@ -1701,7 +1701,7 @@ function ci_is_equivalent_winner(candidate::CodeInstance, ci::CodeInstance,
                                  valid_worlds::WorldRange)
     return (candidate !== ci &&
         ci_worlds_cover(candidate, valid_worlds) &&
-        candidate.def === ci.def &&
+        ci_def(candidate) === ci_def(ci) &&
         candidate.owner === ci.owner &&
         isdefined(candidate, :inferred, :acquire) &&
         isdefined(candidate, :rettype) &&
@@ -2263,7 +2263,7 @@ function typeinf_ext_toplevel(methods::Vector{Any}, worlds::Vector{UInt}, trim_m
         while i <= length(cis)
             ci = cis[i]::CodeInstance
             if isdefined(ci, :edges)
-                edges = ci.edges
+                edges = ci_edges_svec(ci.edges) # image CodeInstances may carry an interned edge list
                 for j = 1:length(edges)
                     isassigned(edges, j) || continue
                     edge = edges[j]

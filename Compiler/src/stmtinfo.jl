@@ -275,7 +275,7 @@ function _add_edges_impl(edges::Vector{Any}, info::MethodMatchInfo, mi_edge::Boo
         for i = 1:nmatches
             edge = method_match_edge(info, i, mi_edge)
             if edge isa CodeInstance
-                @assert edge.def.def === info.results[i].method
+                @assert get_ci_mi(edge).def === info.results[i].method
             end
             push!(edges, edge)
         end

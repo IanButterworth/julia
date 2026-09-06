@@ -10725,7 +10725,7 @@ jl_llvm_functions_t jl_emit_codedecls(jl_codegen_output_t &out,
     jl_method_instance_t *mi = jl_get_ci_mi(codeinst);
     bool specsig, needsparams;
     std::tie(specsig, needsparams) = uses_specsig(
-        get_ci_abi(codeinst), mi, codeinst->rettype, out.params->prefer_specsig);
+        get_ci_abi(codeinst), mi, jl_ci_rettype(codeinst), out.params->prefer_specsig);
     if (jl_atomic_load_relaxed(&codeinst->invoke) == jl_fptr_const_return_addr) {
         decls.invoke_api = JL_INVOKE_CONST;
     }
@@ -10813,10 +10813,10 @@ std::optional<jl_llvm_functions_t> jl_emit_codeinst(
         // to satisfy the dispatching implementation requirements of jl_f_opaque_closure_call
         if (mi->def.method != jl_opaque_closure_method)
             return {}; // user error
-        decls = jl_emit_oc_wrapper(out, mi, codeinst->rettype);
+        decls = jl_emit_oc_wrapper(out, mi, jl_ci_rettype(codeinst));
     } else {
         //assert(jl_egal((jl_value_t*)jl_atomic_load_relaxed(&codeinst->debuginfo), (jl_value_t*)src->debuginfo) && "trying to generate code for a codeinst for an incompatible src");
-        decls = jl_emit_code(out, mi, src, get_ci_abi(codeinst), codeinst->rettype, codeinst);
+        decls = jl_emit_code(out, mi, src, get_ci_abi(codeinst), jl_ci_rettype(codeinst), codeinst);
     }
     if (!decls)
         return {};
