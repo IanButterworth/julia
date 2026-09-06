@@ -3,7 +3,7 @@
 using ..Compiler.Base
 using ..Compiler: Compiler, _findsup, store_backedges, JLOptions, get_world_counter,
     _methods_by_ftype, get_methodtable, get_ci_mi, should_instrument,
-    morespecific, RefValue, get_require_world, Vector, IdDict
+    morespecific, RefValue, get_require_world, Vector, IdDict, ci_materialize!
 using .Core: CodeInstance, MethodInstance
 
 const CI_FLAGS_NATIVE_CACHE_VALID = 0b1000
@@ -88,63 +88,42 @@ function insert_backedges(internal_methods::Vector{Any}, backedge_log)
     # determine which CodeInstance objects are still valid in our image
     # to enable any applicable new codes
     backedges_only = unsafe_load(cglobal(:jl_first_image_replacement_world, UInt)) == typemax(UInt)
-    Compiler.@zone "LOAD_ScanNewMethods" begin
-        # measurement gate (JULIA_LOAD_SCAN=0 elides; unsound, A/B only)
-        ccall(:jl_get_force_load_scan, Cint, ()) == 0 ||
-            scan_new_methods!(internal_methods, backedges_only)
-    end
-    plan = nothing
-    if backedge_log !== nothing && _jl_debug_method_invalidation[] === nothing &&
-       JLOptions().code_coverage == 0 && JLOptions().malloc_log == 0
-        # resolve the all-clean majority in one C pass and receive a verify
-        # plan for the signature-dirty residue: a topologically ordered CI
-        # list with the edge words needing live verification (the backedge
-        # log gate matters: skipped CodeInstances also skip store_backedges)
-        plan = Compiler.@zone "VERIFY_Prepass" ccall(:jl_preverify_clean_cis, Any, (Any, UInt), internal_methods, get_world_counter())
-    end
+    Compiler.@zone "LOAD_ScanNewMethods" scan_new_methods!(internal_methods, backedges_only)
     workspace = VerifyMethodWorkspace(backedge_log !== nothing)
-    if plan isa Core.SimpleVector
-        # hard residue first (full graph walk); the plan sweep then only ever
-        # reads already-stamped callee worlds
-        residue = plan[4]::Vector{Any}
-        Compiler.@zone "LOAD_ScanNewCode" for k = 1:length(residue)
-            codeinst = residue[k]
-            codeinst isa CodeInstance || continue
-            validation_world = get_world_counter()
-            if (@atomic :monotonic codeinst.max_world) == WORLD_AGE_REVALIDATION_SENTINEL
-                verify_method_graph(codeinst, validation_world, workspace)
-            end
-            @ccall jl_promote_ci_to_current(codeinst::Any, validation_world::UInt)::Cvoid
-        end
-        Compiler.@zone "VERIFY_PlanSweep" verify_plan_sweep!(plan[1]::Vector{Any}, plan[2]::Vector{Int32},
-                                                            plan[3]::Vector{Int32}, plan[5]::Vector{UInt64},
-                                                            workspace)
-    end
-    # safety net (and the sole path when no plan ran): already-stamped
-    # CodeInstances short-circuit on the sentinel check
-    Compiler.@zone "LOAD_ScanNewCode" scan_new_code!(internal_methods, workspace)
+    # verify every root, then register the image's backedges, then promote: a
+    # method definition landing after registration invalidates the registered
+    # callers and makes the promotion a no-op, one landing before it leaves
+    # them unregistered and unpromoted (valid only up to their validation
+    # world), as with per-CodeInstance store_backedges
+    worlds = Compiler.@zone "LOAD_ScanNewCode" scan_new_code!(internal_methods, workspace)
     if backedge_log !== nothing
         # bulk-register the image's recorded backedges for the callers that
-        # survived re-validation, in place of per-CodeInstance store_backedges
+        # verified at the current world, in place of per-CodeInstance store_backedges
         Compiler.@zone "VERIFY_Store" ccall(:jl_apply_backedge_log, Cvoid, (Any,), backedge_log)
+    end
+    for i = 1:length(internal_methods)
+        codeinst = internal_methods[i]
+        codeinst isa CodeInstance || continue
+        # under the world_counter_lock, set max_world to typemax(UInt) for the root and its
+        # dependencies (recursively) if the world has not moved since validation; from then on
+        # the ordinary backedge mechanism is responsible for maintaining validity
+        @ccall jl_promote_ci_to_current(codeinst::Any, worlds[i]::UInt)::Cvoid
     end
     nothing
 end
 
 function scan_new_code!(internal_methods::Vector{Any}, workspace::VerifyMethodWorkspace)
+    worlds = Vector{UInt}(undef, length(internal_methods))
     for i = 1:length(internal_methods)
         codeinst = internal_methods[i]
-        codeinst isa CodeInstance || continue
-        # codeinst.owner === nothing || continue
         validation_world = get_world_counter()
+        worlds[i] = validation_world
+        codeinst isa CodeInstance || continue
         if (@atomic :monotonic codeinst.max_world) == WORLD_AGE_REVALIDATION_SENTINEL
             verify_method_graph(codeinst, validation_world, workspace)
         end
-        # After validation, under the world_counter_lock, set max_world to typemax(UInt) for all dependencies
-        # (recursively). From that point onward the ordinary backedge mechanism is responsible for maintaining
-        # validity.
-        @ccall jl_promote_ci_to_current(codeinst::Any, validation_world::UInt)::Cvoid
     end
+    return worlds
 end
 
 # 0: verify this edge normally; 1: its match world is provably unchanged since
@@ -152,78 +131,6 @@ end
 @inline function edge_replay_mode(@nospecialize(sig))
     _jl_debug_method_invalidation[] === nothing || return Int32(0)
     return ccall(:jl_edge_sig_replayable, Int32, (Any,), sig)
-end
-
-# flat sweep over the prepass verify plan: per CodeInstance, verify only the
-# recorded dirty edge words and fold sentinel-callee worlds (stamped by the
-# clean prepass, the residue walk, or earlier plan entries in topo order)
-function verify_plan_sweep!(ordered::Vector{Any}, spans::Vector{Int32}, wordsv::Vector{Int32},
-                            minws::Vector{UInt64}, workspace::VerifyMethodWorkspace)
-    matches = workspace.matches
-    validation_world = get_world_counter()
-    for k = 1:length(ordered)
-        ci = ordered[k]::CodeInstance
-        (@atomic :monotonic ci.max_world) == WORLD_AGE_REVALIDATION_SENTINEL || continue
-        world = @atomic :monotonic ci.min_world
-        minworld = UInt(minws[k])
-        maxworld = validation_world
-        callees = ci.edges
-        ws = Int(spans[2k-1])
-        wn = Int(spans[2k])
-        for t = (ws+1):(ws+wn)
-            maxworld == 0 && break
-            w = Int(wordsv[t]) + 1
-            edge = edges_ref(callees, w)
-            local min2::UInt, max2::UInt
-            if edge isa Int
-                nmatches = abs(edge)
-                fully_covers = edge > 0
-                sig = edges_ref(callees, w + 1)
-                r = edge_replay_mode(sig)
-                if r == 1
-                    min2, max2 = get_require_world(), validation_world
-                else
-                    empty!(matches)
-                    min2, max2 = verify_call(sig, callees, w + 2, nmatches, world, fully_covers, matches, workspace)
-                    if r == 2 && max2 < validation_world
-                        ccall(:jl_safe_printf, Cvoid, (Ptr{UInt8},), "EDGE VERIFY MISMATCH (plan call)\n")
-                    end
-                end
-            elseif edge isa CodeInstance
-                min2 = @atomic :monotonic edge.min_world
-                max2 = @atomic :monotonic edge.max_world
-                sig = (get_ci_mi(edge)::MethodInstance).specTypes
-                r = edge_replay_mode(sig)
-                if r != 1
-                    empty!(matches)
-                    mn, mx = verify_call(sig, callees, w, 1, world, true, matches, workspace)
-                    min2 = max(min2, mn)
-                    max2 = min(max2, mx)
-                end
-            elseif edge isa MethodInstance
-                sig = edge.specTypes
-                r = edge_replay_mode(sig)
-                if r == 1
-                    min2, max2 = get_require_world(), validation_world
-                else
-                    empty!(matches)
-                    min2, max2 = verify_call(sig, callees, w, 1, world, true, matches, workspace)
-                end
-            else
-                min2, max2 = UInt(1), UInt(0) # unexpected shape: invalidate conservatively
-            end
-            minworld = max(minworld, min2)
-            maxworld = min(maxworld, max2)
-        end
-        if maxworld != 0
-            @atomic :monotonic ci.min_world = minworld
-            if ci.flags & CI_FLAGS_NATIVE_CACHE_VALID == CI_FLAGS_NATIVE_CACHE_VALID
-                @ccall jl_mi_cache_insert(get_ci_mi(ci)::Any, ci::Any)::Cvoid
-            end
-        end
-        @atomic :monotonic ci.max_world = maxworld
-        @ccall jl_promote_ci_to_current(ci::Any, validation_world::UInt)::Cvoid
-    end
 end
 
 function verify_method_graph(codeinst::CodeInstance, validation_world::UInt, workspace::VerifyMethodWorkspace)
@@ -258,9 +165,9 @@ function gen_staged_sig(def::Method, mi::MethodInstance)
 end
 
 function needs_instrumentation(codeinst::CodeInstance, mi::MethodInstance, def::Method, validation_world::UInt)
-    # foreign CIs (owner !== nothing) aren't run as native code here, so instrumenting them is moot
-    codeinst.owner === nothing || return false
     if JLOptions().code_coverage != 0 || JLOptions().malloc_log != 0
+        # foreign CIs (owner !== nothing) aren't run as native code here, so instrumenting them is moot
+        ci_materialize!(codeinst).owner === nothing || return false
         # test if the code needs to run with instrumentation, in which case we cannot use existing generated code
         if isdefined(def, :debuginfo) ? # generated_only functions do not have debuginfo, so fall back to considering their codeinst debuginfo though this may be slower and less reliable
             should_instrument(def.module, def.debuginfo) :

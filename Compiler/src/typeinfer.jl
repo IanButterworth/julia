@@ -1641,12 +1641,12 @@ end
 
 function ci_cache_head(mi::MethodInstance)
     isdefined(mi, :cache, :acquire) || return nothing
-    return @atomic :acquire mi.cache
+    return ci_materialize!(@atomic :acquire mi.cache)
 end
 
 function ci_cache_next(code::CodeInstance)
     isdefined(code, :next, :acquire) || return nothing
-    return @atomic :acquire code.next
+    return ci_materialize!(@atomic :acquire code.next)
 end
 
 function find_cached_ci(interp::AbstractInterpreter, mi::MethodInstance,

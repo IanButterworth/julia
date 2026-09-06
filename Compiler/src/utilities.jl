@@ -178,6 +178,11 @@ isa_compileable_sig(::ABIOverride) = false
 # always go through the C accessor: the field reads as undefined until
 # rematerialized, and `isdefined` const-folds to true for CodeInstance
 ci_def(ci::CodeInstance) = ccall(:jl_ci_def, Any, (Any,), ci)
+# decode the remaining interned fields in place (a no-op for runtime
+# CodeInstances); C chain walks do this as they go (see `jl_ci_next`), so call
+# it before reading such fields of a CodeInstance taken straight from an image
+# or from a cache chain walked here
+ci_materialize!(ci::CodeInstance) = (ccall(:jl_ci_materialize_all, Cvoid, (Any,), ci); ci)
 
 
 """

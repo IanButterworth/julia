@@ -292,7 +292,6 @@ static jl_method_instance_t *jl_specializations_get_linfo_(jl_method_t *m JL_PRO
                 if ((jl_value_t*)mi == jl_nothing)
                     break;
                 assert(!jl_types_equal(mi->specTypes, type));
-                jl_contrib_stats[31]++; // insert-position scan length
             }
             jl_atomic_store_relaxed(&bnd_m[slot], m);
             jl_atomic_store_relaxed(&bnd_i[slot], i + 1); // next boundary after this insert
@@ -2776,14 +2775,13 @@ static void _typename_add_backedge(jl_typename_t *tn, int explct, void *env0) JL
 // prior world its precompile worker analyzed.
 JL_DLLEXPORT jl_genericmemory_t *jl_method_contributors = NULL;
 JL_DLLEXPORT jl_genericmemory_t *jl_activation_certs = NULL; // method -> certificate (precompile worker)
-JL_DLLEXPORT uint64_t jl_contrib_stats[32];
 
 static int activate_replay_mode(void)
 {
     static int mode = -1;
     if (mode == -1) {
         const char *e = getenv("JULIA_ACTIVATE_REPLAY");
-        mode = e == NULL ? 0 : (e[0] == '2' ? 2 : (e[0] == '1' ? 1 : 0));
+        mode = e != NULL && e[0] == '1';
     }
     return mode;
 }
@@ -2840,25 +2838,6 @@ void jl_record_binding_backedge(jl_binding_t *b, jl_value_t *edge)
         record_backedge_log((jl_value_t*)b, NULL, edge);
 }
 
-// Reserve capacity on a callee's backedge list ahead of a known burst of
-// registrations (grow-then-shrink keeps the buffer).
-static void mi_backedges_reserve(jl_method_instance_t *callee, size_t extra)
-{
-    if (!jl_atomic_load_relaxed(&allow_new_worlds))
-        return;
-    JL_LOCK(&callee->def.method->writelock);
-    if (jl_atomic_load_relaxed(&allow_new_worlds)) {
-        jl_array_t *backedges = jl_mi_get_backedges(callee);
-        if (!backedges) {
-            backedges = jl_alloc_vec_any(0);
-            jl_gc_write(callee, callee->backedges, jl_array_t, backedges);
-        }
-        jl_array_grow_end(backedges, extra);
-        jl_array_del_end(backedges, extra);
-    }
-    JL_UNLOCK(&callee->def.method->writelock);
-}
-
 // Re-apply a loaded image's backedge log for the callers that survived
 // re-validation (see store_backedges, whose per-CodeInstance work this
 // replaces when a log is present). The serialized form is compact:
@@ -2874,8 +2853,12 @@ JL_DLLEXPORT void jl_apply_backedge_log(jl_array_t *log)
     jl_array_t *idxb = (jl_array_t*)jl_array_ptr_ref(log, 1);
     jl_value_t **uo = jl_array_ptr_data(uobjs);
     size_t nuniq = jl_array_nrows(uobjs);
+    (void)nuniq; // asserted against below
     uint8_t *bytes = jl_array_data(idxb, uint8_t);
     size_t nbytes = jl_array_nrows(idxb);
+    // callers verified at the current world are registered; anything else was
+    // invalidated, or verified at an older world and will not be promoted
+    size_t world = jl_atomic_load_acquire(&jl_world_counter);
 #define BELOG_NEXT(out) do { \
         size_t v_ = 0; \
         int shift_ = 0; \
@@ -2895,7 +2878,6 @@ JL_DLLEXPORT void jl_apply_backedge_log(jl_array_t *log)
     // signature decomposition per method-table run
     size_t scratchcap = 256;
     jl_value_t **scratch = (jl_value_t**)malloc_s(scratchcap * sizeof(jl_value_t*));
-    uint64_t tstart = jl_hrtime();
     size_t bp = 0;
     while (bp < nbytes) {
         jl_value_t *target;
@@ -2924,10 +2906,8 @@ JL_DLLEXPORT void jl_apply_backedge_log(jl_array_t *log)
             jl_value_t *invokesig, *caller;
             BELOG_NEXT(invokesig);
             BELOG_NEXT(caller);
-            if (jl_atomic_load_relaxed(&((jl_code_instance_t*)caller)->max_world) != ~(size_t)0) {
-                jl_contrib_stats[19]++;
-                continue; // did not survive re-validation
-            }
+            if (jl_atomic_load_relaxed(&((jl_code_instance_t*)caller)->max_world) != world)
+                continue;
             scratch[2 * nlive] = invokesig;
             scratch[2 * nlive + 1] = caller;
             nlive++;
@@ -2936,7 +2916,6 @@ JL_DLLEXPORT void jl_apply_backedge_log(jl_array_t *log)
             continue;
         if (target == jl_nothing) {
             // runs of identical invokesig are contiguous: one decomposition per run
-            uint64_t t1 = jl_hrtime();
             for (size_t k = 0; k < nlive; ) {
                 jl_value_t *invokesig = scratch[2 * k];
                 size_t e = k;
@@ -2946,14 +2925,11 @@ JL_DLLEXPORT void jl_apply_backedge_log(jl_array_t *log)
                 for (size_t i = k; i < e; i++)
                     scratch[2 * k + (i - k)] = scratch[2 * i + 1];
                 jl_method_table_add_backedge_batch(invokesig, &scratch[2 * k], e - k);
-                jl_contrib_stats[17] += e - k;
                 k = e;
             }
-            jl_contrib_stats[21] += jl_hrtime() - t1;
         }
         else if (jl_is_method_instance(target)) {
             jl_method_instance_t *callee = (jl_method_instance_t*)target;
-            uint64_t t1 = jl_hrtime();
             JL_LOCK(&callee->def.method->writelock);
             if (jl_atomic_load_relaxed(&allow_new_worlds)) {
                 jl_array_t *backedges = jl_mi_get_backedges(callee);
@@ -2972,23 +2948,17 @@ JL_DLLEXPORT void jl_apply_backedge_log(jl_array_t *log)
                     record_backedge_log((jl_value_t*)callee,
                                         invokesig == jl_nothing ? NULL : invokesig, caller);
                 }
-                jl_contrib_stats[16] += nlive;
             }
             JL_UNLOCK(&callee->def.method->writelock);
-            jl_contrib_stats[20] += jl_hrtime() - t1;
         }
         else {
-            uint64_t t1 = jl_hrtime();
             for (size_t k = 0; k < nlive; k++) {
                 jl_value_t *caller = scratch[2 * k + 1];
-                jl_contrib_stats[18]++;
                 jl_maybe_add_binding_backedge((jl_binding_t*)target, caller,
                                               jl_get_ci_mi((jl_code_instance_t*)caller)->def.method);
             }
-            jl_contrib_stats[21] += jl_hrtime() - t1;
         }
     }
-    jl_contrib_stats[22] += jl_hrtime() - tstart;
 #undef BELOG_NEXT
     free(scratch);
 }
@@ -3175,7 +3145,6 @@ static jl_typename_t *fdisj_slot_key(jl_value_t *t)
             x = ((jl_unionall_t*)x)->body;
         if (!jl_is_datatype(x))
             return NULL;
-        jl_contrib_stats[3]++; // DEBUG: Type{X} keying fired
         return ((jl_datatype_t*)x)->name;
     }
     if (dt->name->abstract || jl_is_kind((jl_value_t*)dt))
@@ -3195,50 +3164,6 @@ struct _foreign_disjoint {
     jl_value_t *sig;
     int ok;
 };
-
-// debug histogram (JULIA_ICI_DEBUG): second-chance load per typename
-typedef struct { jl_typename_t *tn; uint64_t tries; uint64_t isects; } fdisj_stat_t;
-#define FDISJ_STAT_SZ 4096
-static fdisj_stat_t *fdisj_stats = NULL;
-static int fdisj_stats_on(void) JL_NOTSAFEPOINT
-{
-    static int on = -1;
-    if (on == -1)
-        on = getenv("JULIA_ICI_DEBUG") != NULL;
-    return on;
-}
-static void fdisj_stat_note(jl_typename_t *tn, uint64_t isects) JL_NOTSAFEPOINT
-{
-    if (!fdisj_stats_on())
-        return;
-    if (fdisj_stats == NULL)
-        fdisj_stats = (fdisj_stat_t*)calloc_s(FDISJ_STAT_SZ * sizeof(fdisj_stat_t));
-    size_t idx = (((uintptr_t)tn) * 0x9E3779B97F4A7C15ULL >> 32) & (FDISJ_STAT_SZ - 1);
-    for (int probe = 0; probe < 16; probe++) {
-        fdisj_stat_t *e = &fdisj_stats[(idx + probe) & (FDISJ_STAT_SZ - 1)];
-        if (e->tn == tn || e->tn == NULL) {
-            e->tn = tn;
-            e->tries++;
-            e->isects += isects;
-            return;
-        }
-    }
-}
-JL_DLLEXPORT void jl_fdisj_stats_dump(void)
-{
-    if (fdisj_stats == NULL) {
-        jl_safe_printf("fdisj stats: none\n");
-        return;
-    }
-    for (size_t i = 0; i < FDISJ_STAT_SZ; i++) {
-        fdisj_stat_t *e = &fdisj_stats[i];
-        if (e->tn != NULL && e->tries > 200)
-            jl_safe_printf("FDISJ %s.%s tries=%zd isects=%zd\n",
-                           jl_symbol_name(e->tn->module->name),
-                           jl_symbol_name(e->tn->name),
-                           (size_t)e->tries, (size_t)e->isects);
-    }
-}
 
 // key for the function slot: the function type's typename, or for a
 // constructor signature the constructed type's base typename (Type and
@@ -3403,16 +3328,6 @@ static int fdisj_isect_empty(jl_value_t *msig0, jl_value_t *qsig)
     return jl_has_empty_intersection(msig0, qsig);
 }
 
-static int sc_oracle(void) JL_NOTSAFEPOINT
-{
-    static int on = -1;
-    if (on == -1) {
-        char *e = getenv("JULIA_SC_ORACLE");
-        on = e != NULL && strcmp(e, "1") == 0;
-    }
-    return on;
-}
-
 static int fdisj_v2(void) JL_NOTSAFEPOINT
 {
     static int on = -1;
@@ -3530,17 +3445,6 @@ static void _typename_check_foreign_disjoint(jl_typename_t *tn, int explct, void
             jl_typename_t *k0 = fdisj_slot0_key(((jl_method_t*)m)->sig);
             JL_GC_PROMISE_ROOTED(k0); // typenames are rooted by their types
             if (k0 == NULL) {
-                static int fdisj_dump_left = 60;
-                const char *dumptarget = getenv("JULIA_FDISJ_DUMP");
-                if (dumptarget && fdisj_dump_left > 0 &&
-                    strstr(jl_symbol_name(tn->name), dumptarget) != NULL) {
-                    fdisj_dump_left--;
-                    jl_method_t *dm = (jl_method_t*)m;
-                    jl_safe_printf("RESIDUE %s: %s.%s ", jl_symbol_name(tn->name),
-                                   jl_symbol_name(dm->module->name), jl_symbol_name(dm->name));
-                    jl_static_show(JL_STDERR, dm->sig);
-                    jl_safe_printf("\n");
-                }
                 jl_array_ptr_1d_push((jl_array_t*)jl_svecref(memo, 0), m);
                 continue;
             }
@@ -3657,15 +3561,6 @@ static void _typename_check_foreign_disjoint(jl_typename_t *tn, int explct, void
     uint64_t nisect = 0;
 #define FDISJ_TEST(arr_, idx0_, stride_) do { \
         jl_method_t *m_ = (jl_method_t*)jl_array_ptr_ref((arr_), (idx0_)); \
-        if (jl_get_ici_debug_enabled()) { \
-            static _Atomic(int) dumped_; \
-            if (jl_atomic_fetch_add_relaxed(&dumped_, 1) < 400) { \
-                jl_safe_printf("FDTEST %s.%s: ", \
-                               jl_symbol_name(tn->module->name), jl_symbol_name(tn->name)); \
-                jl_static_show((JL_STREAM*)STDERR_FILENO, (jl_value_t*)m_->sig); \
-                jl_safe_printf("\n"); \
-            } \
-        } \
         nisect++; \
         if (!fdisj_isect_empty((jl_value_t*)m_->sig, env->sig)) { \
             /* move-to-front: repeated dirty patterns hit on the first test */ \
@@ -3676,7 +3571,6 @@ static void _typename_check_foreign_disjoint(jl_typename_t *tn, int explct, void
                     jl_array_ptr_set((arr_), (idx0_) + s_, tmp_); \
                 } \
             } \
-            fdisj_stat_note(tn, nisect); \
             env->ok = 0; \
             return; \
         } \
@@ -3791,7 +3685,6 @@ static void _typename_check_foreign_disjoint(jl_typename_t *tn, int explct, void
     }
 #undef FDISJ_SCAN_FAM
 #undef FDISJ_TEST
-    fdisj_stat_note(tn, nisect);
 }
 
 // save-side typename decompositions of call/method signatures, registered per
@@ -3897,9 +3790,7 @@ JL_DLLEXPORT int jl_edge_sig_replayable(jl_value_t *sig)
         }
         ment = e; // window full: overwrite the last probed slot
     }
-    uint64_t t0 = jl_hrtime();
     int clean = 1;
-    jl_contrib_stats[8]++;
     int decomposed;
     static int sc_fuse = -1;
     if (sc_fuse == -1) {
@@ -3910,7 +3801,7 @@ JL_DLLEXPORT int jl_edge_sig_replayable(jl_value_t *sig)
         // single decomposition: collect the typenames once, then run the
         // contributor check and (only if needed) the foreign-disjoint second
         // chance over the collected list instead of re-walking the signature
-        struct _tn_collect coll = { 0, 0 };
+        struct _tn_collect coll = { 0 };
         decomposed = sig_tns_foreach(_typename_collect_for_verdict, sig, &coll);
         if (decomposed < 0)
             decomposed = jl_foreach_top_typename_for(_typename_collect_for_verdict, sig, 1, &coll);
@@ -3919,12 +3810,6 @@ JL_DLLEXPORT int jl_edge_sig_replayable(jl_value_t *sig)
         if (decomposed) {
             for (size_t i = 0; i < coll.n && clean; i++)
                 _typename_check_contributor(coll.tns[i], 1, &clean);
-            if (!clean && sc_oracle()) {
-                // ceiling probe: assume disjoint (UNSOUND, measurement only)
-                jl_contrib_stats[12]++;
-                jl_contrib_stats[13]++;
-                clean = 1;
-            }
             if (!clean) {
                 // second chance: the closure does not cover all contributors
                 // to these typenames, but if no foreign contributor method
@@ -3933,15 +3818,11 @@ JL_DLLEXPORT int jl_edge_sig_replayable(jl_value_t *sig)
                 // poison; an exact replacement's new method carries the
                 // replaced signature, so it covers the removal too)
                 struct _foreign_disjoint fenv = { sig, 1 };
-                jl_contrib_stats[12]++; // second-chance attempts
-                uint64_t t1 = jl_hrtime();
                 for (size_t i = 0; i < coll.n && fenv.ok; i++)
                     _typename_check_foreign_disjoint(coll.tns[i], 1, &fenv);
                 if (fenv.ok) {
                     clean = 1;
-                    jl_contrib_stats[13]++; // second-chance successes
                 }
-                jl_contrib_stats[23] += jl_hrtime() - t1;
             }
         }
     }
@@ -3949,470 +3830,22 @@ JL_DLLEXPORT int jl_edge_sig_replayable(jl_value_t *sig)
         decomposed = sig_tns_foreach(_typename_check_contributor, sig, &clean);
         if (decomposed < 0)
             decomposed = jl_foreach_top_typename_for(_typename_check_contributor, sig, 1, &clean);
-        if (decomposed && !clean && sc_oracle()) {
-            jl_contrib_stats[12]++;
-            jl_contrib_stats[13]++;
-            clean = 1;
-        }
         if (decomposed && !clean) {
             struct _foreign_disjoint fenv = { sig, 1 };
-            jl_contrib_stats[12]++; // second-chance attempts
-            uint64_t t1 = jl_hrtime();
             int fdec = sig_tns_foreach(_typename_check_foreign_disjoint, sig, &fenv);
             if (fdec < 0)
                 fdec = jl_foreach_top_typename_for(_typename_check_foreign_disjoint, sig, 1, &fenv);
             if (fdec && fenv.ok) {
                 clean = 1;
-                jl_contrib_stats[13]++; // second-chance successes
             }
-            jl_contrib_stats[23] += jl_hrtime() - t1;
         }
     }
-    jl_contrib_stats[11] += jl_hrtime() - t0;
     ment->sig = sig;
     ment->gen = jl_loading_closure_gen;
     ment->verdict = decomposed && clean;
-    if (!decomposed || !clean) {
-        jl_value_t *usig = jl_unwrap_unionall(sig);
-        if (jl_is_datatype(usig) && jl_nparams(usig) > 0 && jl_is_typeeq(jl_tparam(usig, 0)))
-            jl_contrib_stats[10]++; // dirty with Type{...} first arg (constructor call)
+    if (!decomposed || !clean)
         return 0;
-    }
-    jl_contrib_stats[9]++;
     return mode;
-}
-
-// Resolve the all-clean majority of a loaded image's revalidation worklist in
-// one C pass, so the Julia verification graph walk only runs for the residue.
-// A sentinel CodeInstance is clean when every edge in its list is provably
-// unchanged relative to the precompile worker (jl_edge_sig_replayable on call
-// signatures, un-invalidated full-range binding partitions) and every callee
-// CodeInstance it depends on is clean too (optimistic for cycles: only
-// dirt propagates, along reverse dependency edges, so a strongly connected
-// clean component stays clean). Survivors get their worlds stamped directly —
-// the Julia walk's sentinel short-circuit then skips them — and their
-// native-cache pokes are performed here since the Julia cleanup that would
-// have done it is skipped. The caller gates on: backedge log present
-// (store_backedges is otherwise required per CodeInstance), debug-invalidation
-// logging off, and coverage/malloc instrumentation off.
-static int verify_plan_enabled(void)
-{
-    static int on = -1;
-    if (on == -1) {
-        char *e = getenv("JULIA_VERIFY_PLAN");
-        on = e == NULL || strcmp(e, "0") != 0;
-    }
-    return on;
-}
-
-JL_DLLEXPORT jl_value_t *jl_preverify_clean_cis(jl_array_t *worklist, size_t validation_world)
-{
-    if (activate_replay_mode() < 1 || jl_loading_closure_bits == NULL)
-        return jl_nothing;
-    if (jl_options.code_coverage || jl_options.malloc_log)
-        return jl_nothing;
-    size_t nitems = jl_array_nrows(worklist);
-    if (nitems == 0)
-        return jl_nothing;
-    // collect the sentinel CodeInstances
-    jl_code_instance_t **cis = (jl_code_instance_t**)malloc_s(nitems * sizeof(void*));
-    size_t n = 0;
-    for (size_t i = 0; i < nitems; i++) {
-        jl_value_t *obj = jl_array_ptr_ref(worklist, i);
-        if (jl_is_code_instance(obj) &&
-            jl_atomic_load_relaxed(&((jl_code_instance_t*)obj)->max_world) == 1) // WORLD_AGE_REVALIDATION_SENTINEL
-            cis[n++] = (jl_code_instance_t*)obj;
-    }
-    if (n == 0) {
-        free(cis);
-        return jl_nothing;
-    }
-    // pointer-keyed slot table
-    size_t tabsz = 1;
-    while (tabsz < 2 * n)
-        tabsz *= 2;
-    size_t *tab = (size_t*)malloc_s(tabsz * sizeof(size_t)); // slot+1, 0 = empty
-    memset(tab, 0, tabsz * sizeof(size_t));
-    for (size_t i = 0; i < n; i++) {
-        size_t idx = (((uintptr_t)cis[i]) * 0x9E3779B97F4A7C15ULL >> 32) & (tabsz - 1);
-        while (tab[idx] != 0)
-            idx = (idx + 1) & (tabsz - 1);
-        tab[idx] = i + 1;
-    }
-#define PREVERIFY_LOOKUP(ci, out) do { \
-        size_t idx_ = (((uintptr_t)(ci)) * 0x9E3779B97F4A7C15ULL >> 32) & (tabsz - 1); \
-        (out) = (size_t)-1; \
-        while (tab[idx_] != 0) { \
-            if (cis[tab[idx_] - 1] == (jl_code_instance_t*)(ci)) { (out) = tab[idx_] - 1; break; } \
-            idx_ = (idx_ + 1) & (tabsz - 1); \
-        } \
-    } while (0)
-    char *dirty = (char*)malloc_s(n);       // cannot be stamped by the prepass
-    char *hard = (char*)malloc_s(n);        // needs the full Julia graph walk
-    memset(dirty, 0, n);
-    memset(hard, 0, n);
-    size_t *minw = (size_t*)malloc_s(n * sizeof(size_t));
-    // per-CI recorded edge-word indices (verification-relevant residue):
-    // dirty match-group headers, dirty invoke signatures, and sentinel-callee
-    // references (for world folding in the plan sweep)
-    uint32_t *wstart = (uint32_t*)malloc_s(n * sizeof(uint32_t));
-    uint32_t *wcount = (uint32_t*)malloc_s(n * sizeof(uint32_t));
-    uint32_t *words = NULL;
-    size_t nwords = 0, capwords = 0;
-#define PLAN_WORD(j) do { \
-        if (nwords == capwords) { \
-            capwords = capwords ? capwords * 2 : 4096; \
-            words = (uint32_t*)realloc_s(words, capwords * sizeof(uint32_t)); \
-        } \
-        words[nwords++] = (uint32_t)(j); \
-    } while (0)
-    // forward dependency pairs (from, to) among in-worklist sentinels
-    size_t *deps = NULL, ndeps = 0, capdeps = 0;
-    for (size_t i = 0; i < n; i++) {
-        jl_code_instance_t *ci = cis[i];
-        minw[i] = jl_require_world;
-        wstart[i] = (uint32_t)nwords;
-        wcount[i] = 0;
-        jl_method_instance_t *mi = jl_get_ci_mi(ci);
-        if (!jl_is_method(mi->def.value)) {
-            hard[i] = 1;
-            continue;
-        }
-        jl_method_t *def = mi->def.method;
-        uint8_t scanned = jl_atomic_load_relaxed(&def->did_scan_source);
-        if ((scanned & 0x1) == 0 || (scanned & 0x4) != 0) {
-            hard[i] = 1; // needs the Julia-side source scan / invalidation log
-            continue;
-        }
-        jl_value_t *edges = (jl_value_t*)jl_atomic_load_relaxed(&ci->edges);
-        if (edges == NULL || edges == jl_nothing) {
-            continue;
-        }
-        // image CodeInstances may carry their edges as an InternedCodeInstance
-        // (relocation-free words) instead of a SimpleVector
-        jl_interned_code_instance_t *iedges = NULL;
-        size_t nedges;
-        if (jl_typetagis(edges, jl_interned_code_instance_type)) {
-            iedges = (jl_interned_code_instance_t*)edges;
-            nedges = iedges->nedges;
-        }
-        else {
-            nedges = jl_svec_len(edges);
-        }
-        int sigdirty = 0;
-        for (size_t j = 0; j < nedges && !hard[i]; j++) {
-            jl_value_t *item;
-            intptr_t litval;
-            int is_lit = 0;
-            if (iedges) {
-                if (jl_ici_literal(iedges, j, &litval)) {
-                    is_lit = 1;
-                    item = NULL;
-                }
-                else {
-                    item = jl_ici_ref_nobox(iedges, j);
-                    JL_GC_PROMISE_ROOTED(item); // decoded words are image objects
-                }
-            }
-            else {
-                item = jl_svecref(edges, j);
-                if (jl_is_long(item)) {
-                    is_lit = 1;
-                    litval = jl_unbox_long(item);
-                }
-            }
-            if (is_lit) {
-                // (n, sig, targets...) match group
-                ssize_t ntargets = litval;
-                if (ntargets < 0)
-                    ntargets = -ntargets;
-                if (j + 1 >= nedges) {
-                    hard[i] = 1;
-                    break;
-                }
-                jl_value_t *sig = iedges ? jl_ici_ref_nobox(iedges, j + 1) : jl_svecref(edges, j + 1);
-                if (sig == NULL) {
-                    hard[i] = 1; // malformed: literal where a sig belongs
-                    break;
-                }
-                JL_GC_PROMISE_ROOTED(sig);
-                if (jl_edge_sig_replayable(sig) != 1) {
-                    PLAN_WORD(j);
-                    wcount[i]++;
-                    sigdirty = 1;
-                }
-                j += 1 + (size_t)ntargets;
-            }
-            else if (jl_is_code_instance(item)) {
-                jl_code_instance_t *callee = (jl_code_instance_t*)item;
-                int calleesigdirty = jl_edge_sig_replayable(jl_get_ci_mi(callee)->specTypes) != 1;
-                size_t cmax = jl_atomic_load_relaxed(&callee->max_world);
-                if (cmax == 1) { // sentinel: depends on its (pre)verification
-                    size_t slot;
-                    PREVERIFY_LOOKUP(callee, slot);
-                    if (slot == (size_t)-1) {
-                        hard[i] = 1; // sentinel outside this worklist
-                        break;
-                    }
-                    if (ndeps == capdeps) {
-                        capdeps = capdeps ? capdeps * 2 : 1024;
-                        deps = (size_t*)realloc_s(deps, capdeps * 2 * sizeof(size_t));
-                    }
-                    deps[2 * ndeps] = slot;
-                    deps[2 * ndeps + 1] = i;
-                    ndeps++;
-                    PLAN_WORD(j); // fold the callee's stamped world in the sweep
-                    wcount[i]++;
-                    if (calleesigdirty)
-                        sigdirty = 1;
-                }
-                else if (calleesigdirty) {
-                    PLAN_WORD(j);
-                    wcount[i]++;
-                    sigdirty = 1;
-                    if (cmax < validation_world && minw[i] <= cmax)
-                        minw[i] = jl_atomic_load_relaxed(&callee->min_world);
-                }
-                else {
-                    // already-settled callee: fully valid or this one bails
-                    if (cmax < validation_world) {
-                        hard[i] = 1;
-                        break;
-                    }
-                    size_t cmin = jl_atomic_load_relaxed(&callee->min_world);
-                    if (minw[i] < cmin)
-                        minw[i] = cmin;
-                }
-            }
-            else if (jl_is_method_instance(item)) {
-                if (jl_edge_sig_replayable(((jl_method_instance_t*)item)->specTypes) != 1) {
-                    PLAN_WORD(j);
-                    wcount[i]++;
-                    sigdirty = 1;
-                }
-            }
-            else if (jl_is_binding(item)) {
-                jl_binding_t *b = (jl_binding_t*)item;
-                jl_binding_partition_t *bp = jl_atomic_load_relaxed(&b->partitions);
-                if (bp != NULL) {
-                    size_t bmin = jl_atomic_load_relaxed(&bp->min_world);
-                    size_t bmax = jl_atomic_load_relaxed(&bp->max_world);
-                    if (bmin > jl_require_world || bmax < validation_world) {
-                        hard[i] = 1; // invalidated binding (or stale partition)
-                        break;
-                    }
-                    if (minw[i] < bmin)
-                        minw[i] = bmin;
-                }
-            }
-            else if (jl_is_method(item)) {
-                hard[i] = 1; // corrupt edge list; let the Julia walk assert
-            }
-            else {
-                // (invokesig, target) pair
-                if (j + 1 >= nedges) {
-                    hard[i] = 1;
-                    break;
-                }
-                jl_value_t *target = iedges ? jl_ici_ref_nobox(iedges, j + 1) : jl_svecref(edges, j + 1);
-                if (target == NULL) {
-                    hard[i] = 1; // malformed: literal where a target belongs
-                    break;
-                }
-                JL_GC_PROMISE_ROOTED(target);
-                if (!jl_is_mtable(target)) {
-                    if (jl_edge_sig_replayable(item) != 1) {
-                        // invoke re-verification needs the pair form; the
-                        // sweep cannot reuse the group path: keep it hard
-                        hard[i] = 1;
-                    }
-                }
-                j += 1;
-            }
-        }
-        if (hard[i]) {
-            // discard recorded words for hard CIs (the Julia walk redoes them)
-            nwords = wstart[i];
-            wcount[i] = 0;
-        }
-        dirty[i] = hard[i] | (char)sigdirty;
-    }
-    // entries that bailed out of the loop above (`hard[i] = 1; continue;`) never reached the
-    // assignment: they must be dirty too, or the plan would stamp them clean
-    for (size_t i = 0; i < n; i++)
-        dirty[i] |= hard[i];
-#undef PREVERIFY_LOOKUP
-    // reverse adjacency (CSR over dep pairs, keyed by dependency source)
-    size_t *radj_off = (size_t*)malloc_s((n + 1) * sizeof(size_t));
-    memset(radj_off, 0, (n + 1) * sizeof(size_t));
-    for (size_t k = 0; k < ndeps; k++)
-        radj_off[deps[2 * k] + 1]++;
-    for (size_t i = 0; i < n; i++)
-        radj_off[i + 1] += radj_off[i];
-    size_t *radj = (size_t*)malloc_s((ndeps ? ndeps : 1) * sizeof(size_t));
-    size_t *fill = (size_t*)malloc_s((n + 1) * sizeof(size_t));
-    memcpy(fill, radj_off, (n + 1) * sizeof(size_t));
-    for (size_t k = 0; k < ndeps; k++)
-        radj[fill[deps[2 * k]]++] = deps[2 * k + 1];
-    // propagate dirt from dependencies to dependents
-    size_t *worklist2 = (size_t*)malloc_s(n * sizeof(size_t));
-    size_t wl = 0;
-    for (size_t i = 0; i < n; i++)
-        if (dirty[i])
-            worklist2[wl++] = i;
-    while (wl > 0) {
-        size_t d = worklist2[--wl];
-        for (size_t k = radj_off[d]; k < radj_off[d + 1]; k++) {
-            size_t r = radj[k];
-            if (!dirty[r]) {
-                dirty[r] = 1;
-                worklist2[wl++] = r;
-            }
-        }
-    }
-    // propagate minworld forward along the same edges to a fixpoint (bounded
-    // sweeps; chains are shallow and cycles take the component max)
-    for (int sweep = 0; sweep < 100; sweep++) {
-        int changed = 0;
-        for (size_t k = 0; k < ndeps; k++) {
-            size_t from = deps[2 * k], to = deps[2 * k + 1];
-            if (!dirty[from] && !dirty[to] && minw[to] < minw[from]) {
-                minw[to] = minw[from];
-                changed = 1;
-            }
-        }
-        if (!changed)
-            break;
-        if (sweep == 99) {
-            // did not converge (should not happen); bail the remainder
-            for (size_t k = 0; k < ndeps; k++)
-                dirty[deps[2 * k + 1]] = 1;
-        }
-    }
-    // stamp the clean survivors and perform the native-cache pokes the Julia
-    // cleanup would have done
-    size_t nclean = 0;
-    for (size_t i = 0; i < n; i++) {
-        if (dirty[i])
-            continue;
-        jl_code_instance_t *ci = cis[i];
-        jl_atomic_store_release(&ci->min_world, minw[i]);
-        jl_atomic_store_release(&ci->max_world, validation_world);
-        if ((jl_atomic_load_relaxed(&ci->flags) & 0b1000) != 0) // CI_FLAGS_NATIVE_CACHE_VALID
-            jl_mi_cache_insert(jl_get_ci_mi(ci), ci);
-        nclean++;
-    }
-    jl_contrib_stats[14] += nclean;
-    jl_contrib_stats[15] += n - nclean;
-    if (!verify_plan_enabled()) {
-        // gate: fall back to the old Julia graph walk for all dirty CIs
-        free(worklist2); free(fill); free(radj); free(radj_off); free(deps);
-        free(words); free(wcount); free(wstart); free(minw); free(hard);
-        free(dirty); free(tab); free(cis);
-        return jl_nothing;
-    }
-    // Kahn order over the plan set (dirty, not hard): a plan entry may only
-    // depend on clean (stamped above), hard (residue walk runs first), or
-    // earlier plan entries; unresolvable cycles fall back to the residue
-    uint32_t *indeg = (uint32_t*)calloc_s(n * sizeof(uint32_t));
-    for (size_t k = 0; k < ndeps; k++) {
-        size_t from = deps[2 * k], to = deps[2 * k + 1];
-        if (dirty[from] && !hard[from] && dirty[to] && !hard[to])
-            indeg[to]++;
-    }
-    size_t *order = (size_t*)malloc_s(n * sizeof(size_t));
-    size_t nord = 0, qhead = 0;
-    for (size_t i = 0; i < n; i++)
-        if (dirty[i] && !hard[i] && indeg[i] == 0)
-            order[nord++] = i;
-    while (qhead < nord) {
-        size_t d = order[qhead++];
-        for (size_t k = radj_off[d]; k < radj_off[d + 1]; k++) {
-            size_t r = radj[k];
-            if (dirty[r] && !hard[r] && indeg[r] > 0 && --indeg[r] == 0)
-                order[nord++] = r;
-        }
-    }
-    for (size_t i = 0; i < n; i++)
-        if (dirty[i] && !hard[i] && indeg[i] > 0)
-            hard[i] = 1; // cycle member: residue
-    // assemble the plan for the Julia sweep
-    jl_value_t *result = jl_nothing;
-    jl_array_t *ordered = NULL, *spans = NULL, *wordsv = NULL, *residue = NULL, *minws = NULL;
-    JL_GC_PUSH5(&ordered, &spans, &wordsv, &residue, &minws);
-    size_t nplan = 0, nres = 0;
-    for (size_t k = 0; k < nord; k++)
-        if (!hard[order[k]])
-            nplan++;
-    for (size_t i = 0; i < n; i++)
-        if (dirty[i] && hard[i])
-            nres++;
-    if (nplan > 0 || nres > 0) {
-        ordered = jl_alloc_vec_any(nplan);
-        spans = jl_alloc_array_1d(jl_array_int32_type, 2 * nplan);
-        residue = jl_alloc_vec_any(nres);
-        static jl_value_t *uint64_vec_type = NULL;
-        if (uint64_vec_type == NULL)
-            uint64_vec_type = jl_apply_array_type((jl_value_t*)jl_uint64_type, 1);
-        JL_GC_PROMISE_ROOTED(uint64_vec_type); // cached array type, rooted by the type cache
-        minws = jl_alloc_array_1d(uint64_vec_type, nplan);
-        size_t np = 0, totw = 0;
-        for (size_t k = 0; k < nord; k++) {
-            size_t i = order[k];
-            if (hard[i])
-                continue;
-            jl_array_ptr_set(ordered, np, (jl_value_t*)cis[i]);
-            jl_array_data(spans, int32_t)[2 * np] = (int32_t)totw;
-            jl_array_data(spans, int32_t)[2 * np + 1] = (int32_t)wcount[i];
-            jl_array_data(minws, uint64_t)[np] = (uint64_t)minw[i];
-            totw += wcount[i];
-            np++;
-        }
-        wordsv = jl_alloc_array_1d(jl_array_int32_type, totw);
-        size_t tw = 0;
-        for (size_t k = 0; k < nord; k++) {
-            size_t i = order[k];
-            if (hard[i])
-                continue;
-            if (wcount[i] > 0)
-                memcpy(jl_array_data(wordsv, int32_t) + tw, words + wstart[i], wcount[i] * sizeof(int32_t));
-            tw += wcount[i];
-        }
-        size_t nr = 0;
-        for (size_t i = 0; i < n; i++)
-            if (dirty[i] && hard[i])
-                jl_array_ptr_set(residue, nr++, (jl_value_t*)cis[i]);
-        jl_svec_t *sv = jl_alloc_svec(5);
-        jl_svecset(sv, 0, ordered);
-        jl_svecset(sv, 1, spans);
-        jl_svecset(sv, 2, wordsv);
-        jl_svecset(sv, 3, residue);
-        jl_svecset(sv, 4, minws);
-        result = (jl_value_t*)sv;
-    }
-    JL_GC_POP();
-    free(order);
-    free(indeg);
-    free(worklist2);
-    free(fill);
-    free(radj);
-    free(radj_off);
-    free(deps);
-    free(words);
-    free(wcount);
-    free(wstart);
-    free(minw);
-    free(hard);
-    free(dirty);
-    free(tab);
-    free(cis);
-    return result;
-}
-
-JL_DLLEXPORT int jl_get_force_load_scan(void) JL_NOTSAFEPOINT
-{
-    char *e = getenv("JULIA_LOAD_SCAN");
-    return e == NULL ? 1 : atoi(e); // measurement gate: JULIA_LOAD_SCAN=0 skips
 }
 
 static void contributor_tag_method(jl_method_t *method)
@@ -4513,10 +3946,8 @@ struct _typename_invalidate_backedge {
     // (certificate replay), entries whose caller lies in the loading closure
     // are not re-derived — their invalidations were replayed from the
     // certificate already, so dead ones are dropped and live ones kept.
-    // `verify` counts closure-owned invalidations the certificate missed.
     jl_array_t *record;
     int foreign_only;
-    int verify;
 };
 
 static void _typename_invalidate_backedges(jl_typename_t *tn, int explct, void *env0) JL_CANSAFEPOINT
@@ -4610,19 +4041,6 @@ static void _typename_invalidate_backedges(jl_typename_t *tn, int explct, void *
                     // replayed from the certificate already; still live, so keep it
                     jl_array_ptr_set(callers, keep++, (jl_value_t*)backedge);
                     continue;
-                }
-                if (env->verify && object_in_loading_closure((jl_value_t*)backedge) &&
-                    jl_atomic_load_relaxed(&backedge->max_world) == ~(size_t)0) {
-                    // certificate replay would have clamped this closure-owned
-                    // caller already; reaching here live means the worker missed it
-                    jl_contrib_stats[4]++;
-                    jl_method_instance_t *cmi = jl_get_ci_mi(backedge);
-                    jl_method_t *cm = (jl_method_t*)cmi->def.method;
-                    jl_safe_printf("TN-CERT VERIFY MISMATCH: caller %s.%s (blob %d) via typename %s\n",
-                                   jl_is_method(cm) ? jl_symbol_name(cm->module->name) : "?",
-                                   jl_is_method(cm) ? jl_symbol_name(cm->name) : "?",
-                                   (int)jl_external_blob_index((jl_value_t*)backedge),
-                                   jl_symbol_name(tn->name));
                 }
                 invalidate_code_instance(backedge, env->max_world, 0);
                 env->invalidated = 1;
@@ -5206,7 +4624,6 @@ void jl_method_table_activate_with_cert(jl_typemap_entry_t *newentry, jl_svec_t 
                     data = (_Atomic(jl_method_instance_t*)*)&loctag;
                     l = 1;
                 }
-                jl_contrib_stats[24] += l;
                 // slot-1 discriminators of the activating signature: a
                 // specialization whose (concrete) first-argument key differs,
                 // or whose key is off the nominal chain of an abstract bound,
@@ -5221,7 +4638,6 @@ void jl_method_table_activate_with_cert(jl_typemap_entry_t *newentry, jl_svec_t 
                     if ((jl_value_t*)mi == jl_nothing)
                         continue;
                     if (method_in_loading_closure((jl_method_t*)mi)) {
-                        jl_contrib_stats[25]++;
                         continue; // covered by the certificate's mi list
                     }
                     if (tkey != NULL || tub != NULL) {
@@ -5229,7 +4645,6 @@ void jl_method_table_activate_with_cert(jl_typemap_entry_t *newentry, jl_svec_t 
                         if (skey != NULL) {
                             if (tkey != NULL) {
                                 if (skey != tkey) {
-                                    jl_contrib_stats[28]++;
                                     continue; // distinct concrete/invariant keys
                                 }
                             }
@@ -5246,13 +4661,11 @@ void jl_method_table_activate_with_cert(jl_typemap_entry_t *newentry, jl_svec_t 
                                     w = w->super;
                                 }
                                 if (!hit && depth < 24) {
-                                    jl_contrib_stats[28]++;
                                     continue;
                                 }
                             }
                         }
                     }
-                    jl_contrib_stats[26]++;
                     if (jl_type_intersection2(type, mi->specTypes, &isect, &isect2)) {
                         int replaced_dispatch = is_replacing(ambig, type, m, d, n, isect, isect2, morespec);
                         int invalidatedmi = _invalidate_dispatch_backedges(mi, type, m, d, n, replaced_dispatch, ambig, max_world, morespec);
@@ -5542,9 +4955,7 @@ void jl_method_table_activate_with_cert(jl_typemap_entry_t *newentry, jl_svec_t 
         tnrecord = jl_alloc_vec_any(0);
     JL_LOCK(&mc->writelock);
     struct _typename_invalidate_backedge typename_env = {type, &isect, &isect2, d, n, max_world, invalidated,
-                                                         tnrecord,
-                                                         /* foreign_only */ replaying && activate_replay_mode() != 2,
-                                                         /* verify */ replaying && activate_replay_mode() == 2 && closure_clean};
+                                                         tnrecord, /* foreign_only */ replaying};
     if (!jl_foreach_top_typename_for(_typename_invalidate_backedges, type, 1, &typename_env)) {
         // if the new method cannot be split into exact backedges, scan the whole table for anything that might be affected
         jl_genericmemory_t *allbackedges = jl_method_table->backedges;

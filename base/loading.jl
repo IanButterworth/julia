@@ -3739,15 +3739,11 @@ function compilecache(pkg::PkgId, spec::PkgLoadSpec, internal_stderr::IO = stder
             cachefile = compilecache_path(pkg, prefs_blob; flags=cacheflags)
             ocachefile = cache_objects ? ocachefile_from_cachefile(cachefile) : nothing
 
-            # append checksum and stat identity for so to the end of the .ji file:
-            crc_so = UInt32(0)
-            so_fsize = UInt64(0)
-            so_mtime = UInt64(0)
-            if cache_objects
-                crc_so = open(_crc32c, tmppath_so, "r")
-                so_st = stat(tmppath_so)
-                so_fsize = UInt64(so_st.size)
-                so_mtime = reinterpret(UInt64, Float64(so_st.mtime))
+            # append checksum for so to the end of the .ji file:
+            crc_so = if cache_objects
+                open(_crc32c, tmppath_so, "r")
+            else
+                UInt32(0)
             end
 
             # append extra crc to the end of the .ji file:
@@ -3756,8 +3752,6 @@ function compilecache(pkg::PkgId, spec::PkgLoadSpec, internal_stderr::IO = stder
                     error("Incompatible header for $(repr("text/plain", pkg)) in new cache file $(repr(tmppath)).")
                 end
                 seekend(f)
-                write(f, so_fsize)
-                write(f, so_mtime)
                 write(f, crc_so)
                 seekstart(f)
                 write(f, _crc32c(f))
@@ -3866,17 +3860,8 @@ isvalid_file_crc(f::IOStream) = (_crc32c(seekstart(f), filesize(f) - 4) == read(
 
 function isvalid_pkgimage_crc(f::IOStream, ocachefile::String)
     seekstart(f) # TODO necessary
-    seek(f, filesize(f) - 24)
-    expected_fsize = read(f, UInt64)
-    expected_mtime = read(f, UInt64)
+    seek(f, filesize(f) - 8)
     expected_crc_so = read(f, UInt32)
-    # a size+mtime match identifies the image the cache was built with (the
-    # same identity source files trust); hash it only when that disagrees
-    st = stat(ocachefile)
-    ispath(st) || return false
-    if UInt64(st.size) == expected_fsize && reinterpret(UInt64, Float64(st.mtime)) == expected_mtime
-        return true
-    end
     crc_so = open(_crc32c, ocachefile, "r")
     expected_crc_so == crc_so
 end

@@ -861,7 +861,6 @@ JL_DLLEXPORT jl_value_t *jl_ci_def_ro(jl_code_instance_t *ci) JL_NOTSAFEPOINT;
 JL_DLLEXPORT jl_value_t *jl_ici_fieldref(jl_value_t *edges, int rank) JL_NOTSAFEPOINT;
 JL_DLLEXPORT void jl_ci_materialize_all(jl_code_instance_t *ci) JL_NOTSAFEPOINT;
 JL_DLLEXPORT void jl_di_materialize_all(jl_debuginfo_t *di); // allocates: converts the subtree
-extern JL_DLLEXPORT uint64_t jl_contrib_stats[32];
 int jl_foreach_top_typename_for(void (*f)(jl_typename_t*, int, void*) JL_CANSAFEPOINT, jl_value_t *argtypes JL_PROPAGATES_ROOT, int all_subtypes, void *env) JL_CANSAFEPOINT;
 JL_DLLEXPORT void jl_register_sig_tns(jl_array_t *tab);
 JL_DLLEXPORT int jl_image_ref_of(jl_value_t *v, uint64_t *key, uint64_t *offset) JL_NOTSAFEPOINT;
@@ -885,10 +884,10 @@ JL_DLLEXPORT jl_value_t *jl_image_ref_resolve(int is_sysimg, uint64_t key, uint6
 // fields in the interned container; decode on first read and write back
 STATIC_INLINE jl_value_t *jl_ci_owner(jl_code_instance_t *ci JL_PROPAGATES_ROOT) JL_NOTSAFEPOINT
 {
-    jl_value_t *v = ci->owner;
+    jl_value_t *v = jl_atomic_load_relaxed((_Atomic(jl_value_t*)*)&ci->owner);
     if (v == NULL) {
         jl_ci_materialize_all(ci);
-        v = ci->owner;
+        v = jl_atomic_load_relaxed((_Atomic(jl_value_t*)*)&ci->owner);
     }
     return v;
 }
@@ -905,30 +904,30 @@ STATIC_INLINE jl_code_instance_t *jl_ci_next(jl_code_instance_t *ci JL_PROPAGATE
 
 STATIC_INLINE jl_value_t *jl_ci_rettype(jl_code_instance_t *ci JL_PROPAGATES_ROOT) JL_NOTSAFEPOINT
 {
-    jl_value_t *v = ci->rettype;
+    jl_value_t *v = jl_atomic_load_relaxed((_Atomic(jl_value_t*)*)&ci->rettype);
     if (v == NULL) {
         jl_ci_materialize_all(ci);
-        v = ci->rettype;
+        v = jl_atomic_load_relaxed((_Atomic(jl_value_t*)*)&ci->rettype);
     }
     return v;
 }
 
 STATIC_INLINE jl_value_t *jl_ci_exctype(jl_code_instance_t *ci JL_PROPAGATES_ROOT) JL_NOTSAFEPOINT
 {
-    jl_value_t *v = ci->exctype;
+    jl_value_t *v = jl_atomic_load_relaxed((_Atomic(jl_value_t*)*)&ci->exctype);
     if (v == NULL) {
         jl_ci_materialize_all(ci);
-        v = ci->exctype;
+        v = jl_atomic_load_relaxed((_Atomic(jl_value_t*)*)&ci->exctype);
     }
     return v;
 }
 
 STATIC_INLINE jl_value_t *jl_ci_rettype_const(jl_code_instance_t *ci JL_PROPAGATES_ROOT) JL_NOTSAFEPOINT
 {
-    jl_value_t *v = ci->rettype_const;
+    jl_value_t *v = jl_atomic_load_relaxed((_Atomic(jl_value_t*)*)&ci->rettype_const);
     if (v == NULL) {
         jl_ci_materialize_all(ci);
-        v = ci->rettype_const;
+        v = jl_atomic_load_relaxed((_Atomic(jl_value_t*)*)&ci->rettype_const);
     }
     return v;
 }
@@ -955,10 +954,10 @@ STATIC_INLINE jl_debuginfo_t *jl_ci_debuginfo(jl_code_instance_t *ci JL_PROPAGAT
 
 STATIC_INLINE jl_value_t *jl_ci_analysis_results(jl_code_instance_t *ci JL_PROPAGATES_ROOT) JL_NOTSAFEPOINT
 {
-    jl_value_t *v = ci->analysis_results;
+    jl_value_t *v = jl_atomic_load_relaxed((_Atomic(jl_value_t*)*)&ci->analysis_results);
     if (v == NULL) {
         jl_ci_materialize_all(ci);
-        v = ci->analysis_results;
+        v = jl_atomic_load_relaxed((_Atomic(jl_value_t*)*)&ci->analysis_results);
     }
     return v;
 }
@@ -974,63 +973,78 @@ STATIC_INLINE jl_debuginfo_t *jl_ci_debuginfo_ro(jl_code_instance_t *ci JL_PROPA
 
 STATIC_INLINE jl_value_t *jl_di_def(jl_debuginfo_t *di JL_PROPAGATES_ROOT)
 {
-    jl_value_t *v = di->def;
-    if (v == NULL) {
+    // convert the whole subtree while the interned container is still in
+    // place, so that raw reads below this node are safe once any materializing
+    // accessor has returned (a racing converter publishes `edges` last)
+    jl_value_t *edges = jl_atomic_load_acquire((_Atomic(jl_value_t*)*)&di->edges);
+    if (edges != NULL && jl_typetagis(edges, jl_interned_code_instance_type))
         jl_di_materialize_all(di);
-        v = di->def;
-    }
-    return v;
+    return jl_atomic_load_acquire((_Atomic(jl_value_t*)*)&di->def);
 }
 
 STATIC_INLINE jl_value_t *jl_di_linetable(jl_debuginfo_t *di JL_PROPAGATES_ROOT)
 {
-    jl_value_t *v = di->linetable;
-    if (v == NULL) {
+    // convert the whole subtree while the interned container is still in
+    // place, so that raw reads below this node are safe once any materializing
+    // accessor has returned (a racing converter publishes `edges` last)
+    jl_value_t *edges = jl_atomic_load_acquire((_Atomic(jl_value_t*)*)&di->edges);
+    if (edges != NULL && jl_typetagis(edges, jl_interned_code_instance_type))
         jl_di_materialize_all(di);
-        v = di->linetable;
-    }
-    return v;
+    return jl_atomic_load_acquire((_Atomic(jl_value_t*)*)&di->linetable);
 }
 
 STATIC_INLINE jl_value_t *jl_di_codelocs_(jl_debuginfo_t *di JL_PROPAGATES_ROOT)
 {
-    jl_value_t *v = di->codelocs;
-    if (v == NULL) {
+    // convert the whole subtree while the interned container is still in
+    // place, so that raw reads below this node are safe once any materializing
+    // accessor has returned (a racing converter publishes `edges` last)
+    jl_value_t *edges = jl_atomic_load_acquire((_Atomic(jl_value_t*)*)&di->edges);
+    if (edges != NULL && jl_typetagis(edges, jl_interned_code_instance_type))
         jl_di_materialize_all(di);
-        v = di->codelocs;
-    }
-    return v;
+    return jl_atomic_load_acquire((_Atomic(jl_value_t*)*)&di->codelocs);
 }
 
 // read-only DebugInfo variants (stackwalk may run in a signal context)
 STATIC_INLINE jl_value_t *jl_di_def_ro(jl_debuginfo_t *di JL_PROPAGATES_ROOT) JL_NOTSAFEPOINT
 {
-    jl_value_t *v = di->def;
-    if (v == NULL)
-        v = jl_ici_fieldref((jl_value_t*)di->edges, JL_ICI_DI_DEF);
+    jl_value_t *v = jl_atomic_load_relaxed((_Atomic(jl_value_t*)*)&di->def);
+    if (v == NULL) {
+        jl_value_t *edges = jl_atomic_load_acquire((_Atomic(jl_value_t*)*)&di->edges);
+        v = jl_ici_fieldref(edges, JL_ICI_DI_DEF);
+        if (v == NULL) // converted meanwhile: the field was published before `edges`
+            v = jl_atomic_load_acquire((_Atomic(jl_value_t*)*)&di->def);
+    }
     return v;
 }
 
 STATIC_INLINE jl_value_t *jl_di_linetable_ro(jl_debuginfo_t *di JL_PROPAGATES_ROOT) JL_NOTSAFEPOINT
 {
-    jl_value_t *v = di->linetable;
-    if (v == NULL)
-        v = jl_ici_fieldref((jl_value_t*)di->edges, JL_ICI_DI_LINETABLE);
+    jl_value_t *v = jl_atomic_load_relaxed((_Atomic(jl_value_t*)*)&di->linetable);
+    if (v == NULL) {
+        jl_value_t *edges = jl_atomic_load_acquire((_Atomic(jl_value_t*)*)&di->edges);
+        v = jl_ici_fieldref(edges, JL_ICI_DI_LINETABLE);
+        if (v == NULL) // converted meanwhile: the field was published before `edges`
+            v = jl_atomic_load_acquire((_Atomic(jl_value_t*)*)&di->linetable);
+    }
     return v;
 }
 
 STATIC_INLINE jl_value_t *jl_di_codelocs_ro(jl_debuginfo_t *di JL_PROPAGATES_ROOT) JL_NOTSAFEPOINT
 {
-    jl_value_t *v = di->codelocs;
-    if (v == NULL)
-        v = jl_ici_fieldref((jl_value_t*)di->edges, JL_ICI_DI_CODELOCS);
+    jl_value_t *v = jl_atomic_load_relaxed((_Atomic(jl_value_t*)*)&di->codelocs);
+    if (v == NULL) {
+        jl_value_t *edges = jl_atomic_load_acquire((_Atomic(jl_value_t*)*)&di->edges);
+        v = jl_ici_fieldref(edges, JL_ICI_DI_CODELOCS);
+        if (v == NULL) // converted meanwhile: the field was published before `edges`
+            v = jl_atomic_load_acquire((_Atomic(jl_value_t*)*)&di->codelocs);
+    }
     return v;
 }
 JL_DLLEXPORT jl_value_t *jl_ci_def(jl_code_instance_t *ci);
 
 STATIC_INLINE jl_method_instance_t *jl_get_ci_mi(jl_code_instance_t *ci JL_PROPAGATES_ROOT) JL_NOTSAFEPOINT
 {
-    jl_value_t *def = ci->def;
+    jl_value_t *def = jl_atomic_load_relaxed((_Atomic(jl_value_t*)*)&ci->def);
     if (def == NULL) // interned in the image; decode and write back
         def = jl_ici_materialize_def(ci);
     if (jl_is_abioverride(def))
@@ -1066,7 +1080,7 @@ JL_DLLEXPORT jl_value_t *jl_sparam_slot_value(jl_value_t *sp JL_PROPAGATES_ROOT)
 // materializing variant returning the raw def object (MethodInstance or ABIOverride)
 STATIC_INLINE jl_value_t *jl_ci_defobj(jl_code_instance_t *ci JL_PROPAGATES_ROOT) JL_NOTSAFEPOINT
 {
-    jl_value_t *def = ci->def;
+    jl_value_t *def = jl_atomic_load_relaxed((_Atomic(jl_value_t*)*)&ci->def);
     if (def == NULL)
         def = jl_ici_materialize_def(ci);
     return def;
@@ -1663,7 +1677,6 @@ JL_DLLEXPORT void jl_method_table_add_backedge(jl_value_t *typ, jl_code_instance
 extern JL_DLLEXPORT jl_array_t *jl_backedge_log JL_GLOBALLY_ROOTED;
 void jl_record_binding_backedge(jl_binding_t *b, jl_value_t *edge);
 JL_DLLEXPORT void jl_apply_backedge_log(jl_array_t *log);
-JL_DLLEXPORT int jl_get_ici_debug_enabled(void) JL_NOTSAFEPOINT;
 JL_DLLEXPORT jl_value_t *jl_ici_ref(jl_interned_code_instance_t *ici, size_t i);
 JL_DLLEXPORT jl_value_t *jl_ici_ref_nobox(jl_interned_code_instance_t *ici, size_t i) JL_NOTSAFEPOINT;
 JL_DLLEXPORT jl_svec_t *jl_ici_to_svec(jl_interned_code_instance_t *ici);
