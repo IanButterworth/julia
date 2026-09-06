@@ -3622,3 +3622,11 @@ end
 # (e.g. Union{Int64,String}) are not expressible as a finite case split
 @test !((Tuple{T,Ref{T}} where T<:Union{Integer,AbstractString}) <:
     Union{Tuple{S,Ref{S}} where S<:Integer, Tuple{S,Ref{S}} where S<:AbstractString})
+# the enumeration is not used when environment output is requested: the bounds
+# recorded for right-side variables must come from the variable's full range,
+# not from the last pinned branch (Union{}, which binds nothing)
+let (t, e) = intersection_env(Tuple{Type{<:Tuple{Int}}}, Tuple{Type{<:Tuple{E}}} where E)
+    @test t == Tuple{Type{<:Tuple{Int}}}
+    @test e[1] isa Core.SimpleVector && e[1][1] isa TypeVar &&
+          e[1][1].lb === Int && e[1][1].ub === Int
+end
