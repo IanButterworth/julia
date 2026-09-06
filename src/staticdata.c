@@ -5770,7 +5770,7 @@ static int all_usings_unchanged_implicit(jl_module_t *mod)
 }
 
 static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
-                                                 jl_array_t *depmods, uint32_t checksum,
+                                                 jl_array_t *depmods, uint64_t checksum,
                                 /* outputs */    jl_array_t **restored JL_REQUIRE_ROOTED_SLOT,
                                                  jl_array_t **init_order JL_REQUIRE_ROOTED_SLOT,
                                                  jl_array_t **extext_methods JL_REQUIRE_ROOTED_SLOT,

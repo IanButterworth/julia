@@ -1762,7 +1762,7 @@ static jl_value_t *subtype_unionall_envout_value(jl_value_t *t, jl_unionall_t *u
 // tuples of atoms do have proper subtypes like Tuple{Union{A,B}} below
 // Union{Tuple{A},Tuple{B}}, but those are *equal* to unions of atom tuples,
 // which a sub-union enumeration covers up to type equality.)
-static int is_atom_type(jl_value_t *a) JL_NOTSAFEPOINT
+JL_DLLEXPORT int jl_is_atom_type(jl_value_t *a) JL_NOTSAFEPOINT
 {
     if (!jl_is_datatype(a))
         return 0;
@@ -1771,7 +1771,7 @@ static int is_atom_type(jl_value_t *a) JL_NOTSAFEPOINT
         return 0;
     if (d->name == jl_tuple_typename) {
         for (size_t i = 0; i < jl_nparams(d); i++) {
-            if (!is_atom_type(jl_tparam(d, i)))
+            if (!jl_is_atom_type(jl_tparam(d, i)))
                 return 0;
         }
     }
@@ -1789,7 +1789,7 @@ static int classify_union_arms(jl_value_t *u, int limit, int *natoms, int *nothe
     }
     if (*natoms + *nother >= limit)
         return 0;
-    if (is_atom_type(u))
+    if (jl_is_atom_type(u))
         (*natoms)++;
     else
         (*nother)++;
@@ -1888,7 +1888,7 @@ static jl_value_t *pick_atom_subset(jl_value_t *u, jl_value_t **rest, jl_stenv_t
         JL_GC_POP();
         return res;
     }
-    if (is_atom_type(u))
+    if (jl_is_atom_type(u))
         return pick_union_decision(e, 0) ? jl_bottom_type : u;
     *rest = *rest == NULL ? u : jl_new_struct(jl_uniontype_type, *rest, u);
     return jl_bottom_type;

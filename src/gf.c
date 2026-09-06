@@ -431,7 +431,7 @@ static jl_code_instance_t *jl_method_inferred_with_abi(jl_method_instance_t *mi 
 {
     jl_code_instance_t *codeinst = jl_atomic_load_relaxed(&mi->cache);
     for (; codeinst; codeinst = jl_ci_next(codeinst)) {
-        if (codeinst->owner != jl_nothing)
+        if (jl_ci_owner(codeinst) != jl_nothing)
             continue;
         if (jl_atomic_load_relaxed(&codeinst->min_world) <= world && world <= jl_atomic_load_relaxed(&codeinst->max_world)) {
             if (emit_codeinst_and_edges(codeinst) && jl_atomic_load_relaxed(&codeinst->invoke) != NULL)
@@ -3378,7 +3378,9 @@ static int fdisj_isect_empty(jl_value_t *msig0, jl_value_t *qsig)
                 jl_value_t *mi = jl_tparam(msig, i);
                 if (qi == mi)
                     continue;
-                if (!jl_is_concrete_type(qi))
+                // only an atom (no proper nonempty subtypes) is disjoint from `mi` merely because it
+                // is not a subtype of it: concrete tuples of kinds, e.g. Tuple{DataType}, are not
+                if (!jl_is_atom_type(qi))
                     continue;
                 int empty;
                 if (!jl_has_free_typevars(mi)) {
@@ -4235,6 +4237,10 @@ JL_DLLEXPORT jl_value_t *jl_preverify_clean_cis(jl_array_t *worklist, size_t val
         }
         dirty[i] = hard[i] | (char)sigdirty;
     }
+    // entries that bailed out of the loop above (`hard[i] = 1; continue;`) never reached the
+    // assignment: they must be dirty too, or the plan would stamp them clean
+    for (size_t i = 0; i < n; i++)
+        dirty[i] |= hard[i];
 #undef PREVERIFY_LOOKUP
     // reverse adjacency (CSR over dep pairs, keyed by dependency source)
     size_t *radj_off = (size_t*)malloc_s((n + 1) * sizeof(size_t));
@@ -5064,7 +5070,8 @@ void jl_method_table_activate_with_cert(jl_typemap_entry_t *newentry, jl_svec_t 
     jl_genericmemory_t *interferences = NULL;
     jl_svec_t *newcert = NULL;
     jl_array_t *tnrecord = NULL; // missing-edge invalidations for the certificate
-    JL_GC_PUSH8(&oldvalue, &oldmi, &loctag, &isect, &isect2, &interferences, &newcert, &tnrecord);
+    jl_value_t *foreign_oldvalue = NULL;
+    JL_GC_PUSH9(&oldvalue, &oldmi, &loctag, &isect, &isect2, &interferences, &newcert, &tnrecord, &foreign_oldvalue);
     int record_cert = jl_generating_output() && jl_options.incremental && mt == jl_method_table;
     int closure_clean = 0;
     if (jl_loading_closure_bits != NULL && mt == jl_method_table) {
@@ -5141,7 +5148,7 @@ void jl_method_table_activate_with_cert(jl_typemap_entry_t *newentry, jl_svec_t 
     // to have no relevant type intersection for sorting).
     interferences = (jl_genericmemory_t*)jl_atomic_load_relaxed(&method->interferences);
     if (replaying) {
-        jl_value_t *foreign_oldvalue = oldvalue;
+        foreign_oldvalue = oldvalue;
         // Replay the precompile worker's scan results: same prior world for
         // this method's typenames (contributor check), so the intersecting
         // set, specificity flags, and image-mi invalidations are as recorded.
@@ -5765,7 +5772,7 @@ STATIC_INLINE jl_callptr_t jl_method_compiled_callptr(jl_method_instance_t *mi, 
 {
     jl_code_instance_t *codeinst = jl_atomic_load_relaxed(&mi->cache);
     for (; codeinst; codeinst = jl_ci_next(codeinst)) {
-        if (codeinst->owner != jl_nothing)
+        if (jl_ci_owner(codeinst) != jl_nothing)
             continue;
         if (jl_atomic_load_relaxed(&codeinst->min_world) <= world && world <= jl_atomic_load_relaxed(&codeinst->max_world)) {
             jl_callptr_t invoke = jl_atomic_load_acquire(&codeinst->invoke);

@@ -865,6 +865,7 @@ extern JL_DLLEXPORT uint64_t jl_contrib_stats[32];
 int jl_foreach_top_typename_for(void (*f)(jl_typename_t*, int, void*) JL_CANSAFEPOINT, jl_value_t *argtypes JL_PROPAGATES_ROOT, int all_subtypes, void *env) JL_CANSAFEPOINT;
 JL_DLLEXPORT void jl_register_sig_tns(jl_array_t *tab);
 JL_DLLEXPORT int jl_image_ref_of(jl_value_t *v, uint64_t *key, uint64_t *offset) JL_NOTSAFEPOINT;
+JL_DLLEXPORT int jl_is_atom_type(jl_value_t *a) JL_NOTSAFEPOINT;
 JL_DLLEXPORT jl_value_t *jl_image_ref_resolve(int is_sysimg, uint64_t key, uint64_t offset) JL_NOTSAFEPOINT;
 
 // interned-field ranks (must match the hooks in staticdata.c)
