@@ -17,5 +17,6 @@ The documentation build renders each canonical `SKILL.md` with its Agent Skill m
 - [`external-deps`](skills/external-deps/index.md) — modifying external dependencies (`deps/`, patches) and JLLs.
 - [`buildkite-logs`](skills/buildkite-logs/index.md) — fetching and inspecting Buildkite CI logs without web sign-in.
 - [`ci-timing`](skills/ci-timing/index.md) — comparing a PR's Buildkite job durations against recent CI history.
+- [`coverage`](skills/coverage/index.md) — looking up test coverage from Codecov, Coveralls or the raw lcov CI artifact.
 - [`compiler-jl`](skills/compiler-jl/index.md) — developing and testing Compiler.jl.
 - [`julia-syntax-lowering`](skills/julia-syntax-lowering/index.md) — developing and testing JuliaSyntax and JuliaLowering.

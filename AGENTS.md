@@ -86,6 +86,7 @@ canonical `SKILL.md` directly.
 - [`doc/src/devdocs/agents/skills/external-deps/`](doc/src/devdocs/agents/skills/external-deps/SKILL.md) — modifying external dependencies (`deps/`, patches) and JLLs.
 - [`doc/src/devdocs/agents/skills/buildkite-logs/`](doc/src/devdocs/agents/skills/buildkite-logs/SKILL.md) — fetching and inspecting Buildkite CI logs without web sign-in.
 - [`doc/src/devdocs/agents/skills/ci-timing/`](doc/src/devdocs/agents/skills/ci-timing/SKILL.md) — comparing a PR's Buildkite job durations against recent CI history.
+- [`doc/src/devdocs/agents/skills/coverage/`](doc/src/devdocs/agents/skills/coverage/SKILL.md) — looking up test coverage from Codecov, Coveralls or the raw lcov CI artifact.
 - [`doc/src/devdocs/agents/skills/compiler-jl/`](doc/src/devdocs/agents/skills/compiler-jl/SKILL.md) — developing and testing Compiler.jl.
 - [`doc/src/devdocs/agents/skills/julia-syntax-lowering/`](doc/src/devdocs/agents/skills/julia-syntax-lowering/SKILL.md) — developing and testing JuliaSyntax and JuliaLowering.
 
