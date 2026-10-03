@@ -2203,6 +2203,7 @@ int jl_register_image_coverage(const void *table, int is_sysimg) JL_NOTSAFEPOINT
 JL_DLLEXPORT int jl_codeinst_coverage_compatible(jl_code_instance_t *ci) JL_NOTSAFEPOINT;
 JL_DLLEXPORT uint8_t jl_image_coverage_config(void) JL_NOTSAFEPOINT;
 JL_DLLEXPORT int jl_match_cache_coverage(uint8_t requested, uint8_t actual) JL_NOTSAFEPOINT;
+JL_DLLEXPORT int jl_match_cache_coverage_loadable(uint8_t requested, uint8_t actual) JL_NOTSAFEPOINT;
 JL_DLLEXPORT _Atomic(uint64_t) *jl_malloc_data_pointer(const char *filename, int line) JL_NOTSAFEPOINT;
 JL_DLLEXPORT NOINLINE int failed_to_sample_task_fun(jl_bt_element_t *bt_data, size_t maxsize, int skip) JL_NOTSAFEPOINT;
 JL_DLLEXPORT NOINLINE int failed_to_stop_thread_fun(jl_bt_element_t *bt_data, size_t maxsize, int skip) JL_NOTSAFEPOINT;

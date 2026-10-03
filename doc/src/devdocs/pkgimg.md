@@ -62,9 +62,11 @@ dependents as well.
 
 Coverage runs create instrumented package-image variants alongside ordinary
 caches for every loaded package, independently of the requested scope. Thus
-`--code-coverage=@<path>` reuses the same images as `user` and `all`, even for
-packages outside the tracked path. An initial coverage run may need to precompile
-instrumented dependency images; subsequent runs can reuse them across selectors.
+`--code-coverage=@<path>` reuses the same images as `user` and `all`. It also
+accepts an ordinary image for a package with no source files under the tracked
+path, such as a bundled standard library, and keeps that image's code. An
+initial coverage run may need to precompile instrumented dependency images;
+subsequent runs can reuse them across selectors.
 Instrumented package images also work with an ordinary system image. Reports
 include zero counts for instrumented lines that were not executed; precompilation
 workloads do not contribute hits.

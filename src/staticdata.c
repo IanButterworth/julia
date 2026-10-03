@@ -4636,7 +4636,7 @@ static jl_value_t *jl_validate_cache_file(ios_t *f, jl_array_t *depmods, uint32_
         // Syntax version mismatch is not fatal to load
         if (!jl_match_cache_flags_current(read_uint8(f)))
             return jl_get_exceptionf(jl_errorexception_type, "Pkgimage flags mismatch");
-        if (!jl_match_cache_coverage(jl_image_coverage_config(), read_uint8(f)))
+        if (!jl_match_cache_coverage_loadable(jl_image_coverage_config(), read_uint8(f)))
             return jl_get_exceptionf(jl_errorexception_type, "Pkgimage coverage instrumentation mismatch");
 
         (void)read_uint8(f); // syntax_version

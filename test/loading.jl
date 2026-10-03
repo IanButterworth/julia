@@ -2038,6 +2038,49 @@ end
     end
 end
 
+@testset "path coverage uses uninstrumented caches outside the tracked path" begin
+    mkdepottempdir() do depot
+        # Tracked paths are compared as written, and macOS temp dirs sit behind a symlink.
+        pkgs = joinpath(realpath(depot), "pkgs")
+        pkgdir = joinpath(pkgs, "CovDep")
+        mkpath(joinpath(pkgdir, "src"))
+        write(joinpath(pkgdir, "Project.toml"), """
+            name = "CovDep"
+            uuid = "7d5e6c1a-3f0b-4e8e-9d6c-1a2b3c4d5e6f"
+            version = "0.1.0"
+
+            [deps]
+            Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+            """)
+        write(joinpath(pkgdir, "src", "CovDep.jl"), """
+            module CovDep
+            using Printf
+            f(x) = @sprintf("%d", x)
+            end
+            """)
+        compiled = joinpath(depot, "compiled", "v$(VERSION.major).$(VERSION.minor)")
+        sep = Sys.iswindows() ? ';' : ':'
+        # The trailing separator keeps the bundled stdlib caches on the depot path.
+        env = ("JULIA_DEPOT_PATH" => depot * sep, "JULIA_LOAD_PATH" => pkgs * sep * "@stdlib")
+        exename = Base.julia_cmd()[1]
+        run_julia(cov, code) = success(addenv(`$exename --startup-file=no --pkgimages=yes $cov -e $code`, env...))
+        cachefiles() = filter(endswith(".ji"), readdir(joinpath(compiled, "CovDep")))
+
+        @test run_julia(`--code-coverage=none`, "using CovDep")
+        @test length(cachefiles()) == 1
+        # Tracking another path reuses the plain caches.
+        @test run_julia(`--code-coverage=@$(joinpath(depot, "elsewhere"))`, "using CovDep")
+        @test length(cachefiles()) == 1
+        # Tracking the package builds it with counters, against the bundled Printf.
+        @test run_julia(`--code-coverage=@$pkgdir`, "using CovDep; CovDep.f(1)")
+        @test length(cachefiles()) == 2
+        @test !isdir(joinpath(compiled, "Printf"))
+        cov = filter(endswith(".cov"), readdir(joinpath(pkgdir, "src"), join=true))
+        @test length(cov) == 1
+        @test occursin(r"^\s+1 f\(x\)"m, read(only(cov), String))
+    end
+end
+
 @testset "command-line flags" begin
     mkdepottempdir() do depot_path mktempdir() do dir
         # generate a Parent.jl and Child.jl package, with Parent depending on Child

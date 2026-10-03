@@ -1182,9 +1182,12 @@ let exename = `$(Base.julia_cmd()) --startup-file=no --color=no`
             info = read(joinpath(dir, only(infos())), String)
             @test occursin(r"^SF:.*CovDep\.jl$"m, info)
             rm(joinpath(dir, only(infos())))
-            # count mode needs its own native image
-            @test readchomp(`$pkg_exename --code-coverage=$covfile --code-coverage=@$pkgdir --code-coverage-mode=count -e $probe`) == "2 1 0 2"
+            # count mode needs its own native image, but the dependency outside
+            # the tracked path keeps its plain image
+            plain_dep_probe = replace(probe, "(Any,), depci) == compatible" => "(Any,), depci) == 0")
+            @test readchomp(`$pkg_exename --code-coverage=$covfile --code-coverage=@$pkgdir --code-coverage-mode=count -e $plain_dep_probe`) == "2 1 0 2"
             @test njis() == 3
+            @test ndepjis() == 2
             rm(joinpath(dir, only(infos())))
             # `all` uses the same variants; the sysimage is used as built either way
             @test readchomp(`$pkg_exename --code-coverage=$covfile --code-coverage=all -e $probe`) == "1 1 0 2"

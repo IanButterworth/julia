@@ -1972,12 +1972,21 @@ end
 function coverage_cache_options(cf::CacheFlags)
     cf.coverage == 0 && return ["--code-coverage=none"]
     mode = cf.coverage == 2 ? "count" : "hit"
-    return ["--code-coverage=user", "--code-coverage-mode=" * mode]
+    # Keep the tracked path so the child accepts the same uninstrumented dependencies.
+    opts = JLOptions()
+    scope = opts.code_coverage == 3 ? "@" * unsafe_string(opts.tracked_path) : "user"
+    return ["--code-coverage=" * scope, "--code-coverage-mode=" * mode]
 end
 
 # Whether a cache with instrumentation `actual` serves `requested`.
 function match_cache_coverage(requested::CacheFlags, actual::CacheFlags)
     return @ccall(jl_match_cache_coverage(UInt8(requested.coverage)::UInt8, UInt8(actual.coverage)::UInt8)::Cint) != 0
+end
+
+# Whether a cache with instrumentation `actual` serves `requested` for a package
+# whose files are all outside the tracked path.
+function match_cache_coverage_loadable(requested::CacheFlags, actual::CacheFlags)
+    return @ccall(jl_match_cache_coverage_loadable(UInt8(requested.coverage)::UInt8, UInt8(actual.coverage)::UInt8)::Cint) != 0
 end
 
 function show(io::IO, cf::CacheFlags)
@@ -4904,8 +4913,9 @@ end
         # one should be cheap.
         header_start = position(io)
         actual_flags = CacheFlags(read(io, UInt8), read(io, UInt8))
+        uninstrumented = !match_cache_coverage(requested_flags, actual_flags)
         if @ccall(jl_match_cache_flags(_cacheflag_to_uint8(requested_flags)::UInt8, _cacheflag_to_uint8(actual_flags)::UInt8)::UInt8) == 0 ||
-           !match_cache_coverage(requested_flags, actual_flags)
+           (uninstrumented && !match_cache_coverage_loadable(requested_flags, actual_flags))
             @debug """
             Rejecting cache file $cachefile for $modkey since the flags are mismatched
               requested flags: $(requested_flags) [$(_cacheflag_to_uint8(requested_flags))]
@@ -4918,6 +4928,15 @@ end
         modules, (includes, _, requires), required_modules, srctextpos, prefs_blob, clone_targets, _, syntax_version = parse_cache_header(io, cachefile)
         if isempty(modules)
             return true # ignore empty file
+        end
+        if uninstrumented
+            for inc in includes
+                if is_file_tracked(Symbol(inc.filename))
+                    @debug "Rejecting cache file $cachefile for $modkey since it has no coverage counters for tracked file $(inc.filename)"
+                    record_reason(reasons, :flags_mismatch)
+                    return true
+                end
+            end
         end
         if stalecheck && syntax_version != cache_edition(modspec.julia_edition)
             @debug "Rejecting cache file $cachefile for $modkey since it was parsed for a different Julia syntax version"

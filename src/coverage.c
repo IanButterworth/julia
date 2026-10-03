@@ -36,6 +36,14 @@ JL_DLLEXPORT int jl_match_cache_coverage(uint8_t requested, uint8_t actual) JL_N
     return actual == requested || actual == JL_IMAGE_COVERAGE_COUNT;
 }
 
+// Path coverage reports only tracked files, so a package outside the tracked
+// path can also load an image without counters. The loader checks the files.
+JL_DLLEXPORT int jl_match_cache_coverage_loadable(uint8_t requested, uint8_t actual) JL_NOTSAFEPOINT
+{
+    return jl_match_cache_coverage(requested, actual) ||
+           (jl_options.code_coverage == JL_LOG_PATH && actual == JL_IMAGE_COVERAGE_NONE);
+}
+
 // Logging for code coverage and memory allocation
 
 #define logdata_blocksize 32 // target getting nearby lines in the same general cache area and reducing calls to malloc by chunking

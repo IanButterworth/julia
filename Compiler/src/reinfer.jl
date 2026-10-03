@@ -2,7 +2,7 @@
 
 using ..Compiler.Base
 using ..Compiler: _findsup, store_backedges, JLOptions, get_world_counter,
-    _methods_by_ftype, get_methodtable, get_ci_mi, should_instrument,
+    _methods_by_ftype, get_methodtable, get_ci_mi, should_instrument, _should_instrument,
     morespecific, RefValue, get_require_world, Vector, IdDict, IdSet,
     binding_access_range, is_leaf_partition, WorldWithRange, WorldRange, min_world, max_world
 using .Core: CodeInstance, MethodInstance
@@ -181,8 +181,13 @@ function needs_instrumentation(codeinst::CodeInstance, mi::MethodInstance, def::
             isdefined(codeinst, :debuginfo) && should_instrument(def.module, codeinst.debuginfo)
             # Compatible image code already has the requested counters.
             # Allocation tracking still needs fresh instrumentation.
-            if JLOptions().malloc_log == 0 && ccall(:jl_codeinst_coverage_compatible, Cint, (Any,), codeinst) != 0
-                return false
+            if JLOptions().malloc_log == 0
+                ccall(:jl_codeinst_coverage_compatible, Cint, (Any,), codeinst) != 0 && return false
+                # Path coverage reports only tracked files, so other image code can stay.
+                if JLOptions().code_coverage == 3 &&
+                   !_should_instrument(isdefined(def, :debuginfo) ? def.debuginfo : codeinst.debuginfo)
+                    return false
+                end
             end
             return true
         end
