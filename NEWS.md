@@ -142,6 +142,11 @@ Compiler/Runtime improvements
   `Core.isdefinedglobal_partition` or `Core.depwarn_binding` builtin function. This does not change the
   meaning of the program, but packages that inspect optimized IR (e.g. from `code_typed`) will encounter
   these new forms. See the "Lowered form" section of the developer documentation for their semantics ([#62452]).
+* Package image builds now keep the compiled code of each function in the native code cache that
+  JIT compilation already uses, and reuse it in later builds. Rebuilding a package after it or one of
+  its dependencies changes only compiles the functions whose code changed. Entries are keyed on the
+  exact LLVM input of each function and on the compiler build, so a reused object is the one compiling
+  again would produce. `JULIA_OBJCACHE=0` turns the cache off for both.
 
 Command-line option changes
 ---------------------------
