@@ -3386,49 +3386,32 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
         arraylist_new(&record_lists, 0);
         jl_array_t *images = NULL;
         size_t images_seen = 0;
-        size_t nblobs_now = n_linkage_blobs();
         JL_GC_PUSH1(&images);
         if (extext_methods) {
             for (size_t i = 1, nex = jl_array_nrows(extext_methods); i < nex; i += 2) {
                 jl_value_t *record = jl_array_ptr_ref(extext_methods, i);
                 if (record == jl_nothing)
                     continue;
-                // The record covers the images loaded when the method activated, which
-                // this image names by dependency index, and the image being built. An
-                // image this file cannot name is left out of the coverage: a record of
-                // the method's interaction with it would have to come from elsewhere.
-                // A record computed against a method of such an image is dropped: the
-                // loader could not resolve that method to check the record still applies.
+                // The record covers the images loaded when the method activated, the
+                // first `seen` linkage blobs, and the image being built. Every loaded
+                // image is in the dependency list, which gives each blob its key here.
                 jl_value_t *seenv = jl_svecref(record, ACTIVATION_RECORD_IMAGES);
                 assert(jl_is_long(seenv));
                 size_t seen = (size_t)jl_unbox_long(seenv);
-                int32_t *dm = s.buildid_depmods_idxs ? jl_array_data(s.buildid_depmods_idxs, int32_t) : NULL;
-                int nameable = dm != NULL;
-                jl_value_t *methods = jl_svecref(record, ACTIVATION_RECORD_METHODS);
-                if (nameable && methods != jl_nothing) {
-                    for (size_t k = 0, nm = jl_array_nrows((jl_array_t*)methods); k < nm && nameable; k++) {
-                        jl_value_t *m = jl_array_ptr_ref((jl_array_t*)methods, k);
-                        if (jl_object_in_image(m) && dm[external_blob_index(m)] < 0)
-                            nameable = 0;
-                    }
-                }
-                if (!nameable) {
-                    jl_array_ptr_set(extext_methods, i, jl_nothing);
-                    continue;
-                }
+                assert(seen <= n_linkage_blobs());
+                assert(s.buildid_depmods_idxs != NULL); // records are only made for an incremental image
                 if (images == NULL || images_seen != seen) {
                     // one key list per distinct set of images, shared by the records
                     // of the methods activated with the same images loaded
-                    images = jl_alloc_array_1d(jl_array_int32_type, 0);
+                    images = jl_alloc_array_1d(jl_array_int32_type, seen + 1);
                     images_seen = seen;
-                    for (size_t b = 0; b < seen && b < nblobs_now; b++) {
-                        if (dm[b] < 0)
-                            continue; // not a dependency, so not nameable
-                        jl_array_grow_end(images, 1);
-                        jl_array_data(images, int32_t)[jl_array_nrows(images) - 1] = dm[b];
+                    int32_t *dm = jl_array_data(s.buildid_depmods_idxs, int32_t);
+                    int32_t *keys = jl_array_data(images, int32_t);
+                    for (size_t b = 0; b < seen; b++) {
+                        assert(dm[b] >= 0);
+                        keys[b] = dm[b];
                     }
-                    jl_array_grow_end(images, 1);
-                    jl_array_data(images, int32_t)[jl_array_nrows(images) - 1] = ACTIVATION_IMAGE_SELF;
+                    keys[seen] = ACTIVATION_IMAGE_SELF;
                 }
                 jl_svecset(record, ACTIVATION_RECORD_IMAGES, (jl_value_t*)images);
                 // Detach the record's invalidation lists before queueing. Rooting them
