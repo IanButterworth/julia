@@ -3382,56 +3382,66 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
             jl_queue_for_serialization(&s, module_init_order);
         }
         // step 1.1: as needed, serialize the data needed for insertion into the running system
-        arraylist_t cert_lists; // (cert, slot, list) triples
-        arraylist_new(&cert_lists, 0);
-        jl_array_t *unseen = NULL;
-        size_t unseen_seen = 0;
+        arraylist_t record_lists; // (record, slot, list) triples
+        arraylist_new(&record_lists, 0);
+        jl_array_t *images = NULL;
+        size_t images_seen = 0;
         size_t nblobs_now = n_linkage_blobs();
-        JL_GC_PUSH1(&unseen);
+        JL_GC_PUSH1(&images);
         if (extext_methods) {
-            // Detach each certificate's invalidation lists before queueing. Slot 2
-            // holds replaced-dispatch MethodInstances with a flag, and slot 3 holds
-            // invalidated callers. Rooting them here would save dead objects into the
-            // image, so they are pruned and requeued below.
             for (size_t i = 1, nex = jl_array_nrows(extext_methods); i < nex; i += 2) {
-                jl_value_t *cert = jl_array_ptr_ref(extext_methods, i);
-                if (cert == jl_nothing)
+                jl_value_t *record = jl_array_ptr_ref(extext_methods, i);
+                if (record == jl_nothing)
                     continue;
-                for (int slot = 2; slot <= 3; slot++) {
-                    jl_value_t *lst = jl_svecref(cert, slot);
+                // The record covers the images loaded when the method activated, which
+                // this image names by dependency index, and the image being built. An
+                // image this file cannot name is left out of the coverage: a record of
+                // the method's interaction with it would have to come from elsewhere.
+                // A record computed against a method of such an image is dropped: the
+                // loader could not resolve that method to check the record still applies.
+                jl_value_t *seenv = jl_svecref(record, ACTIVATION_RECORD_IMAGES);
+                assert(jl_is_long(seenv));
+                size_t seen = (size_t)jl_unbox_long(seenv);
+                int32_t *dm = s.buildid_depmods_idxs ? jl_array_data(s.buildid_depmods_idxs, int32_t) : NULL;
+                int nameable = dm != NULL;
+                jl_value_t *methods = jl_svecref(record, ACTIVATION_RECORD_METHODS);
+                if (nameable && methods != jl_nothing) {
+                    for (size_t k = 0, nm = jl_array_nrows((jl_array_t*)methods); k < nm && nameable; k++) {
+                        jl_value_t *m = jl_array_ptr_ref((jl_array_t*)methods, k);
+                        if (jl_object_in_image(m) && dm[external_blob_index(m)] < 0)
+                            nameable = 0;
+                    }
+                }
+                if (!nameable) {
+                    jl_array_ptr_set(extext_methods, i, jl_nothing);
+                    continue;
+                }
+                if (images == NULL || images_seen != seen) {
+                    // one key list per distinct set of images, shared by the records
+                    // of the methods activated with the same images loaded
+                    images = jl_alloc_array_1d(jl_array_int32_type, 0);
+                    images_seen = seen;
+                    for (size_t b = 0; b < seen && b < nblobs_now; b++) {
+                        if (dm[b] < 0)
+                            continue; // not a dependency, so not nameable
+                        jl_array_grow_end(images, 1);
+                        jl_array_data(images, int32_t)[jl_array_nrows(images) - 1] = dm[b];
+                    }
+                    jl_array_grow_end(images, 1);
+                    jl_array_data(images, int32_t)[jl_array_nrows(images) - 1] = ACTIVATION_IMAGE_SELF;
+                }
+                jl_svecset(record, ACTIVATION_RECORD_IMAGES, (jl_value_t*)images);
+                // Detach the record's invalidation lists before queueing. Rooting them
+                // here would save dead objects into the image, so they are pruned and
+                // requeued below.
+                for (int slot = ACTIVATION_RECORD_SPECS; slot <= ACTIVATION_RECORD_CALLERS; slot++) {
+                    jl_value_t *lst = jl_svecref(record, slot);
                     if (lst == jl_nothing)
                         continue;
-                    arraylist_push(&cert_lists, cert);
-                    arraylist_push(&cert_lists, (void*)(uintptr_t)slot);
-                    arraylist_push(&cert_lists, lst);
-                    jl_svecset(cert, slot, jl_nothing);
-                }
-                // Slot 4 counts the images loaded when the method was activated. The
-                // ones loaded later were not seen by the scan: replace the count with
-                // their dependency indices, or `nothing` if there are none.
-                jl_value_t *seenv = jl_svecref(cert, 4);
-                if (jl_is_long(seenv) && s.buildid_depmods_idxs == NULL) {
-                    jl_array_ptr_set(extext_methods, i, jl_nothing); // dependencies cannot be named: drop the certificate
-                }
-                else if (jl_is_long(seenv)) {
-                    size_t seen = (size_t)jl_unbox_long(seenv);
-                    if (seen >= nblobs_now) {
-                        jl_svecset(cert, 4, jl_nothing);
-                    }
-                    else if (unseen != NULL && unseen_seen == seen) {
-                        jl_svecset(cert, 4, (jl_value_t*)unseen); // same list as the previous certificate
-                    }
-                    else {
-                        // An image that is not a dependency gets a negative index. It is never
-                        // in the closure at load, so its methods are scanned live anyway.
-                        unseen = jl_alloc_array_1d(jl_array_int32_type, nblobs_now - seen);
-                        unseen_seen = seen;
-                        int32_t *ud = jl_array_data(unseen, int32_t);
-                        int32_t *dm = jl_array_data(s.buildid_depmods_idxs, int32_t);
-                        for (size_t b = seen; b < nblobs_now; b++)
-                            ud[b - seen] = dm[b];
-                        jl_svecset(cert, 4, (jl_value_t*)unseen);
-                    }
+                    arraylist_push(&record_lists, record);
+                    arraylist_push(&record_lists, (void*)(uintptr_t)slot);
+                    arraylist_push(&record_lists, lst);
+                    jl_svecset(record, slot, jl_nothing);
                 }
             }
             // Queue method extensions
@@ -3446,17 +3456,17 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
         if (jl_options.trim)
             record_gvars(&s, &MIs);
         jl_serialize_reachable(&s);
-        // Prune the certificate lists only now, after every other root is queued
-        // (including those from generated code), so no reachable object loses its record.
-        if (cert_lists.len > 0) {
+        // Prune the record lists only now, after every other root is queued
+        // (including those from generated code), so no reachable object loses its entry.
+        if (record_lists.len > 0) {
             // Keep an object only if it will exist at load: it is in a dependency
             // image, or it is saved in this image anyway. Dropping the rest is
-            // sound, because replay scans live counterparts made outside the closure.
-            for (size_t i = 0; i < cert_lists.len; i += 3) {
-                jl_svec_t *cert = (jl_svec_t*)cert_lists.items[i];
-                int slot = (int)(uintptr_t)cert_lists.items[i + 1];
-                jl_array_t *lst = (jl_array_t*)cert_lists.items[i + 2];
-                size_t stride = slot == 2 ? 2 : 1; // slot 2 holds (mi, flag) pairs
+            // sound, because replay scans live the counterparts of uncovered images.
+            for (size_t i = 0; i < record_lists.len; i += 3) {
+                jl_svec_t *record = (jl_svec_t*)record_lists.items[i];
+                int slot = (int)(uintptr_t)record_lists.items[i + 1];
+                jl_array_t *lst = (jl_array_t*)record_lists.items[i + 2];
+                size_t stride = slot == ACTIVATION_RECORD_SPECS ? 2 : 1; // (mi, flag) pairs
                 size_t n = jl_array_nrows(lst), ins = 0;
                 jl_value_t **d = jl_array_ptr_data(lst);
                 for (size_t k = 0; k + stride <= n; k += stride) {
@@ -3470,12 +3480,12 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
                     jl_array_del_end(lst, n - ins);
                 if (ins == 0)
                     continue; // the slot stays `nothing`
-                jl_svecset(cert, slot, (jl_value_t*)lst);
+                jl_svecset(record, slot, (jl_value_t*)lst);
                 jl_queue_for_serialization(&s, (jl_value_t*)lst);
             }
             jl_serialize_reachable(&s);
         }
-        arraylist_free(&cert_lists);
+        arraylist_free(&record_lists);
         JL_GC_POP();
         // Beyond this point, all content should already have been visited, so now we can prune
         // the rest and add some internal root arrays.
@@ -3792,7 +3802,7 @@ JL_DLLEXPORT uint32_t jl_create_system_image(void **_native_data, jl_array_t *wo
         ext_foreign_cis = NULL; // not needed anymore, free it
 
         // Collect method extensions
-        // extext_methods: [method1, cert1, ...], worklist-owned "extending external" methods added to functions owned by modules outside the worklist
+        // extext_methods: [method1, record1, ...], worklist-owned "extending external" methods added to functions owned by modules outside the worklist, each paired with its activation record (or nothing)
         extext_methods = jl_alloc_vec_any(0);
         jl_collect_extext_methods(extext_methods, mod_array);
 

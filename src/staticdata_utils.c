@@ -583,24 +583,24 @@ static jl_array_t *queue_used(jl_array_t *list, jl_query_cache *query_cache)
 // - if the method is owned by a worklist module, add it to the list of things to be
 //   verified on reloading
 // - if the method is extext, record that it needs to be reinserted later in the method table
-// The certificate of a method, if it can be saved with this image. It cannot
-// if it names a method created at run time outside the worklist, for example by
-// a dependency's `__init__`, since that object is not saved. Images loaded after
-// the method was activated are recorded in the certificate when it is saved.
-static jl_value_t *activation_cert_to_save(jl_method_t *m) JL_NOTSAFEPOINT
+// The activation record of a method, if it can be saved with this image. It
+// cannot if it names a method created at run time outside the worklist, for
+// example by a dependency's `__init__`, since that object is not saved. The images
+// the record covers are named when it is saved.
+static jl_value_t *activation_record_to_save(jl_method_t *m) JL_NOTSAFEPOINT
 {
-    jl_value_t *cert = jl_get_activation_cert(m);
-    if (cert == jl_nothing)
-        return cert;
-    jl_value_t *cd = jl_svecref(cert, 0);
-    if (cd != jl_nothing) {
-        for (size_t i = 0, l = jl_array_nrows((jl_array_t*)cd); i < l; i++) {
-            jl_method_t *mi = (jl_method_t*)jl_array_ptr_ref((jl_array_t*)cd, i);
+    jl_value_t *record = jl_get_activation_record(m);
+    if (record == jl_nothing)
+        return record;
+    jl_value_t *methods = jl_svecref(record, ACTIVATION_RECORD_METHODS);
+    if (methods != jl_nothing) {
+        for (size_t i = 0, l = jl_array_nrows((jl_array_t*)methods); i < l; i++) {
+            jl_method_t *mi = (jl_method_t*)jl_array_ptr_ref((jl_array_t*)methods, i);
             if (!jl_object_in_image((jl_value_t*)mi) && jl_object_in_image((jl_value_t*)mi->module))
                 return jl_nothing;
         }
     }
-    return cert;
+    return record;
 }
 
 static int jl_collect_methcache_from_mod(jl_typemap_entry_t *ml, void *closure) JL_CANSAFEPOINT
@@ -609,7 +609,7 @@ static int jl_collect_methcache_from_mod(jl_typemap_entry_t *ml, void *closure) 
     jl_method_t *m = ml->func.method;
     if (!jl_object_in_image((jl_value_t*)m->module)) {
         jl_array_ptr_1d_push(s, (jl_value_t*)m); // extext
-        jl_array_ptr_1d_push(s, activation_cert_to_save(m));
+        jl_array_ptr_1d_push(s, activation_record_to_save(m));
     }
     return 1;
 }
@@ -621,7 +621,7 @@ static int jl_collect_methcache_internal(jl_typemap_entry_t *ml, void *closure) 
     jl_array_t *s = (jl_array_t*)closure;
     if (jl_atomic_load_relaxed(&ml->max_world) == ~(size_t)0) {
         jl_array_ptr_1d_push(s, (jl_value_t*)ml->func.method); // extext
-        jl_array_ptr_1d_push(s, jl_nothing); // no certificate, but keep the entries in pairs
+        jl_array_ptr_1d_push(s, jl_nothing); // no activation record, but keep the entries in pairs
     }
     return 1;
 }
@@ -930,7 +930,7 @@ static int64_t write_dependency_list(ios_t *s, jl_array_t* worklist, jl_array_t 
 static void jl_add_methods(jl_array_t *external) JL_CANSAFEPOINT
 {
     size_t i, l = jl_array_nrows(external);
-    for (i = 0; i < l; i += 2) { // (method, activation certificate) pairs
+    for (i = 0; i < l; i += 2) { // (method, activation record) pairs
         jl_method_t *meth = (jl_method_t*)jl_array_ptr_ref(external, i);
         assert(jl_is_method(meth));
         assert(!meth->is_for_opaque_closure);
@@ -943,19 +943,24 @@ static void jl_add_methods(jl_array_t *external) JL_CANSAFEPOINT
 
 extern _Atomic(int) allow_new_worlds;
 
-// Set or clear the closure bits of the dependencies listed by 1-based index in `deps`.
-static void set_closure_deps(size_t *closure_bits, size_t nblobs, jl_array_t *depmods, jl_array_t *deps, int on) JL_NOTSAFEPOINT
+// Set in `bits` the linkage blobs of the images an activation record covers, from
+// the keys it was saved with (ACTIVATION_IMAGE_*): the sysimage, dependencies by
+// index, and the loading image itself (`self`).
+static void set_covered_images(size_t *bits, size_t nblobs, jl_array_t *depmods, size_t self, jl_array_t *images) JL_NOTSAFEPOINT
 {
-    int32_t *d = jl_array_data(deps, int32_t);
-    for (size_t k = 0, n = jl_array_nrows(deps); k < n; k++) {
-        if (d[k] < 1 || (size_t)d[k] > jl_array_nrows(depmods))
+    int32_t *d = jl_array_data(images, int32_t);
+    for (size_t k = 0, n = jl_array_nrows(images); k < n; k++) {
+        size_t idx;
+        if (d[k] == ACTIVATION_IMAGE_SYSIMG)
+            idx = 0;
+        else if (d[k] == ACTIVATION_IMAGE_SELF)
+            idx = self;
+        else if (d[k] > 0 && (size_t)d[k] <= jl_array_nrows(depmods))
+            idx = external_blob_index(jl_array_ptr_ref(depmods, d[k] - 1));
+        else
             continue;
-        size_t idx = external_blob_index(jl_array_ptr_ref(depmods, d[k] - 1));
-        if (idx >= nblobs)
-            continue;
-        size_t *w = &closure_bits[idx / (8 * sizeof(size_t))];
-        size_t bit = (size_t)1 << (idx % (8 * sizeof(size_t)));
-        *w = on ? (*w | bit) : (*w & ~bit);
+        if (idx < nblobs)
+            bits[idx / (8 * sizeof(size_t))] |= (size_t)1 << (idx % (8 * sizeof(size_t)));
     }
 }
 
@@ -971,26 +976,16 @@ static void stamp_remaining_methods(jl_array_t *internal, size_t world) JL_NOTSA
 
 static void jl_activate_methods(jl_array_t *external, jl_array_t *internal, size_t world, const char *pkgname, jl_array_t *depmods) JL_CANSAFEPOINT
 {
-    // Mark which images are in this package's dependency closure: the sysimage,
-    // every dependency, and this image itself.
+    // The bitset over linkage blobs of the images the activating method's record
+    // covers, and the blob of the loading image itself, which owns the external methods.
     size_t nblobs = n_linkage_blobs();
     size_t nwords = (nblobs + 8 * sizeof(size_t) - 1) / (8 * sizeof(size_t));
-    size_t *closure_bits = (size_t*)calloc_s((nwords ? nwords : 1) * sizeof(size_t));
-    closure_bits[0] |= 1; // the sysimage
-    if (depmods) {
-        for (size_t i = 0, ld = jl_array_nrows(depmods); i < ld; i++) {
-            size_t idx = external_blob_index(jl_array_ptr_ref(depmods, i));
-            if (idx < nblobs)
-                closure_bits[idx / (8 * sizeof(size_t))] |= (size_t)1 << (idx % (8 * sizeof(size_t)));
-        }
-    }
-    for (size_t i = 0, le = jl_array_nrows(external); i < le; i += 2) {
+    size_t *covered_bits = (size_t*)calloc_s((nwords ? nwords : 1) * sizeof(size_t));
+    size_t self = nblobs;
+    for (size_t i = 0, le = jl_array_nrows(external); i < le && self == nblobs; i += 2) {
         jl_typemap_entry_t *entry = (jl_typemap_entry_t*)jl_array_ptr_ref(external, i);
-        size_t idx = external_blob_index((jl_value_t*)entry->func.method);
-        if (idx < nblobs)
-            closure_bits[idx / (8 * sizeof(size_t))] |= (size_t)1 << (idx % (8 * sizeof(size_t)));
+        self = external_blob_index((jl_value_t*)entry->func.method);
     }
-    jl_set_loading_closure_blobs(closure_bits, nblobs);
     size_t i, l = jl_array_nrows(internal);
     for (i = 0; i < l; i++) {
         // allow_new_worlds doesn't matter here, since we aren't actually changing anything external
@@ -1022,46 +1017,43 @@ static void jl_activate_methods(jl_array_t *external, jl_array_t *internal, size
         if (!jl_atomic_load_relaxed(&allow_new_worlds)) {
             jl_printf(JL_STDERR, "WARNING: Method changes for %s have been disabled via a call to disable_new_worlds.\n", pkgname);
             stamp_remaining_methods(internal, world);
-            jl_set_loading_closure_blobs(NULL, 0);
-            free(closure_bits);
+            free(covered_bits);
             return;
         }
-        // Images the precompile worker loaded after a method's activation were not
-        // seen by its certificate's scan. They are dependencies here, so take them
-        // out of the closure while that method activates: their methods and
-        // specializations then go through the live scan of outside methods.
-        jl_array_t *unseen = NULL;
+        // Each method activates with the coverage of its record installed: the images
+        // the record names, resolved through the dependency list. Methods activated
+        // with the same images loaded share one key list, so this is rarely redone.
+        // A record of the method from another source, covering an image this one
+        // does not (a sibling, say), would be unioned into the same coverage here.
+        jl_array_t *images = NULL;
         for (i = 0; i < l; i += 2) {
             jl_typemap_entry_t *entry = (jl_typemap_entry_t*)jl_array_ptr_ref(external, i);
-            jl_value_t *cert = jl_array_ptr_ref(external, i + 1);
-            jl_array_t *certunseen = cert != jl_nothing && jl_is_array(jl_svecref((jl_svec_t*)cert, 4)) ?
-                                     (jl_array_t*)jl_svecref((jl_svec_t*)cert, 4) : NULL;
-            if (certunseen != unseen) {
-                if (unseen != NULL)
-                    set_closure_deps(closure_bits, nblobs, depmods, unseen, 1);
-                unseen = certunseen;
-                if (unseen != NULL) {
-                    if (depmods == NULL) {
-                        unseen = NULL;
-                        cert = jl_nothing;
-                    }
-                    else {
-                        set_closure_deps(closure_bits, nblobs, depmods, unseen, 0);
-                    }
-                }
-                jl_set_loading_closure_blobs(closure_bits, nblobs);
+            jl_value_t *record = jl_array_ptr_ref(external, i + 1);
+            if (record != jl_nothing && depmods == NULL)
+                record = jl_nothing; // the images it covers cannot be resolved
+            jl_array_t *rimages = NULL;
+            if (record != jl_nothing) {
+                rimages = (jl_array_t*)jl_svecref((jl_svec_t*)record, ACTIVATION_RECORD_IMAGES);
+                assert(jl_is_array(rimages));
+            }
+            if (rimages != images) {
+                images = rimages;
+                memset(covered_bits, 0, nwords * sizeof(size_t));
+                if (images != NULL)
+                    set_covered_images(covered_bits, nblobs, depmods, self, images);
+                jl_set_activation_coverage(images != NULL ? covered_bits : NULL, images != NULL ? nblobs : 0);
             }
             jl_atomic_store_release(&entry->func.method->primary_world, world);
             //uint64_t t0 = uv_hrtime();
-            jl_method_table_activate_with_cert(entry, cert == jl_nothing ? NULL : (jl_svec_t*)cert);
+            jl_method_table_activate_with_record(entry, record == jl_nothing ? NULL : (jl_svec_t*)record);
             //jl_printf(JL_STDERR, "%f ", (double)(uv_hrtime() - t0) / 1e6);
             //jl_static_show(JL_STDERR, entry->func.value);
             //jl_printf(JL_STDERR, "\n");
         }
     }
     stamp_remaining_methods(internal, world);
-    jl_set_loading_closure_blobs(NULL, 0);
-    free(closure_bits);
+    jl_set_activation_coverage(NULL, 0);
+    free(covered_bits);
 }
 
 static int jl_copy_roots(jl_array_t *method_roots_list, uint64_t key) JL_CANSAFEPOINT

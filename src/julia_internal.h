@@ -1445,11 +1445,28 @@ JL_DLLEXPORT size_t jl_linkage_blob_dep_world(size_t image, size_t blob) JL_NOTS
 // The world since which every method on the typenames of `sig` in `mt` came from `image` or one of its dependencies, else 0 (gf.c).
 JL_DLLEXPORT size_t jl_sig_contributors_world(jl_value_t *sig, jl_methtable_t *mt, size_t image) JL_CANSAFEPOINT;
 size_t jl_n_linkage_blobs(void) JL_NOTSAFEPOINT;
-// method activation certificates and their replay at load (gf.c, staticdata_utils.c)
-void jl_method_table_activate_with_cert(jl_typemap_entry_t *newentry, jl_svec_t *cert) JL_CANSAFEPOINT;
-JL_DLLEXPORT jl_value_t *jl_get_activation_cert(jl_method_t *method) JL_NOTSAFEPOINT;
-extern JL_DLLEXPORT jl_genericmemory_t *jl_activation_certs JL_GLOBALLY_ROOTED;
-JL_DLLEXPORT void jl_set_loading_closure_blobs(size_t *bits, size_t nblobs) JL_NOTSAFEPOINT;
+// method activation records (gf.c, staticdata.c): what a precompile worker's
+// activation of a method found against the images it had loaded, replayed at load
+void jl_method_table_activate_with_record(jl_typemap_entry_t *newentry, jl_svec_t *record) JL_CANSAFEPOINT;
+JL_DLLEXPORT jl_value_t *jl_get_activation_record(jl_method_t *method) JL_NOTSAFEPOINT;
+extern JL_DLLEXPORT jl_genericmemory_t *jl_activation_records JL_GLOBALLY_ROOTED;
+JL_DLLEXPORT void jl_set_activation_coverage(size_t *bits, size_t nblobs) JL_NOTSAFEPOINT;
+// Slots of an activation record, an svec kept per activated method and saved paired
+// with the method in the image's list of methods extending external functions.
+enum activation_record_slot {
+    ACTIVATION_RECORD_IMAGES = 0, // the images the record covers: in the worker, the count of
+                                  // linkage blobs loaded at activation (all of them, plus the image
+                                  // being built); once saved, an Int32 array of ACTIVATION_IMAGE_* keys
+    ACTIVATION_RECORD_METHODS,    // the intersecting methods seen, or nothing
+    ACTIVATION_RECORD_FLAGS,      // Int32 per method: 1 = more specific than the new one, 2 = ambiguous
+    ACTIVATION_RECORD_SPECS,      // (specialization, replaced::Int32) pairs invalidated, or nothing
+    ACTIVATION_RECORD_CALLERS,    // callers invalidated through missing-method edges, or nothing
+    ACTIVATION_RECORD_NSLOTS
+};
+// Keys naming the images a saved record covers: the sysimage, the k-th dependency
+// of the image (depmods[k-1]) for k >= 1, or the image the record is saved in.
+#define ACTIVATION_IMAGE_SYSIMG 0
+#define ACTIVATION_IMAGE_SELF (-1)
 // GC configuration baked into generated code; must match between an image and the runtime that loads it.
 JL_DLLEXPORT const char *jl_gc_image_abi(void) JL_NOTSAFEPOINT;
 

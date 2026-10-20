@@ -2345,8 +2345,8 @@ end
 
 precompile_test_harness("activation replay: worklist-owned method tables") do load_path
     # methods of a method table the package itself defines carry no activation
-    # certificate; they must not break the (method, certificate) pairing of the
-    # image's method list (Revise's "External method tables" test found this)
+    # record; they must not break the (method, record) pairing of the image's
+    # method list (Revise's "External method tables" test found this)
     write(joinpath(load_path, "ReplayOverlay.jl"),
         """
         module ReplayOverlay
@@ -2371,7 +2371,7 @@ precompile_test_harness("activation replay: worklist-owned method tables") do lo
     @test out == "1 1 1"
 end
 
-precompile_test_harness("activation replay: certificate validity") do load_path
+precompile_test_harness("activation replay: record validity") do load_path
     write(joinpath(load_path, "ActReplayDep.jl"),
         """
         module ActReplayDep
@@ -2423,7 +2423,7 @@ precompile_test_harness("activation replay: certificate validity") do load_path
     @test out == "pkg"
 end
 
-precompile_test_harness("activation replay: certificate kept across a later image") do load_path
+precompile_test_harness("activation replay: record covers only the images seen") do load_path
     write(joinpath(load_path, "ActKeepDep.jl"),
         """
         module ActKeepDep

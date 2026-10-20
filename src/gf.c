@@ -2373,15 +2373,15 @@ static int get_intersect_visitor(jl_typemap_entry_t *oldentry, struct typemap_in
     return 1;
 }
 
-static int method_in_loading_closure(jl_method_t *m) JL_NOTSAFEPOINT;
+static int method_covered_by_record(jl_method_t *m) JL_NOTSAFEPOINT;
 
-static int intersect_entry_foreign(jl_typemap_entry_t *ml, struct typemap_intersection_env *closure) JL_NOTSAFEPOINT
+static int intersect_entry_uncovered(jl_typemap_entry_t *ml, struct typemap_intersection_env *closure) JL_NOTSAFEPOINT
 {
-    // only methods the precompile worker could not have seen
-    return !method_in_loading_closure(ml->func.method);
+    // only methods of images the activation record does not cover
+    return !method_covered_by_record(ml->func.method);
 }
 
-static jl_value_t *get_intersect_matches(jl_typemap_t *defs, jl_typemap_entry_t *newentry, jl_typemap_entry_t **replaced, size_t world, int foreign_only) JL_CANSAFEPOINT
+static jl_value_t *get_intersect_matches(jl_typemap_t *defs, jl_typemap_entry_t *newentry, jl_typemap_entry_t **replaced, size_t world, int uncovered_only) JL_CANSAFEPOINT
 {
     jl_tupletype_t *type = newentry->sig;
     jl_tupletype_t *ttypes = (jl_tupletype_t*)jl_unwrap_unionall((jl_value_t*)type);
@@ -2399,7 +2399,7 @@ static jl_value_t *get_intersect_matches(jl_typemap_t *defs, jl_typemap_entry_t 
             /* .min_valid = */ world, /* .max_valid = */ world,
             /* .ti = */ NULL, /* .env = */ NULL, /* .issubty = */ 0,
             /* .emptiness_only = */ 1,
-            /* .entry_filter = */ foreign_only ? intersect_entry_foreign : NULL},
+            /* .entry_filter = */ uncovered_only ? intersect_entry_uncovered : NULL},
         /* .newentry = */ newentry, /* .shadowed */ NULL, /* .replaced */ NULL};
     JL_GC_PUSH3(&env.match.env, &env.match.ti, &env.shadowed);
     jl_typemap_intersection_visitor(defs, 0, &env.match);
@@ -2942,44 +2942,54 @@ JL_DLLEXPORT size_t jl_sig_contributors_world(jl_value_t *sig, jl_methtable_t *m
     return decomposed && env.clean ? env.world : 0;
 }
 
-// ---- method activation replay ----
-// The bitset over linkage blobs of the images in the loading image's dependency
-// closure, installed by the loader (jl_activate_methods) around each method
-// activation it replays a certificate for, and NULL otherwise.
-static size_t *jl_loading_closure_bits = NULL;
-static size_t jl_loading_closure_nblobs = 0;
-
-JL_DLLEXPORT void jl_set_loading_closure_blobs(size_t *bits, size_t nblobs) JL_NOTSAFEPOINT
+static int blob_in_bitset(const size_t *bits, size_t nblobs, size_t idx) JL_NOTSAFEPOINT
 {
-    jl_loading_closure_bits = bits;
-    jl_loading_closure_nblobs = nblobs;
-}
-
-static int blob_in_loading_closure(size_t idx) JL_NOTSAFEPOINT
-{
-    if (idx >= jl_loading_closure_nblobs)
+    if (idx >= nblobs)
         return 0;
-    return (jl_loading_closure_bits[idx / (8 * sizeof(size_t))] >> (idx % (8 * sizeof(size_t)))) & 1;
+    return (bits[idx / (8 * sizeof(size_t))] >> (idx % (8 * sizeof(size_t)))) & 1;
 }
 
-static int object_in_loading_closure(jl_value_t *v) JL_NOTSAFEPOINT
+// ---- method activation records ----
+// A precompile worker records, for every method it activates, what the activation
+// found against the images loaded at that moment (see the ACTIVATION_RECORD_*
+// slots): the intersecting methods with their specificity flags, the
+// (specialization, replaced) pairs it invalidated, and the callers it invalidated
+// through missing-method edges. A record covers a set of images: it is the
+// method's interaction with each of them, and the part owned by one image is the
+// slice of each list that image owns. Today the only record of a method is the
+// worker's own, covering the images it had loaded, saved with the image. A record
+// covering a single sibling image, which the loader would have to get from a
+// separate database, has the same shape, and the loader would union the coverage.
+//
+// At load, activation applies the record to the images it covers and scans live
+// only the methods, specializations and callers owned by uncovered images. Each
+// side sees part of the intersecting set, and the replacement and missing-edge
+// checks can only invalidate more when given fewer methods, so a partial view
+// over-invalidates at worst.
+JL_DLLEXPORT jl_genericmemory_t *jl_activation_records = NULL; // only filled in the precompile worker
+
+// Bitset over linkage blobs of the images covered by the record of the method
+// that is activating, installed by the loader around each replayed activation.
+static size_t *activation_covered_bits = NULL;
+static size_t activation_covered_nblobs = 0;
+
+JL_DLLEXPORT void jl_set_activation_coverage(size_t *bits, size_t nblobs) JL_NOTSAFEPOINT
+{
+    activation_covered_bits = bits;
+    activation_covered_nblobs = nblobs;
+}
+
+static int object_covered_by_record(jl_value_t *v) JL_NOTSAFEPOINT
 {
     if (!jl_object_in_image(v))
         return 0;
-    return blob_in_loading_closure(jl_external_blob_index(v));
+    return blob_in_bitset(activation_covered_bits, activation_covered_nblobs, jl_external_blob_index(v));
 }
 
-static int method_in_loading_closure(jl_method_t *m) JL_NOTSAFEPOINT
+static int method_covered_by_record(jl_method_t *m) JL_NOTSAFEPOINT
 {
-    return object_in_loading_closure((jl_value_t*)m);
+    return object_covered_by_record((jl_value_t*)m);
 }
-
-// Each precompile worker records, for every method it activates, a certificate of
-// what the activation found: svec(intersecting methods, their specificity flags,
-// (specialization, replaced) pairs it invalidated, callers it invalidated through
-// missing-method edges). Loading replays it for the methods the worker saw and scans
-// only the ones it could not have seen.
-JL_DLLEXPORT jl_genericmemory_t *jl_activation_certs = NULL; // only filled in the precompile worker
 
 static int activate_replay_mode(void) JL_NOTSAFEPOINT
 {
@@ -2992,33 +3002,34 @@ static int activate_replay_mode(void) JL_NOTSAFEPOINT
     return mode;
 }
 
-static void record_activation_cert(jl_method_t *method, jl_svec_t *cert) JL_CANSAFEPOINT
+static void record_activation(jl_method_t *method, jl_svec_t *record) JL_CANSAFEPOINT
 {
-    if (jl_activation_certs == NULL)
-        jl_activation_certs = (jl_genericmemory_t*)jl_an_empty_memory_any;
-    jl_genericmemory_t *newtable = jl_eqtable_put(jl_activation_certs, (jl_value_t*)method, (jl_value_t*)cert, NULL);
-    if (newtable != jl_activation_certs)
-        jl_activation_certs = newtable;
+    if (jl_activation_records == NULL)
+        jl_activation_records = (jl_genericmemory_t*)jl_an_empty_memory_any;
+    jl_genericmemory_t *newtable = jl_eqtable_put(jl_activation_records, (jl_value_t*)method, (jl_value_t*)record, NULL);
+    if (newtable != jl_activation_records)
+        jl_activation_records = newtable;
 }
 
-JL_DLLEXPORT jl_value_t *jl_get_activation_cert(jl_method_t *method) JL_NOTSAFEPOINT
+JL_DLLEXPORT jl_value_t *jl_get_activation_record(jl_method_t *method) JL_NOTSAFEPOINT
 {
-    if (jl_activation_certs == NULL)
+    if (jl_activation_records == NULL)
         return jl_nothing;
-    jl_value_t *cert = jl_eqtable_get(jl_activation_certs, (jl_value_t*)method, NULL);
-    return cert == NULL ? jl_nothing : cert;
+    jl_value_t *record = jl_eqtable_get(jl_activation_records, (jl_value_t*)method, NULL);
+    return record == NULL ? jl_nothing : record;
 }
 
-// Does every contributor to the typenames of a signature in `mt` lie in the
-// loading closure? Then the certificate's scan saw all the methods there.
-struct _typename_check_closure_env {
+// Does every contributor to the typenames of a signature in `mt` lie in an image
+// the activating method's record covers? Then the record's scan saw every method
+// on those typenames.
+struct _typename_check_covered_env {
     jl_methtable_t *mt;
     int clean;
 };
 
-static void _typename_check_closure(jl_typename_t *tn, int explct, void *env0) JL_NOTSAFEPOINT
+static void _typename_check_covered(jl_typename_t *tn, int explct, void *env0) JL_NOTSAFEPOINT
 {
-    struct _typename_check_closure_env *env = (struct _typename_check_closure_env*)env0;
+    struct _typename_check_covered_env *env = (struct _typename_check_covered_env*)env0;
     (void)explct;
     if (!env->clean)
         return;
@@ -3029,7 +3040,7 @@ static void _typename_check_closure(jl_typename_t *tn, int explct, void *env0) J
     size_t l = jl_array_nrows(tags);
     int32_t *d = jl_array_data(tags, int32_t);
     for (size_t i = 0; i < l; i++) {
-        if (d[i] < 0 || !blob_in_loading_closure((size_t)d[i])) {
+        if (d[i] < 0 || !blob_in_bitset(activation_covered_bits, activation_covered_nblobs, (size_t)d[i])) {
             env->clean = 0;
             return;
         }
@@ -3044,10 +3055,10 @@ struct _typename_invalidate_backedge {
     size_t n;
     size_t max_world;
     int invalidated;
-    jl_array_t *record; // precompile worker: collects invalidated callers for the certificate
-    // When replaying a certificate, callers inside the closure were already handled
-    // by the replay, so we only drop the dead ones and keep the live ones.
-    int foreign_only;
+    jl_array_t *callers; // precompile worker: collects the invalidated callers for the activation record
+    // When replaying a record, the callers it covers were already handled by the
+    // replay, so we only drop the dead ones and keep the live ones.
+    int uncovered_only;
 };
 
 static void _typename_invalidate_backedges(jl_typename_t *tn, int explct, void *env0) JL_CANSAFEPOINT
@@ -3070,17 +3081,17 @@ static void _typename_invalidate_backedges(jl_typename_t *tn, int explct, void *
         JL_GC_PROMISE_ROOTED(backedgetyp);
         JL_GC_PROMISE_ROOTED(callers);
         size_t j, l = jl_array_nrows(callers);
-        if (env->foreign_only) {
-            // The certificate replay already invalidated callers inside the closure.
-            // Drop the dead ones, keep the live ones, and only check the intersection
-            // again if some caller is from outside the closure.
+        if (env->uncovered_only) {
+            // The record replay already invalidated the callers it covers. Drop the
+            // dead ones, keep the live ones, and only check the intersection again
+            // if some caller is owned by an uncovered image.
             size_t keep = 0;
-            int foreign = 0;
+            int uncovered = 0;
             for (j = 0; j < l; j++) {
                 jl_code_instance_t *backedge = (jl_code_instance_t*)jl_array_ptr_ref(callers, j);
                 JL_GC_PROMISE_ROOTED(backedge);
-                if (!object_in_loading_closure((jl_value_t*)backedge))
-                    foreign = 1;
+                if (!object_covered_by_record((jl_value_t*)backedge))
+                    uncovered = 1;
                 else if (jl_atomic_load_relaxed(&backedge->max_world) != ~(size_t)0)
                     continue;
                 jl_array_ptr_set(callers, keep++, (jl_value_t*)backedge);
@@ -3089,7 +3100,7 @@ static void _typename_invalidate_backedges(jl_typename_t *tn, int explct, void *
                 jl_array_del_end((jl_array_t*)callers, l - keep);
                 l = keep;
             }
-            if (!foreign) {
+            if (!uncovered) {
                 if (l == 0) {
                     // remove this entry
                     jl_gc_write_atomic(table, tab[i], jl_value_t, jl_nothing, relaxed); // clear the key
@@ -3134,15 +3145,15 @@ static void _typename_invalidate_backedges(jl_typename_t *tn, int explct, void *
             for (j = 0; j < l; j++) {
                 jl_code_instance_t *backedge = (jl_code_instance_t*)jl_array_ptr_ref(callers, j);
                 JL_GC_PROMISE_ROOTED(backedge);
-                if (env->foreign_only && object_in_loading_closure((jl_value_t*)backedge)) {
-                    // the certificate replay already handled it, and it is still live
+                if (env->uncovered_only && object_covered_by_record((jl_value_t*)backedge)) {
+                    // the record replay already handled it, and it is still live
                     jl_array_ptr_set(callers, keep++, (jl_value_t*)backedge);
                     continue;
                 }
                 invalidate_code_instance(backedge, env->max_world, 0);
                 env->invalidated = 1;
-                if (env->record)
-                    jl_array_ptr_1d_push(env->record, (jl_value_t*)backedge);
+                if (env->callers)
+                    jl_array_ptr_1d_push(env->callers, (jl_value_t*)backedge);
                 if (_jl_debug_method_invalidation)
                     jl_array_ptr_1d_push(_jl_debug_method_invalidation, (jl_value_t*)backedgetyp);
             }
@@ -3743,10 +3754,12 @@ static int check_fully_ambiguous(jl_method_t *m, jl_value_t *ti, jl_array_t *t, 
 
 void jl_method_table_activate(jl_typemap_entry_t *newentry)
 {
-    jl_method_table_activate_with_cert(newentry, NULL);
+    jl_method_table_activate_with_record(newentry, NULL);
 }
 
-void jl_method_table_activate_with_cert(jl_typemap_entry_t *newentry, jl_svec_t *cert) JL_CANSAFEPOINT
+// Activate `newentry`, replaying `record` (an activation record of its method, or
+// NULL) for the images jl_set_activation_coverage says it covers.
+void jl_method_table_activate_with_record(jl_typemap_entry_t *newentry, jl_svec_t *record) JL_CANSAFEPOINT
 {
     JL_TIMING(ADD_METHOD, ADD_METHOD);
     jl_method_t *method = newentry->func.method;
@@ -3769,39 +3782,40 @@ void jl_method_table_activate_with_cert(jl_typemap_entry_t *newentry, jl_svec_t 
     jl_value_t *isect = NULL;
     jl_value_t *isect2 = NULL;
     jl_genericmemory_t *interferences = NULL;
-    jl_svec_t *newcert = NULL;
-    jl_array_t *tnrecord = NULL; // callers invalidated through missing-method edges, for the certificate
-    jl_value_t *foreign_oldvalue = NULL;
-    JL_GC_PUSH9(&oldvalue, &oldmi, &loctag, &isect, &isect2, &interferences, &newcert, &tnrecord, &foreign_oldvalue);
-    int record_cert = jl_generating_output() && jl_options.incremental && mt == jl_method_table;
-    int closure_clean = 0;
-    if (cert != NULL && activate_replay_mode() && jl_loading_closure_bits != NULL && mt == jl_method_table) {
-        struct _typename_check_closure_env check = {mt, /* .clean = */ 1};
-        int decomposed = jl_foreach_top_typename_for(_typename_check_closure, type, 1, &check);
-        closure_clean = decomposed && check.clean;
+    jl_svec_t *newrecord = NULL;
+    jl_array_t *callers = NULL; // callers invalidated through missing-method edges, for the record
+    jl_value_t *uncovered_oldvalue = NULL;
+    JL_GC_PUSH9(&oldvalue, &oldmi, &loctag, &isect, &isect2, &interferences, &newrecord, &callers, &uncovered_oldvalue);
+    int recording = jl_generating_output() && jl_options.incremental && mt == jl_method_table;
+    int replaying = record != NULL && jl_svec_len(record) == ACTIVATION_RECORD_NSLOTS && activate_replay_mode() &&
+                    activation_covered_bits != NULL && mt == jl_method_table;
+    int all_covered = 0;
+    if (replaying) {
+        struct _typename_check_covered_env check = {mt, /* .clean = */ 1};
+        int decomposed = jl_foreach_top_typename_for(_typename_check_covered, type, 1, &check);
+        all_covered = decomposed && check.clean;
     }
     jl_typemap_entry_t *replaced = NULL;
-    int replaying = cert != NULL && jl_svec_len(cert) == 5 && activate_replay_mode() &&
-                    jl_loading_closure_bits != NULL && mt == jl_method_table;
-    if (replaying && jl_svecref(cert, 0) != jl_nothing) {
-        // A method the worker saw may have been deleted since. The certificate would
-        // still count it as a witness, so scan everything instead. A method of this
-        // image that is not activated yet is not deleted: it activates in this world too,
+    jl_value_t *rmethods = replaying ? jl_svecref(record, ACTIVATION_RECORD_METHODS) : jl_nothing;
+    if (rmethods != jl_nothing) {
+        // A method the worker saw may have been deleted since. The record would still
+        // count it as a witness, so scan everything instead. A method of this image
+        // that is not activated yet is not deleted: it activates in this world too,
         // since precompilation can neither delete nor overwrite methods.
-        jl_array_t *cd = (jl_array_t*)jl_svecref(cert, 0);
-        for (size_t i = 0, l = jl_array_nrows(cd); i < l && replaying; i++) {
-            jl_method_t *m = (jl_method_t*)jl_array_ptr_ref(cd, i);
+        jl_array_t *rm = (jl_array_t*)rmethods;
+        for (size_t i = 0, l = jl_array_nrows(rm); i < l && replaying; i++) {
+            jl_method_t *m = (jl_method_t*)jl_array_ptr_ref(rm, i);
             if (!(jl_atomic_load_relaxed(&m->dispatch_status) & METHOD_SIG_LATEST_WHICH) &&
                 jl_atomic_load_relaxed(&m->primary_world) != ~(size_t)0)
                 replaying = 0;
         }
     }
-    // With a certificate, we replay what the precompile worker found for methods in
-    // the closure, and only scan the methods it could not have seen. Each pass sees
-    // only part of the intersecting methods. The replacement and missing-edge checks
+    // With a record, we replay what the precompile worker found for the images it
+    // covers, and only scan the methods of uncovered images. Each pass sees only
+    // part of the intersecting methods. The replacement and missing-edge checks
     // can only invalidate more when given fewer methods, never less, so this is safe.
-    if (replaying && closure_clean) {
-        // No method from outside the closure is under any of this signature's
+    if (replaying && all_covered) {
+        // No method of an uncovered image is under any of this signature's
         // typenames, so the scan would find nothing. Edge replay relies on the same fact.
         oldvalue = NULL;
     }
@@ -3809,12 +3823,12 @@ void jl_method_table_activate_with_cert(jl_typemap_entry_t *newentry, jl_svec_t 
         oldvalue = get_intersect_matches(jl_atomic_load_relaxed(&mt->defs), newentry, &replaced, max_world, replaying);
     }
     if (replaying && replaced != NULL) {
-        // a method from outside the closure has the exact same signature, so the
-        // certificate does not apply; do the full scan
+        // a method of an uncovered image has the exact same signature, so the
+        // record does not apply; do the full scan
         replaying = 0;
         oldvalue = get_intersect_matches(jl_atomic_load_relaxed(&mt->defs), newentry, &replaced, max_world, 0);
     }
-    record_cert = record_cert && !replaying;
+    recording = recording && !replaying;
     jl_method_t *const *d;
     size_t j, n;
     if (oldvalue == NULL) {
@@ -3841,12 +3855,12 @@ void jl_method_table_activate_with_cert(jl_typemap_entry_t *newentry, jl_svec_t 
     interferences = (jl_genericmemory_t*)jl_atomic_load_relaxed(&method->interferences);
     size_t interferences_max = jl_idset_max(interferences);
     if (replaying) {
-        foreign_oldvalue = oldvalue;
-        // The precompile worker saw the same methods under these typenames, so we
+        uncovered_oldvalue = oldvalue;
+        // The precompile worker saw the same methods of the covered images, so we
         // can reuse its intersecting set, specificity flags and invalidations.
-        jl_value_t *cd = jl_svecref(cert, 0);
-        jl_array_t *cflags = (jl_array_t*)jl_svecref(cert, 1);
-        jl_value_t *cmis = jl_svecref(cert, 2);
+        jl_value_t *cd = rmethods;
+        jl_array_t *cflags = (jl_array_t*)jl_svecref(record, ACTIVATION_RECORD_FLAGS);
+        jl_value_t *cmis = jl_svecref(record, ACTIVATION_RECORD_SPECS);
         if (cd != jl_nothing) {
             oldvalue = cd;
             d = (jl_method_t**)jl_array_ptr_data((jl_array_t*)oldvalue);
@@ -3883,15 +3897,15 @@ void jl_method_table_activate_with_cert(jl_typemap_entry_t *newentry, jl_svec_t 
                 jl_method_instance_t *unspec = jl_atomic_load_relaxed(&m->unspecialized);
                 if (unspec)
                     OLDMI_PUSH(unspec);
-                // scan only the specializations the worker could not have seen
+                // scan only the specializations owned by uncovered images
                 loctag = jl_atomic_load_relaxed(&m->specializations);
                 size_t l = jl_is_svec(loctag) ? jl_svec_len(loctag) : 1;
                 for (size_t i = 0; i < l; i++) {
                     jl_method_instance_t *mi = (jl_method_instance_t*)(jl_is_svec(loctag) ? jl_svecref(loctag, i) : loctag);
                     if ((jl_value_t*)mi == jl_nothing)
                         continue;
-                    if (object_in_loading_closure((jl_value_t*)mi))
-                        continue; // the certificate already covers it
+                    if (object_covered_by_record((jl_value_t*)mi))
+                        continue; // the record already covers it
                     if (jl_type_intersection2(type, mi->specTypes, &isect, &isect2)) {
                         int replaced_dispatch = is_replacing(ambig, type, m, d, n, isect, isect2, morespec);
                         int invalidatedmi = _invalidate_dispatch_backedges(mi, type, m, d, n, replaced_dispatch, ambig, max_world, morespec);
@@ -3928,9 +3942,9 @@ void jl_method_table_activate_with_cert(jl_typemap_entry_t *newentry, jl_svec_t 
                 }
             }
         }
-        // Callers in the closure that the worker invalidated through missing-method
-        // edges. The scan below skips callers in the closure.
-        jl_value_t *ctn = jl_svecref(cert, 3);
+        // Callers of covered images that the worker invalidated through missing-method
+        // edges. The scan below skips the callers of covered images.
+        jl_value_t *ctn = jl_svecref(record, ACTIVATION_RECORD_CALLERS);
         if (ctn != jl_nothing) {
             jl_array_t *cta = (jl_array_t*)ctn;
             for (size_t i = 0, lc = jl_array_nrows(cta); i < lc; i++) {
@@ -3939,10 +3953,10 @@ void jl_method_table_activate_with_cert(jl_typemap_entry_t *newentry, jl_svec_t 
                 invalidated = 1;
             }
         }
-        oldvalue = foreign_oldvalue;
+        oldvalue = uncovered_oldvalue;
     }
     if (oldvalue) {
-        // when replaying, this only covers methods from outside the closure
+        // when replaying, these are only the methods of uncovered images
         if (replaying) {
             d = (jl_method_t**)jl_array_ptr_data((jl_array_t*)oldvalue);
             n = jl_array_nrows((jl_array_t*)oldvalue);
@@ -4026,19 +4040,19 @@ void jl_method_table_activate_with_cert(jl_typemap_entry_t *newentry, jl_svec_t 
             // for a freshly defined method the set starts empty and the probe
             // would be a guaranteed-miss linear scan of the growing set.
             int check_dup_key = interferences->length > 0;
-            if (record_cert) {
-                newcert = jl_alloc_svec(5);
-                jl_svecset(newcert, 0, oldvalue);
+            if (recording) {
+                newrecord = jl_alloc_svec(ACTIVATION_RECORD_NSLOTS);
+                jl_svecset(newrecord, ACTIVATION_RECORD_METHODS, oldvalue);
                 jl_value_t *cf = (jl_value_t*)jl_alloc_array_1d(jl_array_int32_type, n);
-                jl_svecset(newcert, 1, cf);
-                jl_svecset(newcert, 2, jl_alloc_vec_any(0));
+                jl_svecset(newrecord, ACTIVATION_RECORD_FLAGS, cf);
+                jl_svecset(newrecord, ACTIVATION_RECORD_SPECS, jl_alloc_vec_any(0));
             }
             for (j = 0; j < n; j++) {
                 jl_method_t *m = d[j];
                 // Compute ambig state: is there an ambiguity between new method and old m?
                 char ambig = !morespec[j] && !jl_type_morespecific(type, m->sig);
-                if (newcert)
-                    jl_array_data((jl_array_t*)jl_svecref(newcert, 1), int32_t)[j] =
+                if (newrecord)
+                    jl_array_data((jl_array_t*)jl_svecref(newrecord, ACTIVATION_RECORD_FLAGS), int32_t)[j] =
                         (int32_t)((morespec[j] ? 1 : 0) | (ambig ? 2 : 0));
                 if (morespec[j] || ambig) {
                     // !morespecific(new, old): add the old method to this interference set
@@ -4100,8 +4114,8 @@ void jl_method_table_activate_with_cert(jl_typemap_entry_t *newentry, jl_svec_t 
                         // such that everything in `morespecific` dominates everything in `ambiguous`, and everything in `ambiguous` dominates everything in `lessspecific`
                         // And then compute where each isect falls, and whether it changed group--necessitating invalidation--or not.
                         int replaced_dispatch = is_replacing(ambig, type, m, d, n, isect, isect2, morespec);
-                        if (newcert) {
-                            jl_array_t *cmis = (jl_array_t*)jl_svecref(newcert, 2);
+                        if (newrecord) {
+                            jl_array_t *cmis = (jl_array_t*)jl_svecref(newrecord, ACTIVATION_RECORD_SPECS);
                             jl_array_ptr_1d_push(cmis, (jl_value_t*)mi);
                             // not into loctag, which still roots the specializations being walked
                             jl_value_t *flag = jl_box_int32(replaced_dispatch);
@@ -4146,11 +4160,11 @@ void jl_method_table_activate_with_cert(jl_typemap_entry_t *newentry, jl_svec_t 
     }
 
     jl_methcache_t *mc = jl_method_table->cache;
-    if (record_cert && !replaced)
-        tnrecord = jl_alloc_vec_any(0);
+    if (recording && !replaced)
+        callers = jl_alloc_vec_any(0);
     JL_LOCK(&mc->writelock);
     struct _typename_invalidate_backedge typename_env = {type, &isect, &isect2, d, n, max_world, invalidated,
-                                                         tnrecord, /* foreign_only */ replaying};
+                                                         callers, /* uncovered_only */ replaying};
     invalidate_missing_backedges(&typename_env);
     invalidated |= typename_env.invalidated;
     if (oldmi && jl_array_nrows(oldmi)) {
@@ -4185,19 +4199,21 @@ void jl_method_table_activate_with_cert(jl_typemap_entry_t *newentry, jl_svec_t 
     jl_atomic_store_relaxed(&method->dispatch_status, dispatch_bits); // TODO: this should be sequenced fully after the world counter store
     jl_gc_write_atomic(method, method->interferences, jl_genericmemory_t, interferences, release);
 #undef OLDMI_PUSH
-    if (record_cert && !replaced) {
-        if (newcert == NULL) { // no intersecting methods
-            newcert = jl_alloc_svec(5);
-            jl_svecset(newcert, 0, jl_nothing);
-            jl_svecset(newcert, 1, jl_nothing);
-            jl_svecset(newcert, 2, jl_nothing);
+    if (recording && !replaced) {
+        if (newrecord == NULL) { // no intersecting methods
+            newrecord = jl_alloc_svec(ACTIVATION_RECORD_NSLOTS);
+            jl_svecset(newrecord, ACTIVATION_RECORD_METHODS, jl_nothing);
+            jl_svecset(newrecord, ACTIVATION_RECORD_FLAGS, jl_nothing);
+            jl_svecset(newrecord, ACTIVATION_RECORD_SPECS, jl_nothing);
         }
-        jl_svecset(newcert, 3, tnrecord != NULL && jl_array_nrows(tnrecord) > 0 ?
-                               (jl_value_t*)tnrecord : jl_nothing);
-        // Images loaded after this point were not seen by this scan
+        jl_svecset(newrecord, ACTIVATION_RECORD_CALLERS, callers != NULL && jl_array_nrows(callers) > 0 ?
+                                                         (jl_value_t*)callers : jl_nothing);
+        // The record covers every image loaded so far, and the objects not in any
+        // image yet, which the image being built will own. Saving turns the count
+        // into the keys of these images.
         loctag = jl_box_long((long)jl_n_linkage_blobs());
-        jl_svecset(newcert, 4, loctag);
-        record_activation_cert(method, newcert);
+        jl_svecset(newrecord, ACTIVATION_RECORD_IMAGES, loctag);
+        record_activation(method, newrecord);
     }
     JL_GC_POP();
 }
