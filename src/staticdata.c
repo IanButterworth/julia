@@ -202,6 +202,8 @@ typedef struct {
     int coverage_compatible; // counters support the requested coverage mode
     uint32_t *closure;       // bitvector over blobs 0..idx: the images this one was
                              // loaded against, transitively, and itself
+    _Atomic(size_t) world;   // the world in which the image's methods were activated
+                             // (0 until then)
 } image_metadata_t;
 
 // Readers of the image tree take no lock: each loads the current snapshot and
@@ -278,8 +280,10 @@ static uint32_t *image_closure_new(size_t idx, jl_array_t *depmods) JL_NOTSAFEPO
     return closure;
 }
 
-// Is linkage blob `blob` in the dependency closure of linkage blob `image`?
-JL_DLLEXPORT int jl_linkage_blob_in_closure(size_t image, size_t blob) JL_NOTSAFEPOINT
+// If linkage blob `blob` is in the dependency closure of linkage blob `image`,
+// the world in which the methods of `blob` were activated, else 0. A blob in a
+// closure has been loaded in full, so its world is set.
+JL_DLLEXPORT size_t jl_linkage_blob_closure_world(size_t image, size_t blob) JL_NOTSAFEPOINT
 {
     if (blob > image)
         return 0;
@@ -287,9 +291,12 @@ JL_DLLEXPORT int jl_linkage_blob_in_closure(size_t image, size_t blob) JL_NOTSAF
     if (data == EYT_NOTFOUND)
         return 0;
     image_metadata_t *meta = (image_metadata_t*)data;
-    if (meta->closure == NULL)
+    if (meta->closure == NULL || !bitvector_get(meta->closure, blob))
         return 0;
-    return bitvector_get(meta->closure, blob) != 0;
+    image_metadata_t *blobmeta = (image_metadata_t*)eyt_tree_range_data(&image_tree, blob);
+    size_t world = jl_atomic_load_relaxed(&blobmeta->world);
+    assert(world != 0);
+    return world;
 }
 
 JL_DLLEXPORT uint8_t jl_object_in_image(jl_value_t *obj) JL_NOTSAFEPOINT
@@ -4202,7 +4209,8 @@ static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
                                                  jl_array_t **extext_methods JL_REQUIRE_ROOTED_SLOT,
                                                  jl_array_t **internal_methods JL_REQUIRE_ROOTED_SLOT,
                                                  jl_array_t **method_roots_list JL_REQUIRE_ROOTED_SLOT,
-                                                 pkgcachesizes *cachesizes) JL_CANSAFEPOINT JL_GC_DISABLED
+                                                 pkgcachesizes *cachesizes,
+                                                 image_metadata_t **meta_out) JL_CANSAFEPOINT JL_GC_DISABLED
 {
     jl_task_t *ct = jl_current_task;
     int en = jl_gc_enable(0);
@@ -4730,6 +4738,11 @@ static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
     meta->base = (uintptr_t)image_base;
     meta->relocs_base = (void*)relocs_base;
     meta->closure = NULL; // until the blob index is known
+    // the sysimage's methods are all active by the world it was saved in; a
+    // package image's are activated by the caller, which records that world
+    jl_atomic_store_relaxed(&meta->world, restored == NULL ? jl_require_world : 0);
+    if (meta_out)
+        *meta_out = meta;
     // adopt the image's coverage counters
     meta->coverage_compatible = jl_register_image_coverage(image->coverage, !s.incremental);
     if (restored == NULL) {
@@ -4749,7 +4762,7 @@ static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
     }
     // the blob index is the range's position, assigned under the tree's lock
     // since another image may be being added; nothing can reach this image's
-    // objects, nor ask for its closure, until the restore returns
+    // objects, nor ask for its closure, until its methods are activated
     meta->idx = eyt_tree_add_range(&image_tree,
         (uintptr_t)image_base,
         (uintptr_t)image_base + sizeof_sysimg,
@@ -4870,7 +4883,8 @@ static jl_value_t *jl_restore_package_image_from_stream(ios_t *f, jl_image_t *im
                 ios_close(f);
             ios_static_buffer(f, sysimg, len);
             pkgcachesizes cachesizes;
-            jl_restore_system_image_from_stream_(f, image, depmods, checksum, (jl_array_t**)&restored, &init_order, &extext_methods, &internal_methods, &method_roots_list, &cachesizes);
+            image_metadata_t *meta = NULL;
+            jl_restore_system_image_from_stream_(f, image, depmods, checksum, (jl_array_t**)&restored, &init_order, &extext_methods, &internal_methods, &method_roots_list, &cachesizes, &meta);
             JL_SIGATOMIC_END();
 
             // Add roots to methods
@@ -4897,6 +4911,7 @@ static jl_value_t *jl_restore_package_image_from_stream(ios_t *f, jl_image_t *im
             if (new_methods)
                 world += 1;
             jl_activate_methods(extext_methods, internal_methods, world, pkgname);
+            jl_atomic_store_relaxed(&meta->world, world);
             // TODO: inject internal_methods into caches here, so the system can see them immediately as potential candidates (before validation)
             // allow users to start running in this updated world
             if (new_methods)
@@ -4943,7 +4958,7 @@ static void jl_restore_system_image_from_stream(ios_t *f, jl_image_t *image) JL_
     ios_t f_payload;
     ios_static_buffer(&f_payload, f->buf + datastartpos, f->size - datastartpos);
     jl_restore_system_image_from_stream_(&f_payload, image, NULL,
-                                         checksum, NULL, NULL, NULL, NULL, NULL, NULL);
+                                         checksum, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
 }
 
 JL_DLLEXPORT jl_value_t *jl_restore_incremental_from_buf(jl_image_buf_t buf, jl_image_t *image, jl_array_t *depmods, int completeinfo, const char *pkgname, int needs_permalloc) JL_CANSAFEPOINT

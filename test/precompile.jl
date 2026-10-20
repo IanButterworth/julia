@@ -2274,12 +2274,13 @@ precompile_test_harness("trusted edges: load order") do load_path
         print(Base.invokelatest(TrustedEdgeExtA.callf), " ", Base.invokelatest(TrustedEdgeDep.f, 1))
         """)
     @test out == "a a"
-    # a trusted edge leaves the caller valid in the current world
+    # a trusted edge backdates the caller to its contributors' activation
     out = trusted_edge_test_output(load_path, depot, """
         using TrustedEdgeDep, TrustedEdgeExtA
         mi = only(Base.specializations(only(methods(TrustedEdgeExtA.callf))))
         ci = mi.cache
-        print(ci.min_world ≤ Base.get_world_counter(), " ", ci.max_world == typemax(UInt))
+        # valid since the youngest contributor to TrustedEdgeDep.f, TrustedEdgeExtA itself, was activated
+        print(ci.min_world == only(methods(TrustedEdgeExtA.callf)).primary_world, " ", ci.max_world == typemax(UInt))
         """)
     @test out == "true true"
     # the closure recorded for an image when it is loaded is the images it was
@@ -2291,8 +2292,8 @@ precompile_test_harness("trusted edges: load order") do load_path
     out = trusted_edge_test_output(load_path, depot, """
         using TrustedEdgeDep, TrustedEdgeExtA
         sig = Tuple{typeof(TrustedEdgeDep.f), Int}
-        in_closure(sig, obj) = ccall(:jl_sig_contributors_in_closure, Cint, (Any, Any, Csize_t), sig, Core.methodtable,
-                                     ccall(:jl_external_blob_index, Csize_t, (Any,), obj))
+        in_closure(sig, obj) = Int(0 != ccall(:jl_sig_contributors_world, Csize_t, (Any, Any, Csize_t), sig, Core.methodtable,
+                                     ccall(:jl_external_blob_index, Csize_t, (Any,), obj)))
         print(in_closure(sig, TrustedEdgeExtA), " ", in_closure(sig, only(methods(TrustedEdgeExtA.callf))), " ",
               in_closure(sig, TrustedEdgeDep), " ", in_closure(sig, Base), " ", in_closure(sig, Main))
         # a method on Type{Union{}} meets the constructors of every family, so defining one

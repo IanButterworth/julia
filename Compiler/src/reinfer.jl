@@ -145,37 +145,20 @@ function scan_new_code!(internal_methods::Vector{Any}, workspace::VerifyMethodWo
     end
 end
 
-# Whether every method contributor to the call signature's typenames lies in
-# the dependency closure of the image at linkage blob `image`, which owns the
-# code being verified (see jl_sig_contributors_in_closure). Such a signature
-# matches exactly the methods that image's precompile worker matched, so the
-# worker's verdict is trusted instead of matching again. The question is asked
-# of the global method table only, so the caller matches an edge with a
-# recorded target of another table live. Invalidation debugging wants every
+# If every method contributor to the call signature's typenames in `mt`, the
+# table the live lookup of this edge would search, lies in the dependency
+# closure of the image at linkage blob `image`, which owns the code being
+# verified, the world since which all of them have been active, else zero (see
+# jl_sig_contributors_world). From that world on, such a signature has matched
+# exactly the methods that image's precompile worker matched, so the worker's
+# verdict is trusted instead of matching again, with that world as its min
+# world: a live match bounds its min world by the youngest entry intersecting
+# the signature, which was active by then. Invalidation debugging wants every
 # edge matched.
-function sig_contributors_in_closure(@nospecialize(sig), image::UInt)
-    _jl_debug_method_invalidation[] === nothing || return false
-    image == typemax(UInt) && return false # code of no image has no worker's verdict
-    return ccall(:jl_sig_contributors_in_closure, Cint, (Any, Any, Csize_t), sig, Core.methodtable, image) != 0
-end
-
-function targets_global(expected::Vector{Method})
-    for meth in expected
-        get_methodtable(meth) === Core.methodtable || return false
-    end
-    return true
-end
-
-# the min world of an edge whose recorded target(s) are trusted: they became
-# available in this session at their activation worlds, as a live match reports
-# for an unchanged match set
-targets_minworld(meth::Method) = max(get_require_world(), meth.primary_world)
-function targets_minworld(expected::Vector{Method})
-    minworld = get_require_world()
-    for meth in expected
-        minworld = max(minworld, meth.primary_world)
-    end
-    return minworld
+function sig_contributors_world(@nospecialize(sig), mt::Core.MethodTable, image::UInt)
+    _jl_debug_method_invalidation[] === nothing || return UInt(0)
+    image == typemax(UInt) && return UInt(0) # code of no image has no worker's verdict
+    return ccall(:jl_sig_contributors_world, Csize_t, (Any, Any, Csize_t), sig, mt, image)
 end
 
 function verify_method_graph(codeinst::CodeInstance, validation_world::UInt, workspace::VerifyMethodWorkspace)
@@ -768,14 +751,17 @@ function verify_call(@nospecialize(sig), expecteds::Core.SimpleVector, i::Int, n
             end
         end
         # Next, trust the precompile worker's verdict if nothing can have changed the
-        # match set since (see sig_contributors_in_closure). An edge with no targets (a
-        # missing or ambiguous call) has no target world to bound its validity from
-        # below, so it is matched live.
-        if n > 0 && targets_global(expected) && sig_contributors_in_closure(sig, image)
-            let minworld = targets_minworld(expected)
-                @assert minworld ≤ world "expected method not present in verification world"
-                promote_mi_to_current(mi, minworld, world)
-                return minworld, typemax(UInt)
+        # match set since (see sig_contributors_world). An edge with no targets (a
+        # missing or ambiguous call) records no verdict about the targets, so it is
+        # matched live.
+        if n > 0
+            # Core.methodtable: the table verify_call_lookup searches
+            let minworld = sig_contributors_world(sig, Core.methodtable, image)
+                if minworld != 0
+                    @assert minworld ≤ world "contributor activated after the verification world"
+                    promote_mi_to_current(mi, minworld, world)
+                    return minworld, typemax(UInt)
+                end
             end
         end
         # Try the interference set fast path (used by both n==1, when the O(1) checks above
@@ -905,17 +891,15 @@ function verify_invokesig(@nospecialize(invokesig), expected::Method, world::UIn
         minworld = expected.primary_world
         @assert minworld ≤ world "expected method not present in verification world"
         maxworld = typemax(UInt)
-    elseif method_is_latest_which(expected) && get_methodtable(expected) === Core.methodtable &&
-           sig_contributors_in_closure(invokesig, image)
-        # the precompile worker's verdict (see sig_contributors_in_closure)
-        minworld = targets_minworld(expected)
-        @assert minworld ≤ world "expected method not present in verification world"
-        maxworld = typemax(UInt)
     else
         mt = get_methodtable(expected)
         if mt === nothing
             minworld = 1
             maxworld = 0
+        elseif method_is_latest_which(expected) && (minworld = sig_contributors_world(invokesig, mt, image)) != 0
+            # the precompile worker's verdict (see sig_contributors_world)
+            @assert minworld ≤ world "contributor activated after the verification world"
+            maxworld = typemax(UInt)
         else
             matched, valid_worlds = _findsup(invokesig, mt, world)
             minworld, maxworld = valid_worlds.min_world, valid_worlds.max_world

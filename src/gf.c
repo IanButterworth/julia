@@ -2832,7 +2832,7 @@ JL_DLLEXPORT void jl_method_table_add_backedge(jl_value_t *typ, jl_code_instance
 // and itself, as staticdata.c recorded when the image was loaded) still has
 // the method-match set its precompile worker computed the edge against, so the
 // worker's verdict holds and the loader can skip matching that edge again
-// (jl_sig_contributors_in_closure). That the set of sources, not their order, decides
+// (jl_sig_contributors_world). That the set of sources, not their order, decides
 // the match set relies on overwriting a method being an error during
 // incremental precompilation: a worker never sees two of its images define
 // the same signature, so neither does an image's closure. The tags name
@@ -2880,6 +2880,7 @@ static void _typename_tag_contributor(jl_typename_t *tn, int explct, void *env0)
 struct _typename_check_contributor_env {
     jl_methtable_t *mt;
     size_t image; // the linkage blob whose closure bounds the contributors
+    size_t world; // the youngest contributor's activation world so far
     int clean;
 };
 
@@ -2896,10 +2897,13 @@ static void _typename_check_contributor(jl_typename_t *tn, int explct, void *env
     size_t l = jl_array_nrows(tags);
     int32_t *d = jl_array_data(tags, int32_t);
     for (size_t i = 0; i < l; i++) {
-        if (d[i] < 0 || !jl_linkage_blob_in_closure(env->image, (size_t)d[i])) {
+        size_t world = d[i] < 0 ? 0 : jl_linkage_blob_closure_world(env->image, (size_t)d[i]);
+        if (world == 0) {
             env->clean = 0;
             return;
         }
+        if (world > env->world)
+            env->world = world;
     }
 }
 
@@ -2915,18 +2919,21 @@ static int32_t contributor_tag_for(jl_method_t *method) JL_NOTSAFEPOINT
     return jl_object_in_image((jl_value_t*)method) ? (int32_t)jl_external_blob_index((jl_value_t*)method) : -1;
 }
 
-// Does every contributor to the typenames of `sig` in `mt` lie within the
-// dependency closure of the image at linkage blob `image`? If so, the
-// method-match set of `sig` is the one that image's precompile worker saw.
-// The answer holds until the world next changes: a contributor being added
-// concurrently moves the world, which the caller stamps its result with.
-JL_DLLEXPORT int jl_sig_contributors_in_closure(jl_value_t *sig, jl_methtable_t *mt, size_t image) JL_CANSAFEPOINT
+// If every contributor to the typenames of `sig` in `mt` lies within the
+// dependency closure of the image at linkage blob `image`, the world since
+// which all of them have been active: from then on, the methods on those
+// typenames have been exactly those that image's precompile worker saw, so its
+// method-match set for `sig` has been the worker's. Otherwise 0. The answer
+// holds until the world next changes: a contributor being added concurrently
+// moves the world, which the caller stamps its result with.
+JL_DLLEXPORT size_t jl_sig_contributors_world(jl_value_t *sig, jl_methtable_t *mt, size_t image) JL_CANSAFEPOINT
 {
     if (image == (size_t)-1)
         return 0;
-    struct _typename_check_contributor_env env = {mt, image, 1};
+    // the sysimage's contributions are not tagged: they are active by jl_require_world
+    struct _typename_check_contributor_env env = {mt, image, jl_require_world, 1};
     int decomposed = jl_foreach_top_typename_for(_typename_check_contributor, sig, 1, &env);
-    return decomposed && env.clean;
+    return decomposed && env.clean ? env.world : 0;
 }
 
 struct _typename_invalidate_backedge {
