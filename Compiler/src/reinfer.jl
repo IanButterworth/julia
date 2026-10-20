@@ -144,8 +144,8 @@ function scan_new_code!(internal_methods::Vector{Any}, workspace::VerifyMethodWo
 end
 
 # The world since which every method on the typenames of `sig` in `mt` has come
-# from an image in the dependency closure of the image at linkage blob `image`,
-# or zero if one came from elsewhere (see jl_sig_contributors_world). From that
+# from the image at linkage blob `image` or one of its dependencies, or zero if
+# one came from elsewhere (see jl_sig_contributors_world). From that
 # world on, `sig` has matched exactly what that image's precompile worker
 # matched, so the worker's verdict can stand in for a live match, with that
 # world as its min world. `mt` is the table the live match would search. Zero

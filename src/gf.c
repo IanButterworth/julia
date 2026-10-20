@@ -2827,13 +2827,13 @@ JL_DLLEXPORT void jl_method_table_add_backedge(jl_value_t *typ, jl_code_instance
 // linkage blob of the image a method came from, or -1 for a method defined or
 // deleted at run time. While the edges of a package image are verified, a call
 // signature whose typenames have no contributor outside that image's
-// dependency closure (the sysimage, the images it was loaded against, and
-// itself; see staticdata.c) still has the method-match set the image's
-// precompile worker saw, so the worker's verdict holds
-// (jl_sig_contributors_world). That the set of contributors, whatever their
-// order, determines the match set relies on overwriting a method being an
-// error during incremental precompilation, so no two images of a closure
-// define the same signature. The tags name this process's blobs, so the table
+// dependencies (the sysimage, the images it was loaded against, and itself;
+// see staticdata.c) still has the method-match set the image's precompile
+// worker saw, so the worker's verdict holds (jl_sig_contributors_world). That
+// the set of contributors, whatever their order, determines the match set
+// relies on overwriting a method being an error during incremental
+// precompilation, so no two images among an image's dependencies define the
+// same signature. The tags name this process's blobs, so the table
 // is not saved in images. Writers hold mt->cache->writelock; readers take no
 // lock, as the table is published with release stores and a tag vector is
 // replaced, never grown in place.
@@ -2876,7 +2876,7 @@ static void _typename_tag_contributor(jl_typename_t *tn, int explct, void *env0)
 
 struct _typename_check_contributor_env {
     jl_methtable_t *mt;
-    size_t image; // the linkage blob whose closure bounds the contributors
+    size_t image; // the linkage blob whose dependencies bound the contributors
     size_t world; // the youngest contributor's activation world so far
     int clean;
 };
@@ -2894,7 +2894,7 @@ static void _typename_check_contributor(jl_typename_t *tn, int explct, void *env
     size_t l = jl_array_nrows(tags);
     int32_t *d = jl_array_data(tags, int32_t);
     for (size_t i = 0; i < l; i++) {
-        size_t world = d[i] < 0 ? 0 : jl_linkage_blob_closure_world(env->image, (size_t)d[i]);
+        size_t world = d[i] < 0 ? 0 : jl_linkage_blob_dep_world(env->image, (size_t)d[i]);
         if (world == 0) {
             env->clean = 0;
             return;
@@ -2916,9 +2916,9 @@ static int32_t contributor_tag_for(jl_method_t *method) JL_NOTSAFEPOINT
     return jl_object_in_image((jl_value_t*)method) ? (int32_t)jl_external_blob_index((jl_value_t*)method) : -1;
 }
 
-// If every contributor to the typenames of `sig` in `mt` lies in the
-// dependency closure of the image at linkage blob `image`, the world in which
-// the youngest of them was activated, else 0. From that world on, the methods
+// If every contributor to the typenames of `sig` in `mt` is the image at
+// linkage blob `image` or one of its dependencies, the world in which the
+// youngest of them was activated, else 0. From that world on, the methods
 // on those typenames have been exactly the ones that image's precompile worker
 // saw, so its method-match set for `sig` has been the worker's. A contributor
 // added concurrently moves the world counter, which the caller stamps its

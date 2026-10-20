@@ -2246,7 +2246,7 @@ precompile_test_harness("trusted edges: load order") do load_path
     depot = DEPOT_PATH[1]
     # whichever loads second, the more specific method wins everywhere: A's caller
     # is invalidated by B's activation, or verified against B's method (a
-    # contributor outside A's dependency closure) at A's load
+    # contributor outside A's dependencies) at A's load
     for order in (("TrustedEdgeExtA", "TrustedEdgeExtB"), ("TrustedEdgeExtB", "TrustedEdgeExtA"))
         out = trusted_edge_test_output(load_path, depot, """
             using TrustedEdgeDep, $(order[1]), $(order[2])
@@ -2255,8 +2255,8 @@ precompile_test_harness("trusted edges: load order") do load_path
             """)
         @test out == "b b b"
     end
-    # a method defined in the session before loading is foreign to the image's
-    # dependency closure and must be matched live
+    # a method defined in the session before loading is not from any of the
+    # image's dependencies and must be matched live
     out = trusted_edge_test_output(load_path, depot, """
         using TrustedEdgeDep
         TrustedEdgeDep.f(::Int) = :session
@@ -2283,29 +2283,29 @@ precompile_test_harness("trusted edges: load order") do load_path
         print(ci.min_world == only(methods(TrustedEdgeExtA.callf)).primary_world, " ", ci.max_world == typemax(UInt))
         """)
     @test out == "true true"
-    # an image's closure is the images it was loaded against plus itself, and the
-    # question is asked for the blob owning an object: the contributors to
-    # TrustedEdgeDep.f, TrustedEdgeDep and TrustedEdgeExtA, are in the closure of
-    # TrustedEdgeExtA but not in that of TrustedEdgeDep, of the sysimage, or of
-    # no image
+    # an image's dependencies are the images it was loaded against, the sysimage
+    # and itself, and the question is asked for the blob owning an object: the
+    # contributors to TrustedEdgeDep.f, TrustedEdgeDep and TrustedEdgeExtA, are
+    # among the dependencies of TrustedEdgeExtA but not of TrustedEdgeDep, of the
+    # sysimage, or of no image
     out = trusted_edge_test_output(load_path, depot, """
         using TrustedEdgeDep, TrustedEdgeExtA
         sig = Tuple{typeof(TrustedEdgeDep.f), Int}
-        in_closure(sig, obj) = Int(0 != ccall(:jl_sig_contributors_world, Csize_t, (Any, Any, Csize_t), sig, Core.methodtable,
+        in_deps(sig, obj) = Int(0 != ccall(:jl_sig_contributors_world, Csize_t, (Any, Any, Csize_t), sig, Core.methodtable,
                                      ccall(:jl_external_blob_index, Csize_t, (Any,), obj)))
-        print(in_closure(sig, TrustedEdgeExtA), " ", in_closure(sig, only(methods(TrustedEdgeExtA.callf))), " ",
-              in_closure(sig, TrustedEdgeDep), " ", in_closure(sig, Base), " ", in_closure(sig, Main))
+        print(in_deps(sig, TrustedEdgeExtA), " ", in_deps(sig, only(methods(TrustedEdgeExtA.callf))), " ",
+              in_deps(sig, TrustedEdgeDep), " ", in_deps(sig, Base), " ", in_deps(sig, Main))
         # a method on Type{Union{}} meets the constructors of every family, so defining one
         # poisons every constructor signature, but no other
         ctor = Tuple{Type{Int}, Int}
-        print(" ", in_closure(ctor, TrustedEdgeExtA))
+        print(" ", in_deps(ctor, TrustedEdgeExtA))
         (::Type{Union{}})(::Int) = 0
-        print(" ", in_closure(ctor, TrustedEdgeExtA), " ", in_closure(sig, TrustedEdgeExtA))
+        print(" ", in_deps(ctor, TrustedEdgeExtA), " ", in_deps(sig, TrustedEdgeExtA))
         """)
     @test out == "1 1 0 0 0 1 0 1"
 end
 
-precompile_test_harness("trusted edges: a method on a kind outside the closure") do load_path
+precompile_test_harness("trusted edges: a method on a kind outside the dependencies") do load_path
     write(joinpath(load_path, "TrustedEdgeKindDep.jl"),
         """
         module TrustedEdgeKindDep
@@ -2323,7 +2323,7 @@ precompile_test_harness("trusted edges: a method on a kind outside the closure")
         end
         """)
     # a method on a kind applies to the constructor call of every type, so it is
-    # a contributor to the caller's signature from outside its dependency closure,
+    # a contributor to the caller's signature from outside its dependencies,
     # and makes the call ambiguous
     write(joinpath(load_path, "TrustedEdgeKindPirate.jl"),
         """

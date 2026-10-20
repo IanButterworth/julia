@@ -200,8 +200,8 @@ typedef struct {
     jl_module_t *top_mod;    // owning top-level module
     size_t idx;              // range index in image_tree (for serialization)
     int coverage_compatible; // counters support the requested coverage mode
-    uint32_t *closure;       // bitvector over blobs 0..idx: the images this one was
-                             // loaded against, transitively, and itself
+    uint32_t *deps;          // bitvector over blobs 0..idx: the sysimage, the images
+                             // this one was loaded against, and itself
     _Atomic(size_t) world;   // the world in which the image's methods were activated
                              // (0 until then)
 } image_metadata_t;
@@ -260,28 +260,38 @@ JL_DLLEXPORT size_t jl_external_blob_index(jl_value_t *v) JL_NOTSAFEPOINT
     return external_blob_index(v);
 }
 
-// The dependency closure of the image at blob `idx`: the sysimage, every image
-// it was loaded against (transitively, via `depmods`), and itself, as a
-// bitvector over blobs 0..idx. Blobs are only appended, so it never changes.
-static uint32_t *image_closure_new(size_t idx, jl_array_t *depmods) JL_NOTSAFEPOINT
+// The dependencies of the image at blob `idx`, as a bitvector over blobs
+// 0..idx: the sysimage, every image in `depmods`, and itself. `depmods` lists
+// every module the precompile worker had loaded, so it is already complete.
+// Blobs are only appended, so the bitvector never changes.
+static uint32_t *image_deps_new(size_t idx, jl_array_t *depmods) JL_NOTSAFEPOINT
 {
-    uint32_t *closure = (uint32_t*)calloc_s(bitvector_nwords(idx + 1) * sizeof(uint32_t));
-    bitvector_set(closure, 0, 1); // the sysimage
+    uint32_t *deps = (uint32_t*)calloc_s(bitvector_nwords(idx + 1) * sizeof(uint32_t));
+    bitvector_set(deps, 0, 1); // the sysimage
+    for (size_t i = 0, ld = depmods ? jl_array_nrows(depmods) : 0; i < ld; i++) {
+        image_metadata_t *dep = external_blob_metadata(jl_array_ptr_ref(depmods, i));
+        if (dep == NULL || dep->idx >= idx)
+            continue;
+        bitvector_set(deps, dep->idx, 1);
+    }
+    bitvector_set(deps, idx, 1);
+#ifndef NDEBUG
+    // a dependency's own dependencies are among ours
     for (size_t i = 0, ld = depmods ? jl_array_nrows(depmods) : 0; i < ld; i++) {
         image_metadata_t *dep = external_blob_metadata(jl_array_ptr_ref(depmods, i));
         if (dep == NULL || dep->idx >= idx)
             continue;
         for (size_t w = 0, nw = bitvector_nwords(dep->idx + 1); w < nw; w++)
-            closure[w] |= dep->closure[w];
+            assert((dep->deps[w] & ~deps[w]) == 0);
     }
-    bitvector_set(closure, idx, 1);
-    return closure;
+#endif
+    return deps;
 }
 
-// If linkage blob `blob` is in the dependency closure of linkage blob `image`,
-// the world in which the methods of `blob` were activated, else 0. A blob in a
-// closure has been loaded in full, so its world is set.
-JL_DLLEXPORT size_t jl_linkage_blob_closure_world(size_t image, size_t blob) JL_NOTSAFEPOINT
+// If linkage blob `blob` is a dependency of linkage blob `image` (or the
+// sysimage, or `image` itself), the world in which the methods of `blob` were
+// activated, else 0. A dependency has been loaded in full, so its world is set.
+JL_DLLEXPORT size_t jl_linkage_blob_dep_world(size_t image, size_t blob) JL_NOTSAFEPOINT
 {
     if (blob > image)
         return 0;
@@ -289,7 +299,7 @@ JL_DLLEXPORT size_t jl_linkage_blob_closure_world(size_t image, size_t blob) JL_
     if (data == EYT_NOTFOUND)
         return 0;
     image_metadata_t *meta = (image_metadata_t*)data;
-    if (meta->closure == NULL || !bitvector_get(meta->closure, blob))
+    if (meta->deps == NULL || !bitvector_get(meta->deps, blob))
         return 0;
     image_metadata_t *blobmeta = (image_metadata_t*)eyt_tree_range_data(&image_tree, blob);
     size_t world = jl_atomic_load_relaxed(&blobmeta->world);
@@ -4734,7 +4744,7 @@ static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
     image_metadata_t *meta = (image_metadata_t*)malloc_s(sizeof(image_metadata_t));
     meta->base = (uintptr_t)image_base;
     meta->relocs_base = (void*)relocs_base;
-    meta->closure = NULL; // until the blob index is known
+    meta->deps = NULL; // until the blob index is known
     // the sysimage's methods are active by jl_require_world; a package image's
     // are activated by the caller, which records the world
     jl_atomic_store_relaxed(&meta->world, restored == NULL ? jl_require_world : 0);
@@ -4762,7 +4772,7 @@ static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
         (uintptr_t)image_base,
         (uintptr_t)image_base + sizeof_sysimg,
         (void*)meta);
-    meta->closure = image_closure_new(meta->idx, depmods);
+    meta->deps = image_deps_new(meta->idx, depmods);
     jl_timing_counter_inc(JL_TIMING_COUNTER_ImageSize, sizeof_sysimg + sizeof(uintptr_t));
 
     // jl_printf(JL_STDOUT, "%ld blobs to link against\n", n_linkage_blobs());
