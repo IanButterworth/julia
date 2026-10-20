@@ -2704,7 +2704,8 @@ function detect_closure_boxes(mods::Module...)
     world = Base.get_world_counter()
     matches = Any[]
     function is_active_method(m::Method)
-        minworld, maxworld = Core.Compiler.ReinferUtils.verify_invokesig(m.sig, m, world, matches)
+        # typemax: code of no image, so the signature is matched live
+        minworld, maxworld = Core.Compiler.ReinferUtils.verify_invokesig(m.sig, m, world, matches, typemax(UInt))
         return minworld <= world <= maxworld
     end
 
