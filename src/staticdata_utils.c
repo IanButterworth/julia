@@ -589,7 +589,7 @@ static int jl_collect_methcache_from_mod(jl_typemap_entry_t *ml, void *closure) 
     jl_method_t *m = ml->func.method;
     if (!jl_object_in_image((jl_value_t*)m->module)) {
         jl_array_ptr_1d_push(s, (jl_value_t*)m); // extext
-        jl_array_ptr_1d_push(s, jl_get_activation_record(m)); // names only objects of images, so it can be saved
+        jl_array_ptr_1d_push(s, jl_get_ext_backinterferences(m)); // names only objects of images, so it can be saved
     }
     return 1;
 }
@@ -601,7 +601,7 @@ static int jl_collect_methcache_internal(jl_typemap_entry_t *ml, void *closure) 
     jl_array_t *s = (jl_array_t*)closure;
     if (jl_atomic_load_relaxed(&ml->max_world) == ~(size_t)0) {
         jl_array_ptr_1d_push(s, (jl_value_t*)ml->func.method); // extext
-        jl_array_ptr_1d_push(s, jl_nothing); // no activation record, but keep the entries in pairs
+        jl_array_ptr_1d_push(s, jl_nothing); // no record, but keep the entries in pairs
     }
     return 1;
 }
@@ -910,7 +910,7 @@ static int64_t write_dependency_list(ios_t *s, jl_array_t* worklist, jl_array_t 
 static void jl_add_methods(jl_array_t *external) JL_CANSAFEPOINT
 {
     size_t i, l = jl_array_nrows(external);
-    for (i = 0; i < l; i += 2) { // (method, activation record) pairs
+    for (i = 0; i < l; i += 2) { // (method, ext_backinterferences) pairs
         jl_method_t *meth = (jl_method_t*)jl_array_ptr_ref(external, i);
         assert(jl_is_method(meth));
         assert(!meth->is_for_opaque_closure);
@@ -924,7 +924,7 @@ static void jl_add_methods(jl_array_t *external) JL_CANSAFEPOINT
 extern _Atomic(int) allow_new_worlds;
 
 // `image` is the linkage blob of the loading image, whose dependencies its
-// methods' activation records cover.
+// methods' ext_backinterferences records cover.
 static void jl_activate_methods(jl_array_t *external, jl_array_t *internal, size_t world, const char *pkgname, size_t image) JL_CANSAFEPOINT
 {
     size_t i, l = jl_array_nrows(internal);
@@ -965,7 +965,7 @@ static void jl_activate_methods(jl_array_t *external, jl_array_t *internal, size
             jl_typemap_entry_t *entry = (jl_typemap_entry_t*)jl_array_ptr_ref(external, i);
             jl_value_t *record = jl_array_ptr_ref(external, i + 1);
             //uint64_t t0 = uv_hrtime();
-            jl_method_table_activate_with_record(entry, record == jl_nothing ? NULL : (jl_svec_t*)record);
+            jl_method_table_activate_with_record(entry, record == jl_nothing ? NULL : (jl_array_t*)record);
             //jl_printf(JL_STDERR, "%f ", (double)(uv_hrtime() - t0) / 1e6);
             //jl_static_show(JL_STDERR, entry->func.value);
             //jl_printf(JL_STDERR, "\n");

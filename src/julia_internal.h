@@ -1444,21 +1444,19 @@ JL_DLLEXPORT size_t jl_external_blob_index(jl_value_t *v) JL_NOTSAFEPOINT;
 JL_DLLEXPORT size_t jl_linkage_blob_dep_world(size_t image, size_t blob) JL_NOTSAFEPOINT;
 // The world since which every method on the typenames of `sig` in `mt` came from `image` or one of its dependencies, else 0 (gf.c).
 JL_DLLEXPORT size_t jl_sig_contributors_world(jl_value_t *sig, jl_methtable_t *mt, size_t image) JL_CANSAFEPOINT;
-// method activation records (gf.c, staticdata.c): what the activation of a method
-// found by scanning the method table live, replayed when the method activates again
-void jl_method_table_activate_with_record(jl_typemap_entry_t *newentry, jl_svec_t *record) JL_CANSAFEPOINT;
-JL_DLLEXPORT jl_value_t *jl_get_activation_record(jl_method_t *method) JL_NOTSAFEPOINT;
-extern JL_DLLEXPORT jl_genericmemory_t *jl_activation_records JL_GLOBALLY_ROOTED;
+// The ext_backinterferences of a method (gf.c, staticdata.c; its `record` for short):
+// the methods of other images whose interference sets contain it, those intersecting
+// it and not more specific than it, as a list of methods. It is the back direction of
+// `interferences`, which the image preserves, restricted to external methods, so the
+// pair gives every intersecting method of those images with its specificity: what
+// the activation found by scanning the method table live, replayed when the method
+// activates again.
+void jl_method_table_activate_with_record(jl_typemap_entry_t *newentry, jl_array_t *record) JL_CANSAFEPOINT;
+JL_DLLEXPORT jl_value_t *jl_get_ext_backinterferences(jl_method_t *method) JL_NOTSAFEPOINT;
+extern JL_DLLEXPORT jl_genericmemory_t *jl_ext_backinterferences JL_GLOBALLY_ROOTED;
 JL_DLLEXPORT void jl_set_activation_coverage(size_t image) JL_NOTSAFEPOINT;
-JL_DLLEXPORT void jl_activation_records_complete(size_t image) JL_CANSAFEPOINT;
-JL_DLLEXPORT int jl_activation_recording(void) JL_NOTSAFEPOINT;
-// Slots of an activation record, an svec kept per activated method and saved paired
-// with the method in the image's list of methods extending external functions.
-enum activation_record_slot {
-    ACTIVATION_RECORD_METHODS = 0, // the intersecting methods of images, or nothing
-    ACTIVATION_RECORD_FLAGS,      // Int32 per method: 1 = more specific than the new one, 2 = ambiguous
-    ACTIVATION_RECORD_NSLOTS
-};
+JL_DLLEXPORT void jl_ext_backinterferences_complete(size_t image) JL_CANSAFEPOINT;
+JL_DLLEXPORT int jl_recording_ext_backinterferences(void) JL_NOTSAFEPOINT;
 // GC configuration baked into generated code; must match between an image and the runtime that loads it.
 JL_DLLEXPORT const char *jl_gc_image_abi(void) JL_NOTSAFEPOINT;
 

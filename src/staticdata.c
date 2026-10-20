@@ -3705,7 +3705,7 @@ JL_DLLEXPORT uint32_t jl_create_system_image(void **_native_data, jl_array_t *wo
         ext_foreign_cis = NULL; // not needed anymore, free it
 
         // Collect method extensions
-        // extext_methods: [method1, record1, ...], worklist-owned "extending external" methods added to functions owned by modules outside the worklist, each paired with its activation record (or nothing)
+        // extext_methods: [method1, record1, ...], worklist-owned "extending external" methods added to functions owned by modules outside the worklist, each paired with its ext_backinterferences (or nothing)
         extext_methods = jl_alloc_vec_any(0);
         jl_collect_extext_methods(extext_methods, mod_array);
 
@@ -4923,10 +4923,10 @@ static jl_value_t *jl_restore_package_image_from_stream(ios_t *f, jl_image_t *im
                 jl_atomic_store_release(&jl_world_counter, world);
             // now permit more methods to be added again
             JL_UNLOCK(&world_counter_lock);
-            // the activation records made so far saw the method table without this
-            // image: complete them against it (see jl_activation_records)
-            if (jl_activation_recording())
-                jl_activation_records_complete(meta->idx);
+            // the ext_backinterferences recorded so far saw the method table without this
+            // image: complete them against it (see jl_ext_backinterferences)
+            if (jl_recording_ext_backinterferences())
+                jl_ext_backinterferences_complete(meta->idx);
 
             if (completeinfo) {
                 cachesizes_sv = jl_alloc_svec(7);
