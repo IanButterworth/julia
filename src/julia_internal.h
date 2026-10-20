@@ -1440,9 +1440,9 @@ void jl_gc_safe_enter_from_nonmutator(jl_ptls_t ptls) JL_CANSAFEPOINT_LEAVE;
 JL_DLLEXPORT uint8_t jl_object_in_image(jl_value_t* v) JL_NOTSAFEPOINT;
 // The linkage blob (image) owning `v`, or -1 for an object of no image.
 JL_DLLEXPORT size_t jl_external_blob_index(jl_value_t *v) JL_NOTSAFEPOINT;
-// Is linkage blob `blob` in the dependency closure recorded for linkage blob `image`?
+// The world in which linkage blob `blob` activated its methods if it is in the dependency closure of linkage blob `image`, else 0.
 JL_DLLEXPORT size_t jl_linkage_blob_closure_world(size_t image, size_t blob) JL_NOTSAFEPOINT;
-// the world since which the contributors to a signature's typenames, all in an image's closure, have been active (gf.c)
+// The world since which every method on the typenames of `sig` in `mt` came from an image in the closure of `image`, else 0 (gf.c).
 JL_DLLEXPORT size_t jl_sig_contributors_world(jl_value_t *sig, jl_methtable_t *mt, size_t image) JL_CANSAFEPOINT;
 // GC configuration baked into generated code; must match between an image and the runtime that loads it.
 JL_DLLEXPORT const char *jl_gc_image_abi(void) JL_NOTSAFEPOINT;

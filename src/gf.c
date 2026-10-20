@@ -909,8 +909,8 @@ static void foreach_top_nth_typename(void (*f)(jl_typename_t*, int, void*) JL_CA
         if (jl_is_some_Type(current_a)) {
             *facts |= HAVE_TYPE;
             if (jl_is_typeofbottom_param(current_a)) {
-                // Type{Union{}} meets the Type{<:T} slot of every family, so key it
-                // as exactly Type, like Type{>:Any}, rather than under no family
+                // Type{Union{}} is a subtype of Type{<:T} for every T, so key it under
+                // Type itself rather than descending into Union{}, which has no typename
                 *facts |= EXACTLY_TYPE;
             }
             else {
@@ -2822,24 +2822,21 @@ JL_DLLEXPORT void jl_method_table_add_backedge(jl_value_t *typ, jl_code_instance
 }
 
 // ---- method-table contributor tracking ----
-// For every generic function of a method table, keyed by the same top-typename
-// decomposition as the table's mt-backedge table, `mt->contributors` records
-// which sources have added or deleted methods under it during this session:
-// the linkage blob index of the image that owns an image method, or -1 for a
-// run-time definition or deletion. While a package image's edges are being
-// verified, a call signature whose typenames have no contributor outside that
-// image's dependency closure (the sysimage, the images it was loaded against,
-// and itself, as staticdata.c recorded when the image was loaded) still has
-// the method-match set its precompile worker computed the edge against, so the
-// worker's verdict holds and the loader can skip matching that edge again
-// (jl_sig_contributors_world). That the set of sources, not their order, decides
-// the match set relies on overwriting a method being an error during
-// incremental precompilation: a worker never sees two of its images define
-// the same signature, so neither does an image's closure. The tags name
-// this process's blobs, so the table is dropped from images. Writers hold
-// mt->cache->writelock; the query reads
-// without it, as the table is published with release stores and each tag
-// vector is replaced, never grown, when a source is added to it.
+// `mt->contributors` records, under the same top typenames as the table's
+// backedges, who added or deleted methods there during this session: the
+// linkage blob of the image a method came from, or -1 for a method defined or
+// deleted at run time. While the edges of a package image are verified, a call
+// signature whose typenames have no contributor outside that image's
+// dependency closure (the sysimage, the images it was loaded against, and
+// itself; see staticdata.c) still has the method-match set the image's
+// precompile worker saw, so the worker's verdict holds
+// (jl_sig_contributors_world). That the set of contributors, whatever their
+// order, determines the match set relies on overwriting a method being an
+// error during incremental precompilation, so no two images of a closure
+// define the same signature. The tags name this process's blobs, so the table
+// is not saved in images. Writers hold mt->cache->writelock; readers take no
+// lock, as the table is published with release stores and a tag vector is
+// replaced, never grown in place.
 
 // add `tag` to the contributors of `tn` in `mt`, unless already present
 static void contributor_add_tag(jl_methtable_t *mt, jl_typename_t *tn, int32_t tag) JL_CANSAFEPOINT
@@ -2870,8 +2867,8 @@ static void _typename_tag_contributor(jl_typename_t *tn, int explct, void *env0)
 {
     struct _typename_tag_contributor_env *env = (struct _typename_tag_contributor_env*)env0;
     JL_GC_PROMISE_ROOTED(env->mt);
-    // like the mt-backedge table, record only under explicitly encountered
-    // typenames; the check consults every callback
+    // tag only the typenames the signature names explicitly, like the backedge
+    // table; the query checks every typename it is called for
     if (!explct)
         return;
     contributor_add_tag(env->mt, tn, env->tag);
@@ -2893,7 +2890,7 @@ static void _typename_check_contributor(jl_typename_t *tn, int explct, void *env
     jl_genericmemory_t *contributors = jl_atomic_load_relaxed(&env->mt->contributors);
     jl_array_t *tags = (jl_array_t*)jl_eqtable_get(contributors, (jl_value_t*)tn, NULL);
     if (tags == NULL)
-        return; // only pre-session (sysimage) contributions
+        return; // no contributor this session: the sysimage's methods are not tagged
     size_t l = jl_array_nrows(tags);
     int32_t *d = jl_array_data(tags, int32_t);
     for (size_t i = 0; i < l; i++) {
@@ -2919,13 +2916,13 @@ static int32_t contributor_tag_for(jl_method_t *method) JL_NOTSAFEPOINT
     return jl_object_in_image((jl_value_t*)method) ? (int32_t)jl_external_blob_index((jl_value_t*)method) : -1;
 }
 
-// If every contributor to the typenames of `sig` in `mt` lies within the
-// dependency closure of the image at linkage blob `image`, the world since
-// which all of them have been active: from then on, the methods on those
-// typenames have been exactly those that image's precompile worker saw, so its
-// method-match set for `sig` has been the worker's. Otherwise 0. The answer
-// holds until the world next changes: a contributor being added concurrently
-// moves the world, which the caller stamps its result with.
+// If every contributor to the typenames of `sig` in `mt` lies in the
+// dependency closure of the image at linkage blob `image`, the world in which
+// the youngest of them was activated, else 0. From that world on, the methods
+// on those typenames have been exactly the ones that image's precompile worker
+// saw, so its method-match set for `sig` has been the worker's. A contributor
+// added concurrently moves the world counter, which the caller stamps its
+// result with.
 JL_DLLEXPORT size_t jl_sig_contributors_world(jl_value_t *sig, jl_methtable_t *mt, size_t image) JL_CANSAFEPOINT
 {
     if (image == (size_t)-1)

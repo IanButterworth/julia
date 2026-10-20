@@ -206,12 +206,11 @@ typedef struct {
                              // (0 until then)
 } image_metadata_t;
 
-// Readers of the image tree take no lock: each loads the current snapshot and
-// finishes with it inside one JL_NOTSAFEPOINT body, keeping only the
-// image_metadata_t it found, which is never freed. So a replaced snapshot can
-// be held only by a thread that has not passed a safepoint since loading it,
-// and a collection, which needs every thread at a safepoint, is the point at
-// which no thread holds it: the snapshot is freed at the next one.
+// Readers of the image tree take no lock: a reader loads the current snapshot
+// and finishes with it without passing a safepoint, keeping only the
+// image_metadata_t it found, which is never freed. A replaced snapshot is
+// therefore unreachable once every thread has passed a safepoint, which a
+// collection guarantees, so it is freed at the next one.
 static void image_tree_retire(void *snapshot) JL_NOTSAFEPOINT
 {
     jl_gc_add_quiescent(jl_current_task->ptls, (void**)snapshot, free);
@@ -261,10 +260,9 @@ JL_DLLEXPORT size_t jl_external_blob_index(jl_value_t *v) JL_NOTSAFEPOINT
     return external_blob_index(v);
 }
 
-// The dependency closure of an image is fixed when it is loaded: the sysimage,
-// every image it was loaded against (transitively, from `depmods`), and
-// itself. Blobs are only ever appended, so the closure of blob `idx` is a
-// bitvector over blobs 0..idx that never changes afterwards.
+// The dependency closure of the image at blob `idx`: the sysimage, every image
+// it was loaded against (transitively, via `depmods`), and itself, as a
+// bitvector over blobs 0..idx. Blobs are only appended, so it never changes.
 static uint32_t *image_closure_new(size_t idx, jl_array_t *depmods) JL_NOTSAFEPOINT
 {
     uint32_t *closure = (uint32_t*)calloc_s(bitvector_nwords(idx + 1) * sizeof(uint32_t));
@@ -859,8 +857,7 @@ static void jl_insert_into_serialization_queue(jl_serializer_state *s, jl_value_
     }
     if (jl_is_mtable(v)) {
         jl_methtable_t *mt = (jl_methtable_t*)v;
-        // The contributor tags name this process's linkage blobs, so every
-        // process starts afresh
+        // The contributor tags name this process's linkage blobs, so they are not saved
         record_field_change((jl_value_t**)&mt->contributors, jl_an_empty_memory_any);
         // Any back-edges will be re-validated and added by staticdata.jl, so
         // drop them from the image here
@@ -4738,8 +4735,8 @@ static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
     meta->base = (uintptr_t)image_base;
     meta->relocs_base = (void*)relocs_base;
     meta->closure = NULL; // until the blob index is known
-    // the sysimage's methods are all active by the world it was saved in; a
-    // package image's are activated by the caller, which records that world
+    // the sysimage's methods are active by jl_require_world; a package image's
+    // are activated by the caller, which records the world
     jl_atomic_store_relaxed(&meta->world, restored == NULL ? jl_require_world : 0);
     if (meta_out)
         *meta_out = meta;
@@ -4760,9 +4757,7 @@ static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
         if (!meta->coverage_compatible)
             meta->coverage_compatible = jl_coverage_plain_image_accepted(checksum, topmod->build_id.lo);
     }
-    // the blob index is the range's position, assigned under the tree's lock
-    // since another image may be being added; nothing can reach this image's
-    // objects, nor ask for its closure, until its methods are activated
+    // the tree assigns the index under its lock, as other images may be loading
     meta->idx = eyt_tree_add_range(&image_tree,
         (uintptr_t)image_base,
         (uintptr_t)image_base + sizeof_sysimg,

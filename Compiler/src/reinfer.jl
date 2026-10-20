@@ -19,9 +19,7 @@ struct VerifyMethodInitialState
     mi::MethodInstance
     def::Method
     callees::Core.SimpleVector
-    # the linkage blob of the image owning `codeinst`, whose precompile worker recorded
-    # `callees` and whose dependency closure the worker saw (typemax: no image)
-    image::UInt
+    image::UInt # linkage blob of the image owning `codeinst`, or typemax for none (see sig_contributors_world)
 end
 
 struct VerifyMethodWorkState
@@ -145,16 +143,13 @@ function scan_new_code!(internal_methods::Vector{Any}, workspace::VerifyMethodWo
     end
 end
 
-# If every method contributor to the call signature's typenames in `mt`, the
-# table the live lookup of this edge would search, lies in the dependency
-# closure of the image at linkage blob `image`, which owns the code being
-# verified, the world since which all of them have been active, else zero (see
-# jl_sig_contributors_world). From that world on, such a signature has matched
-# exactly the methods that image's precompile worker matched, so the worker's
-# verdict is trusted instead of matching again, with that world as its min
-# world: a live match bounds its min world by the youngest entry intersecting
-# the signature, which was active by then. Invalidation debugging wants every
-# edge matched.
+# The world since which every method on the typenames of `sig` in `mt` has come
+# from an image in the dependency closure of the image at linkage blob `image`,
+# or zero if one came from elsewhere (see jl_sig_contributors_world). From that
+# world on, `sig` has matched exactly what that image's precompile worker
+# matched, so the worker's verdict can stand in for a live match, with that
+# world as its min world. `mt` is the table the live match would search. Zero
+# under the invalidation debugger, which wants every edge matched.
 function sig_contributors_world(@nospecialize(sig), mt::Core.MethodTable, image::UInt)
     _jl_debug_method_invalidation[] === nothing || return UInt(0)
     image == typemax(UInt) && return UInt(0) # code of no image has no worker's verdict
@@ -750,18 +745,13 @@ function verify_call(@nospecialize(sig), expecteds::Core.SimpleVector, i::Int, n
                 end
             end
         end
-        # Next, trust the precompile worker's verdict if nothing can have changed the
-        # match set since (see sig_contributors_world). An edge with no targets (a
-        # missing or ambiguous call) records no verdict about the targets, so it is
-        # matched live.
-        if n > 0
-            # Core.methodtable: the table verify_call_lookup searches
-            let minworld = sig_contributors_world(sig, Core.methodtable, image)
-                if minworld != 0
-                    @assert minworld ≤ world "contributor activated after the verification world"
-                    promote_mi_to_current(mi, minworld, world)
-                    return minworld, typemax(UInt)
-                end
+        # Trust the precompile worker's verdict while the methods it matched `sig`
+        # against are exactly the methods there are (see sig_contributors_world).
+        let minworld = sig_contributors_world(sig, Core.methodtable, image) # the table verify_call_lookup searches
+            if minworld != 0
+                @assert minworld ≤ world "contributor activated after the verification world"
+                promote_mi_to_current(mi, minworld, world)
+                return minworld, typemax(UInt)
             end
         end
         # Try the interference set fast path (used by both n==1, when the O(1) checks above
@@ -873,8 +863,8 @@ function verify_call(@nospecialize(sig), expecteds::Core.SimpleVector, i::Int, n
     return minworld, maxworld
 end
 
-# record on `mi`, found to be the only match of its signature as of `world` since
-# `minworld`, that its method dominates it, for the O(1) fast path of later checks
+# record on `mi`, the only match of its signature from `minworld` through `world`,
+# that its method dominates the signature, for the O(1) check above
 function promote_mi_to_current(mi::Union{Nothing,MethodInstance}, minworld::UInt, world::UInt)
     if mi isa MethodInstance
         ccall(:jl_promote_mi_to_current, Cvoid, (Any, UInt, UInt), mi, minworld, world)
@@ -897,7 +887,7 @@ function verify_invokesig(@nospecialize(invokesig), expected::Method, world::UIn
             minworld = 1
             maxworld = 0
         elseif method_is_latest_which(expected) && (minworld = sig_contributors_world(invokesig, mt, image)) != 0
-            # the precompile worker's verdict (see sig_contributors_world)
+            # the precompile worker's verdict stands (see sig_contributors_world)
             @assert minworld ≤ world "contributor activated after the verification world"
             maxworld = typemax(UInt)
         else

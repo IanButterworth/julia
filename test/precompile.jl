@@ -2274,21 +2274,20 @@ precompile_test_harness("trusted edges: load order") do load_path
         print(Base.invokelatest(TrustedEdgeExtA.callf), " ", Base.invokelatest(TrustedEdgeDep.f, 1))
         """)
     @test out == "a a"
-    # a trusted edge backdates the caller to its contributors' activation
+    # a trusted edge is valid since the youngest contributor to TrustedEdgeDep.f,
+    # TrustedEdgeExtA itself, was activated
     out = trusted_edge_test_output(load_path, depot, """
         using TrustedEdgeDep, TrustedEdgeExtA
         mi = only(Base.specializations(only(methods(TrustedEdgeExtA.callf))))
         ci = mi.cache
-        # valid since the youngest contributor to TrustedEdgeDep.f, TrustedEdgeExtA itself, was activated
         print(ci.min_world == only(methods(TrustedEdgeExtA.callf)).primary_world, " ", ci.max_world == typemax(UInt))
         """)
     @test out == "true true"
-    # the closure recorded for an image when it is loaded is the images it was
-    # loaded against plus itself, and the question is asked for the linkage
-    # blob owning an object: TrustedEdgeDep.f has contributors in both
-    # TrustedEdgeDep and TrustedEdgeExtA, so its contributors are in the closure
-    # of TrustedEdgeExtA, but not in that of TrustedEdgeDep, of the sysimage,
-    # or of no image
+    # an image's closure is the images it was loaded against plus itself, and the
+    # question is asked for the blob owning an object: the contributors to
+    # TrustedEdgeDep.f, TrustedEdgeDep and TrustedEdgeExtA, are in the closure of
+    # TrustedEdgeExtA but not in that of TrustedEdgeDep, of the sysimage, or of
+    # no image
     out = trusted_edge_test_output(load_path, depot, """
         using TrustedEdgeDep, TrustedEdgeExtA
         sig = Tuple{typeof(TrustedEdgeDep.f), Int}
@@ -2323,7 +2322,9 @@ precompile_test_harness("trusted edges: a method on a kind outside the closure")
         precompile(callbar, ())
         end
         """)
-    # outside the caller's dependency closure, and makes its call ambiguous
+    # a method on a kind applies to the constructor call of every type, so it is
+    # a contributor to the caller's signature from outside its dependency closure,
+    # and makes the call ambiguous
     write(joinpath(load_path, "TrustedEdgeKindPirate.jl"),
         """
         module TrustedEdgeKindPirate

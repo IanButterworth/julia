@@ -1,11 +1,10 @@
 // This file is a part of Julia. License is MIT: https://julialang.org/license
 
-// Eytzinger tree for fast address range lookups, lock-free for readers: a
-// writer publishes an immutable snapshot of the whole tree, and a reader uses
-// whichever snapshot it loaded without taking any lock. A replaced snapshot
-// is retired by the tree's owner once no reader can still hold it, so every
-// reader loads the snapshot and finishes with it without passing a safepoint
-// in between: see _eyt_tree_snapshot.
+// Eytzinger tree for fast address range lookups. Readers take no lock: a
+// writer publishes a new immutable snapshot of the whole tree, and a reader
+// uses the snapshot it loaded. The tree's owner retires a replaced snapshot
+// once no reader can still hold it, so a reader must not pass a safepoint
+// while using one: see _eyt_tree_snapshot.
 // See https://algorithmica.org/en/eytzinger
 
 #ifndef JL_EYTZINGER_H
@@ -85,12 +84,10 @@ typedef struct {
 typedef struct eyt_tree_t {
     _Atomic(eyt_snapshot_t*) snapshot; // the current version
     uv_mutex_t writelock; // serializes writers
-    // Called, under the write lock, with a snapshot that a new one has
-    // replaced. A reader may still be using it, so the callback must defer
-    // freeing it until every thread has since passed a safepoint, which no
-    // reader holds a snapshot across (jl_gc_add_quiescent frees at the next
-    // collection, which needs that of every thread), or free it at once when
-    // there are no concurrent readers. NULL leaks it.
+    // Called under the write lock with the snapshot that a new one replaced.
+    // Readers may still hold it, so the callback must not free it until every
+    // thread has passed a safepoint (jl_gc_add_quiescent does), unless there
+    // are no concurrent readers. NULL leaks it.
     void (*retire)(void *snapshot);
 } eyt_tree_t;
 
@@ -104,13 +101,12 @@ JL_DLLEXPORT void eyt_tree_init(eyt_tree_t *t, void (*retire)(void *snapshot)) J
 // numbered in insertion order. Thread-safe against readers and other writers.
 JL_DLLEXPORT size_t eyt_tree_add_range(eyt_tree_t *t, uintptr_t start, uintptr_t end, void *data) JL_NOTSAFEPOINT;
 
-// The current snapshot, for the readers below only: it stays valid until the
-// thread next passes a safepoint, after which `retire` may have freed it, so
-// a reader loads it and finishes with it in one JL_NOTSAFEPOINT body and never
-// stores or returns it. What it returns to callers (range data) is the
-// caller's own, with the caller's lifetime. A relaxed load is enough: every
-// read of the snapshot's contents depends on the loaded address, which orders
-// it after the writer's release store on every target we support.
+// The current snapshot, for the readers below: it is valid only until the
+// thread next passes a safepoint, so a reader uses it within one
+// JL_NOTSAFEPOINT body and never stores or returns it (range data has the
+// caller's lifetime). A relaxed load suffices: every read of the snapshot
+// depends on the loaded address, which orders it after the writer's release
+// store on every target we support.
 static inline eyt_snapshot_t *_eyt_tree_snapshot(eyt_tree_t *t) JL_NOTSAFEPOINT
 {
     return jl_atomic_load_relaxed(&t->snapshot);
