@@ -2832,8 +2832,12 @@ JL_DLLEXPORT void jl_method_table_add_backedge(jl_value_t *typ, jl_code_instance
 // and itself, as staticdata.c recorded when the image was loaded) still has
 // the method-match set its precompile worker computed the edge against, so the
 // worker's verdict holds and the loader can skip matching that edge again
-// (jl_edge_sig_replayable). The tags name this process's blobs, so the table
-// is dropped from images. Writers hold mt->cache->writelock; the query reads
+// (jl_sig_contributors_in_closure). That the set of sources, not their order, decides
+// the match set relies on overwriting a method being an error during
+// incremental precompilation: a worker never sees two of its images define
+// the same signature, so neither does an image's closure. The tags name
+// this process's blobs, so the table is dropped from images. Writers hold
+// mt->cache->writelock; the query reads
 // without it, as the table is published with release stores and each tag
 // vector is replaced, never grown, when a source is added to it.
 
@@ -2911,25 +2915,14 @@ static int32_t contributor_tag_for(jl_method_t *method) JL_NOTSAFEPOINT
     return jl_object_in_image((jl_value_t*)method) ? (int32_t)jl_external_blob_index((jl_value_t*)method) : -1;
 }
 
-static int edge_replay_enabled(void) JL_NOTSAFEPOINT
+// Does every contributor to the typenames of `sig` in `mt` lie within the
+// dependency closure of the image at linkage blob `image`? If so, the
+// method-match set of `sig` is the one that image's precompile worker saw.
+// The answer holds until the world next changes: a contributor being added
+// concurrently moves the world, which the caller stamps its result with.
+JL_DLLEXPORT int jl_sig_contributors_in_closure(jl_value_t *sig, jl_methtable_t *mt, size_t image) JL_CANSAFEPOINT
 {
-    static int enabled = -1;
-    if (enabled == -1) {
-        // JULIA_EDGE_REPLAY=0 makes the loader match every edge again
-        const char *e = getenv("JULIA_EDGE_REPLAY");
-        enabled = e == NULL || e[0] != '0';
-    }
-    return enabled;
-}
-
-// Is `sig`'s method-match set in `mt` provably the one seen by the precompile
-// worker of the image at linkage blob `image`, i.e. does every contributor to
-// its typenames lie within that image's dependency closure? The answer holds
-// until the world next changes: a contributor being added concurrently moves
-// the world, which the caller stamps its result with.
-JL_DLLEXPORT int jl_edge_sig_replayable(jl_value_t *sig, jl_methtable_t *mt, size_t image) JL_CANSAFEPOINT
-{
-    if (image == (size_t)-1 || !edge_replay_enabled())
+    if (image == (size_t)-1)
         return 0;
     struct _typename_check_contributor_env env = {mt, image, 1};
     int decomposed = jl_foreach_top_typename_for(_typename_check_contributor, sig, 1, &env);
@@ -3238,7 +3231,7 @@ JL_DLLEXPORT void jl_method_table_disable(jl_method_t *method) JL_CANSAFEPOINT
         jl_atomic_store_relaxed(&methodentry->max_world, world);
         jl_method_table_invalidate(method, world, 1);
         JL_LOCK(&mt->cache->writelock);
-        contributor_tag_method(mt, method, -1); // a deletion poisons the function for edge replay
+        contributor_tag_method(mt, method, -1); // a deletion is a contributor of no image
         JL_UNLOCK(&mt->cache->writelock);
         jl_atomic_store_release(&jl_world_counter, world + 1);
     }

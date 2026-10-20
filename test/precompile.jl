@@ -2198,237 +2198,234 @@ precompile_test_harness("Issue #48391") do load_path
     @test_throws ErrorException isless(x, x)
 end
 
-# Edge replay: a package image's call edges whose method-match set provably
-# equals the one its precompile worker saw are not matched again at load. Every
-# scenario below loads in a fresh process so each load order starts from the
-# images alone.
+# Trusted image edges: a package image's call edges whose method-match set
+# provably equals the one its precompile worker saw are not matched again at
+# load. Every scenario below loads in a fresh process so each load order starts
+# from the images alone.
 let exename = `$(Base.julia_cmd()) --startup-file=no`
-    global function edge_replay_test_output(load_path, depot, body; replay::Bool=true)
+    global function trusted_edge_test_output(load_path, depot, body)
         code = """
             insert!(LOAD_PATH, 1, $(repr(load_path)))
             insert!(DEPOT_PATH, 1, $(repr(depot)))
             $body
             """
-        cmd = `$exename -e $code`
-        return readchomp(replay ? cmd : addenv(cmd, "JULIA_EDGE_REPLAY" => "0"))
+        return readchomp(`$exename -e $code`)
     end
 end
 
-precompile_test_harness("edge replay: load order") do load_path
-    write(joinpath(load_path, "EdgeReplayDep.jl"),
+precompile_test_harness("trusted edges: load order") do load_path
+    write(joinpath(load_path, "TrustedEdgeDep.jl"),
         """
-        module EdgeReplayDep
+        module TrustedEdgeDep
         f(x) = :dep
         end
         """)
-    # two extenders of EdgeReplayDep.f, each precompiled without knowledge of the
+    # two extenders of TrustedEdgeDep.f, each precompiled without knowledge of the
     # other; their callers are inferred against their own method only
-    write(joinpath(load_path, "EdgeReplayExtA.jl"),
+    write(joinpath(load_path, "TrustedEdgeExtA.jl"),
         """
-        module EdgeReplayExtA
-        using EdgeReplayDep
-        EdgeReplayDep.f(::Integer) = :a
-        callf() = EdgeReplayDep.f(1)
+        module TrustedEdgeExtA
+        using TrustedEdgeDep
+        TrustedEdgeDep.f(::Integer) = :a
+        callf() = TrustedEdgeDep.f(1)
         precompile(callf, ())
         end
         """)
-    write(joinpath(load_path, "EdgeReplayExtB.jl"),
+    write(joinpath(load_path, "TrustedEdgeExtB.jl"),
         """
-        module EdgeReplayExtB
-        using EdgeReplayDep
-        EdgeReplayDep.f(::Signed) = :b
-        callf() = EdgeReplayDep.f(1)
+        module TrustedEdgeExtB
+        using TrustedEdgeDep
+        TrustedEdgeDep.f(::Signed) = :b
+        callf() = TrustedEdgeDep.f(1)
         precompile(callf, ())
         end
         """)
-    Base.compilecache(Base.PkgId("EdgeReplayDep"))
-    Base.compilecache(Base.PkgId("EdgeReplayExtA"))
-    Base.compilecache(Base.PkgId("EdgeReplayExtB"))
+    Base.compilecache(Base.PkgId("TrustedEdgeDep"))
+    Base.compilecache(Base.PkgId("TrustedEdgeExtA"))
+    Base.compilecache(Base.PkgId("TrustedEdgeExtB"))
     depot = DEPOT_PATH[1]
     # whichever loads second, the more specific method wins everywhere: A's caller
     # is invalidated by B's activation, or verified against B's method (a
     # contributor outside A's dependency closure) at A's load
-    for order in (("EdgeReplayExtA", "EdgeReplayExtB"), ("EdgeReplayExtB", "EdgeReplayExtA"))
-        out = edge_replay_test_output(load_path, depot, """
-            using EdgeReplayDep, $(order[1]), $(order[2])
-            print(Base.invokelatest(EdgeReplayExtA.callf), " ", Base.invokelatest(EdgeReplayExtB.callf), " ",
-                  Base.invokelatest(EdgeReplayDep.f, 1))
+    for order in (("TrustedEdgeExtA", "TrustedEdgeExtB"), ("TrustedEdgeExtB", "TrustedEdgeExtA"))
+        out = trusted_edge_test_output(load_path, depot, """
+            using TrustedEdgeDep, $(order[1]), $(order[2])
+            print(Base.invokelatest(TrustedEdgeExtA.callf), " ", Base.invokelatest(TrustedEdgeExtB.callf), " ",
+                  Base.invokelatest(TrustedEdgeDep.f, 1))
             """)
         @test out == "b b b"
     end
     # a method defined in the session before loading is foreign to the image's
     # dependency closure and must be matched live
-    out = edge_replay_test_output(load_path, depot, """
-        using EdgeReplayDep
-        EdgeReplayDep.f(::Int) = :session
-        using EdgeReplayExtA
-        print(Base.invokelatest(EdgeReplayExtA.callf), " ", Base.invokelatest(EdgeReplayDep.f, 1))
+    out = trusted_edge_test_output(load_path, depot, """
+        using TrustedEdgeDep
+        TrustedEdgeDep.f(::Int) = :session
+        using TrustedEdgeExtA
+        print(Base.invokelatest(TrustedEdgeExtA.callf), " ", Base.invokelatest(TrustedEdgeDep.f, 1))
         """)
     @test out == "session session"
     # a deletion in the session leaves no method behind but marks the function,
     # so the image's edges to it are matched live
-    out = edge_replay_test_output(load_path, depot, """
-        using EdgeReplayDep
-        EdgeReplayDep.f(::Int) = :session
-        Base.delete_method(which(EdgeReplayDep.f, (Int,)))
-        using EdgeReplayExtA
-        print(Base.invokelatest(EdgeReplayExtA.callf), " ", Base.invokelatest(EdgeReplayDep.f, 1))
+    out = trusted_edge_test_output(load_path, depot, """
+        using TrustedEdgeDep
+        TrustedEdgeDep.f(::Int) = :session
+        Base.delete_method(which(TrustedEdgeDep.f, (Int,)))
+        using TrustedEdgeExtA
+        print(Base.invokelatest(TrustedEdgeExtA.callf), " ", Base.invokelatest(TrustedEdgeDep.f, 1))
         """)
     @test out == "a a"
-    # a replayed edge gives the caller the same world range as matching it live
-    worlds = """
-        using EdgeReplayDep, EdgeReplayExtA
-        mi = only(Base.specializations(only(methods(EdgeReplayExtA.callf))))
+    # a trusted edge leaves the caller valid in the current world
+    out = trusted_edge_test_output(load_path, depot, """
+        using TrustedEdgeDep, TrustedEdgeExtA
+        mi = only(Base.specializations(only(methods(TrustedEdgeExtA.callf))))
         ci = mi.cache
-        print(ci.min_world, " ", ci.max_world == typemax(UInt))
-        """
-    out = edge_replay_test_output(load_path, depot, worlds)
-    @test endswith(out, " true")
-    @test out == edge_replay_test_output(load_path, depot, worlds; replay=false)
+        print(ci.min_world ≤ Base.get_world_counter(), " ", ci.max_world == typemax(UInt))
+        """)
+    @test out == "true true"
     # the closure recorded for an image when it is loaded is the images it was
-    # loaded against plus itself, and a signature's verdict is asked for the
-    # linkage blob owning an object: EdgeReplayDep.f has contributors in both
-    # EdgeReplayDep and EdgeReplayExtA, so the signature replays for objects
-    # of EdgeReplayExtA, but not for those of EdgeReplayDep, of the sysimage,
+    # loaded against plus itself, and the question is asked for the linkage
+    # blob owning an object: TrustedEdgeDep.f has contributors in both
+    # TrustedEdgeDep and TrustedEdgeExtA, so its contributors are in the closure
+    # of TrustedEdgeExtA, but not in that of TrustedEdgeDep, of the sysimage,
     # or of no image
-    out = edge_replay_test_output(load_path, depot, """
-        using EdgeReplayDep, EdgeReplayExtA
-        sig = Tuple{typeof(EdgeReplayDep.f), Int}
-        replayable(sig, obj) = ccall(:jl_edge_sig_replayable, Cint, (Any, Any, Csize_t), sig, Core.methodtable,
+    out = trusted_edge_test_output(load_path, depot, """
+        using TrustedEdgeDep, TrustedEdgeExtA
+        sig = Tuple{typeof(TrustedEdgeDep.f), Int}
+        in_closure(sig, obj) = ccall(:jl_sig_contributors_in_closure, Cint, (Any, Any, Csize_t), sig, Core.methodtable,
                                      ccall(:jl_external_blob_index, Csize_t, (Any,), obj))
-        print(replayable(sig, EdgeReplayExtA), " ", replayable(sig, only(methods(EdgeReplayExtA.callf))), " ",
-              replayable(sig, EdgeReplayDep), " ", replayable(sig, Base), " ", replayable(sig, Main))
+        print(in_closure(sig, TrustedEdgeExtA), " ", in_closure(sig, only(methods(TrustedEdgeExtA.callf))), " ",
+              in_closure(sig, TrustedEdgeDep), " ", in_closure(sig, Base), " ", in_closure(sig, Main))
         # a method on Type{Union{}} meets the constructors of every family, so defining one
         # poisons every constructor signature, but no other
         ctor = Tuple{Type{Int}, Int}
-        print(" ", replayable(ctor, EdgeReplayExtA))
+        print(" ", in_closure(ctor, TrustedEdgeExtA))
         (::Type{Union{}})(::Int) = 0
-        print(" ", replayable(ctor, EdgeReplayExtA), " ", replayable(sig, EdgeReplayExtA))
+        print(" ", in_closure(ctor, TrustedEdgeExtA), " ", in_closure(sig, TrustedEdgeExtA))
         """)
     @test out == "1 1 0 0 0 1 0 1"
 end
 
-precompile_test_harness("edge replay: a method on a kind outside the closure") do load_path
-    write(joinpath(load_path, "EdgeReplayKindDep.jl"),
+precompile_test_harness("trusted edges: a method on a kind outside the closure") do load_path
+    write(joinpath(load_path, "TrustedEdgeKindDep.jl"),
         """
-        module EdgeReplayKindDep
+        module TrustedEdgeKindDep
         abstract type Bar end
         struct F end
         (::Type{T})(x::F, y) where {T<:Bar} = :bar
         end
         """)
-    write(joinpath(load_path, "EdgeReplayKindUser.jl"),
+    write(joinpath(load_path, "TrustedEdgeKindUser.jl"),
         """
-        module EdgeReplayKindUser
-        using EdgeReplayKindDep: Bar, F
+        module TrustedEdgeKindUser
+        using TrustedEdgeKindDep: Bar, F
         callbar() = Bar(F(), F())
         precompile(callbar, ())
         end
         """)
     # outside the caller's dependency closure, and makes its call ambiguous
-    write(joinpath(load_path, "EdgeReplayKindPirate.jl"),
+    write(joinpath(load_path, "TrustedEdgeKindPirate.jl"),
         """
-        module EdgeReplayKindPirate
-        using EdgeReplayKindDep: F
+        module TrustedEdgeKindPirate
+        using TrustedEdgeKindDep: F
         (::DataType)(x::F, y::F) = :kind
         end
         """)
-    for name in ("EdgeReplayKindDep", "EdgeReplayKindUser", "EdgeReplayKindPirate")
+    for name in ("TrustedEdgeKindDep", "TrustedEdgeKindUser", "TrustedEdgeKindPirate")
         Base.compilecache(Base.PkgId(name))
     end
-    out = edge_replay_test_output(load_path, DEPOT_PATH[1], """
-        using EdgeReplayKindPirate
-        using EdgeReplayKindUser
-        print(try EdgeReplayKindUser.callbar() catch err; occursin("ambiguous", sprint(showerror, err)) end)
+    out = trusted_edge_test_output(load_path, DEPOT_PATH[1], """
+        using TrustedEdgeKindPirate
+        using TrustedEdgeKindUser
+        print(try TrustedEdgeKindUser.callbar() catch err; occursin("ambiguous", sprint(showerror, err)) end)
         """)
     @test out == "true"
 end
 
-precompile_test_harness("edge replay: extension activation") do load_path
+precompile_test_harness("trusted edges: extension activation") do load_path
     host_uuid = "0f0f2a5c-6c6d-4b1e-9d2a-2e7d5b7a1c01"
     trig_uuid = "9b4b1d2e-7a3f-4c0e-8f6b-5a2c1d3e4f02"
-    mkpath(joinpath(load_path, "EdgeReplayHost", "src")); mkpath(joinpath(load_path, "EdgeReplayHost", "ext"))
-    mkpath(joinpath(load_path, "EdgeReplayTrig", "src"))
+    mkpath(joinpath(load_path, "TrustedEdgeHost", "src")); mkpath(joinpath(load_path, "TrustedEdgeHost", "ext"))
+    mkpath(joinpath(load_path, "TrustedEdgeTrig", "src"))
     write(joinpath(load_path, "Project.toml"),
         """
         [deps]
-        EdgeReplayHost = "$host_uuid"
-        EdgeReplayTrig = "$trig_uuid"
+        TrustedEdgeHost = "$host_uuid"
+        TrustedEdgeTrig = "$trig_uuid"
         """)
     write(joinpath(load_path, "Manifest.toml"),
         """
         julia_version = "$(VERSION)"
         manifest_format = "2.0"
 
-        [[deps.EdgeReplayHost]]
-        path = "EdgeReplayHost"
+        [[deps.TrustedEdgeHost]]
+        path = "TrustedEdgeHost"
         uuid = "$host_uuid"
         version = "0.1.0"
-        weakdeps = ["EdgeReplayTrig"]
+        weakdeps = ["TrustedEdgeTrig"]
 
-            [deps.EdgeReplayHost.extensions]
-            EdgeReplayHostExt = "EdgeReplayTrig"
+            [deps.TrustedEdgeHost.extensions]
+            TrustedEdgeHostExt = "TrustedEdgeTrig"
 
-        [[deps.EdgeReplayTrig]]
-        path = "EdgeReplayTrig"
+        [[deps.TrustedEdgeTrig]]
+        path = "TrustedEdgeTrig"
         uuid = "$trig_uuid"
         version = "0.1.0"
         """)
-    write(joinpath(load_path, "EdgeReplayHost", "Project.toml"),
+    write(joinpath(load_path, "TrustedEdgeHost", "Project.toml"),
         """
-        name = "EdgeReplayHost"
+        name = "TrustedEdgeHost"
         uuid = "$host_uuid"
         version = "0.1.0"
 
         [weakdeps]
-        EdgeReplayTrig = "$trig_uuid"
+        TrustedEdgeTrig = "$trig_uuid"
 
         [extensions]
-        EdgeReplayHostExt = "EdgeReplayTrig"
+        TrustedEdgeHostExt = "TrustedEdgeTrig"
         """)
-    write(joinpath(load_path, "EdgeReplayHost", "src", "EdgeReplayHost.jl"),
+    write(joinpath(load_path, "TrustedEdgeHost", "src", "TrustedEdgeHost.jl"),
         """
-        module EdgeReplayHost
+        module TrustedEdgeHost
         h(x) = :host
         callh() = h(1)
         precompile(callh, ())
         end
         """)
-    write(joinpath(load_path, "EdgeReplayHost", "ext", "EdgeReplayHostExt.jl"),
+    write(joinpath(load_path, "TrustedEdgeHost", "ext", "TrustedEdgeHostExt.jl"),
         """
-        module EdgeReplayHostExt
-        using EdgeReplayHost, EdgeReplayTrig
-        EdgeReplayHost.h(::Int) = :ext
+        module TrustedEdgeHostExt
+        using TrustedEdgeHost, TrustedEdgeTrig
+        TrustedEdgeHost.h(::Int) = :ext
         end
         """)
-    write(joinpath(load_path, "EdgeReplayTrig", "Project.toml"),
+    write(joinpath(load_path, "TrustedEdgeTrig", "Project.toml"),
         """
-        name = "EdgeReplayTrig"
+        name = "TrustedEdgeTrig"
         uuid = "$trig_uuid"
         version = "0.1.0"
         """)
-    write(joinpath(load_path, "EdgeReplayTrig", "src", "EdgeReplayTrig.jl"),
+    write(joinpath(load_path, "TrustedEdgeTrig", "src", "TrustedEdgeTrig.jl"),
         """
-        module EdgeReplayTrig
+        module TrustedEdgeTrig
         end
         """)
-    Base.compilecache(Base.PkgId(Base.UUID(host_uuid), "EdgeReplayHost"))
-    Base.compilecache(Base.PkgId(Base.UUID(trig_uuid), "EdgeReplayTrig"))
+    Base.compilecache(Base.PkgId(Base.UUID(host_uuid), "TrustedEdgeHost"))
+    Base.compilecache(Base.PkgId(Base.UUID(trig_uuid), "TrustedEdgeTrig"))
     depot = DEPOT_PATH[1]
-    # the host's replayed caller keeps its backedges, so the extension's method
+    # the host's trusted caller keeps its backedges, so the extension's method
     # invalidates it when the trigger loads later
-    out = edge_replay_test_output(load_path, depot, """
-        using EdgeReplayHost
-        before = Base.invokelatest(EdgeReplayHost.callh)
-        using EdgeReplayTrig
-        print(before, " ", Base.invokelatest(EdgeReplayHost.callh))
+    out = trusted_edge_test_output(load_path, depot, """
+        using TrustedEdgeHost
+        before = Base.invokelatest(TrustedEdgeHost.callh)
+        using TrustedEdgeTrig
+        print(before, " ", Base.invokelatest(TrustedEdgeHost.callh))
         """)
     @test out == "host ext"
     # the other order: the extension activates as soon as the host arrives
-    out = edge_replay_test_output(load_path, depot, """
-        using EdgeReplayTrig
-        using EdgeReplayHost
-        print(Base.invokelatest(EdgeReplayHost.callh))
+    out = trusted_edge_test_output(load_path, depot, """
+        using TrustedEdgeTrig
+        using TrustedEdgeHost
+        print(Base.invokelatest(TrustedEdgeHost.callh))
         """)
     @test out == "ext"
 end

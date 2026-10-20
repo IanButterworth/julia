@@ -1442,8 +1442,8 @@ JL_DLLEXPORT uint8_t jl_object_in_image(jl_value_t* v) JL_NOTSAFEPOINT;
 JL_DLLEXPORT size_t jl_external_blob_index(jl_value_t *v) JL_NOTSAFEPOINT;
 // Is linkage blob `blob` in the dependency closure recorded for linkage blob `image`?
 JL_DLLEXPORT int jl_linkage_blob_in_closure(size_t image, size_t blob) JL_NOTSAFEPOINT;
-// edge replay from the method-table contributor tags (gf.c)
-JL_DLLEXPORT int jl_edge_sig_replayable(jl_value_t *sig, jl_methtable_t *mt, size_t image) JL_CANSAFEPOINT;
+// whether every contributor to a signature's typenames is in an image's closure (gf.c)
+JL_DLLEXPORT int jl_sig_contributors_in_closure(jl_value_t *sig, jl_methtable_t *mt, size_t image) JL_CANSAFEPOINT;
 // GC configuration baked into generated code; must match between an image and the runtime that loads it.
 JL_DLLEXPORT const char *jl_gc_image_abi(void) JL_NOTSAFEPOINT;
 
