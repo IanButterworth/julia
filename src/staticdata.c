@@ -199,6 +199,8 @@ typedef struct {
     jl_module_t *top_mod;    // owning top-level module
     size_t idx;              // range index in image_tree (for serialization)
     int coverage_compatible; // counters support the requested coverage mode
+    size_t *closure;         // bitset over blobs 0..idx: the images this one was
+                             // loaded against, transitively, and itself
 } image_metadata_t;
 
 void jl_init_staticdata(void)
@@ -240,46 +242,40 @@ static size_t external_blob_index(jl_value_t *v) JL_NOTSAFEPOINT
     return meta ? meta->idx : (size_t)-1;
 }
 
-size_t jl_external_blob_index(jl_value_t *v) JL_NOTSAFEPOINT
+JL_DLLEXPORT size_t jl_external_blob_index(jl_value_t *v) JL_NOTSAFEPOINT
 {
     return external_blob_index(v);
 }
 
-// Install, for edge replay during a package image's edge verification, the
-// bitset of linkage blobs forming its dependency closure: the sysimage, each
-// dependency image (depmods), and the loading image itself, found from the
-// first image-owned object of its internal methods list.
-static size_t *loading_closure_bits_owned = NULL;
-JL_DLLEXPORT void jl_set_loading_closure_from_depmods(jl_array_t *depmods, jl_array_t *anchors) JL_NOTSAFEPOINT
+#define CLOSURE_WORD_BITS (8 * sizeof(size_t))
+#define CLOSURE_NWORDS(idx) (((idx) + 1 + CLOSURE_WORD_BITS - 1) / CLOSURE_WORD_BITS)
+
+// The dependency closure of an image is fixed when it is loaded: the sysimage,
+// every image it was loaded against (transitively, from `depmods`), and
+// itself. Blobs are only ever appended, so the closure of blob `idx` is a
+// bitset over blobs 0..idx that never changes afterwards.
+static size_t *image_closure_new(size_t idx, jl_array_t *depmods) JL_NOTSAFEPOINT
 {
-    size_t nblobs = n_linkage_blobs();
-    size_t nwords = (nblobs + 8 * sizeof(size_t) - 1) / (8 * sizeof(size_t));
-    size_t *bits = (size_t*)calloc_s((nwords ? nwords : 1) * sizeof(size_t));
-    bits[0] |= 1; // the sysimage
-    for (size_t i = 0, ld = jl_array_nrows(depmods); i < ld; i++) {
-        size_t idx = external_blob_index(jl_array_ptr_ref(depmods, i));
-        if (idx < nblobs)
-            bits[idx / (8 * sizeof(size_t))] |= (size_t)1 << (idx % (8 * sizeof(size_t)));
+    size_t *closure = (size_t*)calloc_s(CLOSURE_NWORDS(idx) * sizeof(size_t));
+    closure[0] |= 1; // the sysimage
+    for (size_t i = 0, ld = depmods ? jl_array_nrows(depmods) : 0; i < ld; i++) {
+        image_metadata_t *dep = external_blob_metadata(jl_array_ptr_ref(depmods, i));
+        if (dep == NULL || dep->idx >= idx)
+            continue;
+        for (size_t w = 0; w < CLOSURE_NWORDS(dep->idx); w++)
+            closure[w] |= dep->closure[w];
     }
-    for (size_t i = 0, la = jl_array_nrows(anchors); i < la; i++) {
-        jl_value_t *a = jl_array_ptr_ref(anchors, i);
-        if (a && jl_object_in_image(a)) {
-            size_t idx = external_blob_index(a);
-            if (idx < nblobs)
-                bits[idx / (8 * sizeof(size_t))] |= (size_t)1 << (idx % (8 * sizeof(size_t)));
-            break;
-        }
-    }
-    assert(loading_closure_bits_owned == NULL);
-    loading_closure_bits_owned = bits;
-    jl_set_loading_closure_blobs(bits, nblobs);
+    closure[idx / CLOSURE_WORD_BITS] |= (size_t)1 << (idx % CLOSURE_WORD_BITS);
+    return closure;
 }
 
-JL_DLLEXPORT void jl_clear_loading_closure(void) JL_NOTSAFEPOINT
+// Is linkage blob `blob` in the dependency closure of linkage blob `image`?
+JL_DLLEXPORT int jl_linkage_blob_in_closure(size_t image, size_t blob) JL_NOTSAFEPOINT
 {
-    jl_set_loading_closure_blobs(NULL, 0);
-    free(loading_closure_bits_owned);
-    loading_closure_bits_owned = NULL;
+    if (image >= n_linkage_blobs() || blob > image)
+        return 0;
+    image_metadata_t *meta = (image_metadata_t*)image_tree.ranges[image].data;
+    return (meta->closure[blob / CLOSURE_WORD_BITS] >> (blob % CLOSURE_WORD_BITS)) & 1;
 }
 
 JL_DLLEXPORT uint8_t jl_object_in_image(jl_value_t *obj) JL_NOTSAFEPOINT
@@ -842,6 +838,9 @@ static void jl_insert_into_serialization_queue(jl_serializer_state *s, jl_value_
     }
     if (jl_is_mtable(v)) {
         jl_methtable_t *mt = (jl_methtable_t*)v;
+        // The contributor tags name this process's linkage blobs, so every
+        // process starts afresh
+        record_field_change((jl_value_t**)&mt->contributors, jl_an_empty_memory_any);
         // Any back-edges will be re-validated and added by staticdata.jl, so
         // drop them from the image here
         if (s->incremental || jl_options.trim || jl_options.strip_ir) {
@@ -4717,6 +4716,7 @@ static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
     meta->base = (uintptr_t)image_base;
     meta->relocs_base = (void*)relocs_base;
     meta->idx = n_linkage_blobs();
+    meta->closure = image_closure_new(meta->idx, depmods);
     // adopt the image's coverage counters
     meta->coverage_compatible = jl_register_image_coverage(image->coverage, !s.incremental);
     if (restored == NULL) {

@@ -2285,6 +2285,27 @@ precompile_test_harness("edge replay: load order") do load_path
     out = edge_replay_test_output(load_path, depot, worlds)
     @test endswith(out, " true")
     @test out == edge_replay_test_output(load_path, depot, worlds; replay=false)
+    # the closure recorded for an image when it is loaded is the images it was
+    # loaded against plus itself, and a signature's verdict is asked for the
+    # linkage blob owning an object: EdgeReplayDep.f has contributors in both
+    # EdgeReplayDep and EdgeReplayExtA, so the signature replays for objects
+    # of EdgeReplayExtA, but not for those of EdgeReplayDep, of the sysimage,
+    # or of no image
+    out = edge_replay_test_output(load_path, depot, """
+        using EdgeReplayDep, EdgeReplayExtA
+        sig = Tuple{typeof(EdgeReplayDep.f), Int}
+        replayable(sig, obj) = ccall(:jl_edge_sig_replayable, Cint, (Any, Any, Csize_t), sig, Core.methodtable,
+                                     ccall(:jl_external_blob_index, Csize_t, (Any,), obj))
+        print(replayable(sig, EdgeReplayExtA), " ", replayable(sig, only(methods(EdgeReplayExtA.callf))), " ",
+              replayable(sig, EdgeReplayDep), " ", replayable(sig, Base), " ", replayable(sig, Main))
+        # a method on Type{Union{}} meets the constructors of every family, so defining one
+        # poisons every constructor signature, but no other
+        ctor = Tuple{Type{Int}, Int}
+        print(" ", replayable(ctor, EdgeReplayExtA))
+        (::Type{Union{}})(::Int) = 0
+        print(" ", replayable(ctor, EdgeReplayExtA), " ", replayable(sig, EdgeReplayExtA))
+        """)
+    @test out == "1 1 0 0 0 1 0 1"
 end
 
 precompile_test_harness("edge replay: a method on a kind outside the closure") do load_path

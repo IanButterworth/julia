@@ -908,8 +908,15 @@ static void foreach_top_nth_typename(void (*f)(jl_typename_t*, int, void*) JL_CA
 
         if (jl_is_some_Type(current_a)) {
             *facts |= HAVE_TYPE;
-            arraylist_push(&workqueue, jl_some_Type_T(current_a));
-            arraylist_push(&workqueue, (void*)(uintptr_t)-1);
+            if (jl_is_typeofbottom_param(current_a)) {
+                // Type{Union{}} meets the Type{<:T} slot of every family, so key it
+                // as exactly Type, like Type{>:Any}, rather than under no family
+                *facts |= EXACTLY_TYPE;
+            }
+            else {
+                arraylist_push(&workqueue, jl_some_Type_T(current_a));
+                arraylist_push(&workqueue, (void*)(uintptr_t)-1);
+            }
         }
         else if (jl_is_datatype(current_a)) {
             if (current_n <= 0) {
@@ -2815,100 +2822,88 @@ JL_DLLEXPORT void jl_method_table_add_backedge(jl_value_t *typ, jl_code_instance
 }
 
 // ---- method-table contributor tracking ----
-// For every generic function, keyed by the same top-typename decomposition the
-// mt-backedge table uses, record which sources have added or deleted methods
-// under it during this session: the linkage blob index of the image that owns
-// an image method, or -1 for a run-time definition or deletion. While a package
-// image is being loaded, a call signature whose typenames have no contributor
-// outside the image's dependency closure (the sysimage, the images it was
-// precompiled against, and itself) still has the method-match set its
-// precompile worker computed the edge against, so the worker's verdict holds
-// and the loader can skip matching that edge again (jl_edge_sig_replayable).
-JL_DLLEXPORT jl_genericmemory_t *jl_method_contributors = NULL;
-jl_mutex_t jl_method_contributors_lock;
+// For every generic function of a method table, keyed by the same top-typename
+// decomposition as the table's mt-backedge table, `mt->contributors` records
+// which sources have added or deleted methods under it during this session:
+// the linkage blob index of the image that owns an image method, or -1 for a
+// run-time definition or deletion. While a package image's edges are being
+// verified, a call signature whose typenames have no contributor outside that
+// image's dependency closure (the sysimage, the images it was loaded against,
+// and itself, as staticdata.c recorded when the image was loaded) still has
+// the method-match set its precompile worker computed the edge against, so the
+// worker's verdict holds and the loader can skip matching that edge again
+// (jl_edge_sig_replayable). The tags name this process's blobs, so the table
+// is dropped from images. Writers hold mt->cache->writelock; the query reads
+// without it, as the table is published with release stores and each tag
+// vector is replaced, never grown, when a source is added to it.
 
-static size_t *jl_loading_closure_bits = NULL; // bitset over linkage blobs
-static size_t jl_loading_closure_nblobs = 0;
-
-// The verdict per signature for the image being loaded, valid while the world does
-// not change: (world << 1) | replayable, keyed by the signature. Edge lists repeat
-// signatures many times, and each verdict walks all of the signature's typenames.
-static htable_t edge_sig_verdicts;
-static int edge_sig_verdicts_init = 0;
-
-JL_DLLEXPORT void jl_set_loading_closure_blobs(size_t *bits, size_t nblobs) JL_NOTSAFEPOINT
+// add `tag` to the contributors of `tn` in `mt`, unless already present
+static void contributor_add_tag(jl_methtable_t *mt, jl_typename_t *tn, int32_t tag) JL_CANSAFEPOINT
 {
-    jl_loading_closure_bits = bits;
-    jl_loading_closure_nblobs = nblobs;
-    if (edge_sig_verdicts_init)
-        htable_reset(&edge_sig_verdicts, 0); // the verdicts were for the previous closure
-}
-
-static int blob_in_loading_closure(size_t idx) JL_NOTSAFEPOINT
-{
-    if (idx >= jl_loading_closure_nblobs)
-        return 0;
-    return (jl_loading_closure_bits[idx / (8 * sizeof(size_t))] >> (idx % (8 * sizeof(size_t)))) & 1;
-}
-
-static void contributor_add_tag(jl_typename_t *tn, int32_t tag) JL_CANSAFEPOINT
-{
-    if (jl_method_contributors == NULL)
-        jl_method_contributors = (jl_genericmemory_t*)jl_an_empty_memory_any;
-    jl_array_t *tags = (jl_array_t*)jl_eqtable_get(jl_method_contributors, (jl_value_t*)tn, NULL);
-    if (tags == NULL) {
-        tags = jl_alloc_array_1d(jl_array_int32_type, 0);
-        JL_GC_PUSH1(&tags);
-        jl_genericmemory_t *newtable = jl_eqtable_put(jl_method_contributors, (jl_value_t*)tn, (jl_value_t*)tags, NULL);
-        JL_GC_POP();
-        if (newtable != jl_method_contributors)
-            jl_method_contributors = newtable;
-    }
-    size_t l = jl_array_nrows(tags);
-    int32_t *d = jl_array_data(tags, int32_t);
+    jl_genericmemory_t *contributors = jl_atomic_load_relaxed(&mt->contributors);
+    jl_array_t *tags = (jl_array_t*)jl_eqtable_get(contributors, (jl_value_t*)tn, NULL);
+    size_t l = tags == NULL ? 0 : jl_array_nrows(tags);
     for (size_t i = 0; i < l; i++)
-        if (d[i] == tag)
+        if (jl_array_data(tags, int32_t)[i] == tag)
             return;
-    jl_array_grow_end(tags, 1);
-    jl_array_data(tags, int32_t)[l] = tag;
+    jl_array_t *newtags = jl_alloc_array_1d(jl_array_int32_type, l + 1);
+    if (l > 0)
+        memcpy(jl_array_data(newtags, int32_t), jl_array_data(tags, int32_t), l * sizeof(int32_t));
+    jl_array_data(newtags, int32_t)[l] = tag;
+    JL_GC_PUSH1(&newtags);
+    jl_genericmemory_t *newtable = jl_eqtable_put(contributors, (jl_value_t*)tn, (jl_value_t*)newtags, NULL);
+    JL_GC_POP();
+    if (newtable != contributors)
+        jl_gc_write_atomic(mt, mt->contributors, jl_genericmemory_t, newtable, release);
 }
+
+struct _typename_tag_contributor_env {
+    jl_methtable_t *mt;
+    int32_t tag;
+};
 
 static void _typename_tag_contributor(jl_typename_t *tn, int explct, void *env0) JL_CANSAFEPOINT
 {
+    struct _typename_tag_contributor_env *env = (struct _typename_tag_contributor_env*)env0;
+    JL_GC_PROMISE_ROOTED(env->mt);
     // like the mt-backedge table, record only under explicitly encountered
-    // typenames; the check consults every callback. The shared Type typename
-    // is tagged regardless: Type-signatures of unrelated families still
-    // intersect one another (every abstract-bounded constructor admits
-    // Type{Union{}}), so the per-family top typename is not a complete key.
-    if (!explct && tn != jl_type_typename)
+    // typenames; the check consults every callback
+    if (!explct)
         return;
-    contributor_add_tag(tn, *(int32_t*)env0);
+    contributor_add_tag(env->mt, tn, env->tag);
 }
+
+struct _typename_check_contributor_env {
+    jl_methtable_t *mt;
+    size_t image; // the linkage blob whose closure bounds the contributors
+    int clean;
+};
 
 static void _typename_check_contributor(jl_typename_t *tn, int explct, void *env0) JL_NOTSAFEPOINT
 {
-    int *clean = (int*)env0;
+    struct _typename_check_contributor_env *env = (struct _typename_check_contributor_env*)env0;
     (void)explct;
-    if (!*clean || jl_method_contributors == NULL)
+    if (!env->clean)
         return;
-    jl_array_t *tags = (jl_array_t*)jl_eqtable_get(jl_method_contributors, (jl_value_t*)tn, NULL);
+    jl_genericmemory_t *contributors = jl_atomic_load_relaxed(&env->mt->contributors);
+    jl_array_t *tags = (jl_array_t*)jl_eqtable_get(contributors, (jl_value_t*)tn, NULL);
     if (tags == NULL)
         return; // only pre-session (sysimage) contributions
     size_t l = jl_array_nrows(tags);
     int32_t *d = jl_array_data(tags, int32_t);
     for (size_t i = 0; i < l; i++) {
-        if (d[i] < 0 || !blob_in_loading_closure((size_t)d[i])) {
-            *clean = 0;
+        if (d[i] < 0 || !jl_linkage_blob_in_closure(env->image, (size_t)d[i])) {
+            env->clean = 0;
             return;
         }
     }
 }
 
-static void contributor_tag_method(jl_method_t *method, int32_t tag) JL_CANSAFEPOINT
+// record `tag` under every top typename of `method`'s signature in `mt`
+static void contributor_tag_method(jl_methtable_t *mt, jl_method_t *method, int32_t tag) JL_CANSAFEPOINT
 {
-    JL_LOCK(&jl_method_contributors_lock);
-    jl_foreach_top_typename_for(_typename_tag_contributor, (jl_value_t*)method->sig, 0, &tag);
-    JL_UNLOCK(&jl_method_contributors_lock);
+    struct _typename_tag_contributor_env env = {mt, tag};
+    jl_foreach_top_typename_for(_typename_tag_contributor, (jl_value_t*)method->sig, 0, &env);
 }
 
 static int32_t contributor_tag_for(jl_method_t *method) JL_NOTSAFEPOINT
@@ -2927,31 +2922,18 @@ static int edge_replay_enabled(void) JL_NOTSAFEPOINT
     return enabled;
 }
 
-// Is `sig`'s method-match set provably the one the loading image's precompile
-// worker saw, i.e. does every contributor to its typenames lie within the
-// dependency closure installed by jl_set_loading_closure_blobs?
-JL_DLLEXPORT int jl_edge_sig_replayable(jl_value_t *sig) JL_CANSAFEPOINT
+// Is `sig`'s method-match set in `mt` provably the one seen by the precompile
+// worker of the image at linkage blob `image`, i.e. does every contributor to
+// its typenames lie within that image's dependency closure? The answer holds
+// until the world next changes: a contributor being added concurrently moves
+// the world, which the caller stamps its result with.
+JL_DLLEXPORT int jl_edge_sig_replayable(jl_value_t *sig, jl_methtable_t *mt, size_t image) JL_CANSAFEPOINT
 {
-    if (jl_loading_closure_bits == NULL || !edge_replay_enabled())
+    if (image == (size_t)-1 || !edge_replay_enabled())
         return 0;
-    size_t world = jl_atomic_load_acquire(&jl_world_counter);
-    JL_LOCK(&jl_method_contributors_lock);
-    if (!edge_sig_verdicts_init) {
-        htable_new(&edge_sig_verdicts, 0);
-        edge_sig_verdicts_init = 1;
-    }
-    void **bp = ptrhash_bp(&edge_sig_verdicts, sig);
-    if (*bp != HT_NOTFOUND && ((uintptr_t)*bp >> 1) == world) {
-        int r = (uintptr_t)*bp & 1;
-        JL_UNLOCK(&jl_method_contributors_lock);
-        return r;
-    }
-    int clean = 1;
-    int decomposed = jl_foreach_top_typename_for(_typename_check_contributor, sig, 1, &clean);
-    int r = decomposed && clean;
-    *ptrhash_bp(&edge_sig_verdicts, sig) = (void*)(((uintptr_t)world << 1) | (uintptr_t)r);
-    JL_UNLOCK(&jl_method_contributors_lock);
-    return r;
+    struct _typename_check_contributor_env env = {mt, image, 1};
+    int decomposed = jl_foreach_top_typename_for(_typename_check_contributor, sig, 1, &env);
+    return decomposed && env.clean;
 }
 
 struct _typename_invalidate_backedge {
@@ -3255,8 +3237,9 @@ JL_DLLEXPORT void jl_method_table_disable(jl_method_t *method) JL_CANSAFEPOINT
         assert(jl_atomic_load_relaxed(&methodentry->max_world) == ~(size_t)0);
         jl_atomic_store_relaxed(&methodentry->max_world, world);
         jl_method_table_invalidate(method, world, 1);
-        if (mt == jl_method_table)
-            contributor_tag_method(method, -1); // a deletion poisons the function for edge replay
+        JL_LOCK(&mt->cache->writelock);
+        contributor_tag_method(mt, method, -1); // a deletion poisons the function for edge replay
+        JL_UNLOCK(&mt->cache->writelock);
         jl_atomic_store_release(&jl_world_counter, world + 1);
     }
     JL_UNLOCK(&world_counter_lock);
@@ -3279,10 +3262,9 @@ jl_typemap_entry_t *jl_method_table_add(jl_methtable_t *mt, jl_method_t *method,
     newentry = jl_typemap_alloc((jl_tupletype_t*)method->sig, simpletype, jl_emptysvec, (jl_value_t*)method, ~(size_t)0, 1);
     jl_typemap_insert(&mt->defs, (jl_value_t*)mt, newentry, 0);
 
-    if (mt == jl_method_table) {
+    if (mt == jl_method_table)
         update_max_args(method->sig);
-        contributor_tag_method(method, contributor_tag_for(method));
-    }
+    contributor_tag_method(mt, method, contributor_tag_for(method));
     JL_UNLOCK(&mt->cache->writelock);
     JL_GC_POP();
     return newentry;
