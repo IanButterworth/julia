@@ -590,6 +590,7 @@ static int jl_collect_methcache_from_mod(jl_typemap_entry_t *ml, void *closure) 
     if (!jl_object_in_image((jl_value_t*)m->module)) {
         jl_array_ptr_1d_push(s, (jl_value_t*)m); // extext
         jl_array_ptr_1d_push(s, jl_get_ext_backinterferences(m)); // names only objects of images, so it can be saved
+        jl_array_ptr_1d_push(s, jl_get_ext_specverdicts(m));
     }
     return 1;
 }
@@ -601,7 +602,8 @@ static int jl_collect_methcache_internal(jl_typemap_entry_t *ml, void *closure) 
     jl_array_t *s = (jl_array_t*)closure;
     if (jl_atomic_load_relaxed(&ml->max_world) == ~(size_t)0) {
         jl_array_ptr_1d_push(s, (jl_value_t*)ml->func.method); // extext
-        jl_array_ptr_1d_push(s, jl_nothing); // no record, but keep the entries in pairs
+        jl_array_ptr_1d_push(s, jl_nothing); // no records, but keep the entries in triples
+        jl_array_ptr_1d_push(s, jl_nothing);
     }
     return 1;
 }
@@ -722,7 +724,7 @@ static const char *jl_git_commit(void) JL_CANSAFEPOINT
 
 
 // "magic" string and version header of .ji file
-static const int JI_FORMAT_VERSION = 17;
+static const int JI_FORMAT_VERSION = 18;
 static const char JI_MAGIC[] = "\373jli\r\n\032\n"; // based on PNG signature
 static const uint16_t BOM = 0xFEFF; // byte-order marker
 
@@ -910,7 +912,7 @@ static int64_t write_dependency_list(ios_t *s, jl_array_t* worklist, jl_array_t 
 static void jl_add_methods(jl_array_t *external) JL_CANSAFEPOINT
 {
     size_t i, l = jl_array_nrows(external);
-    for (i = 0; i < l; i += 2) { // (method, ext_backinterferences) pairs
+    for (i = 0; i < l; i += 3) { // (method, ext_backinterferences, ext_specverdicts) triples
         jl_method_t *meth = (jl_method_t*)jl_array_ptr_ref(external, i);
         assert(jl_is_method(meth));
         assert(!meth->is_for_opaque_closure);
@@ -961,11 +963,22 @@ static void jl_activate_methods(jl_array_t *external, jl_array_t *internal, size
             return;
         }
         jl_set_activation_coverage(image);
-        for (i = 0; i < l; i += 2) {
+        if (getenv("JULIA_SPEC_REPLAY_STATS")) { // temporary
+            size_t nrec = 0, nspec = 0, npairs = 0;
+            for (i = 0; i < l; i += 3) {
+                nrec += jl_array_ptr_ref(external, i + 1) != jl_nothing;
+                jl_value_t *sr = jl_array_ptr_ref(external, i + 2);
+                if (sr != jl_nothing) { nspec++; npairs += jl_array_nrows((jl_array_t*)sr) / 2; }
+            }
+            jl_printf(JL_STDERR, "SPECSTATS %s: %zu ext methods, %zu records, %zu with verdicts, %zu verdict pairs\n", pkgname, l / 3, nrec, nspec, npairs);
+        }
+        for (i = 0; i < l; i += 3) {
             jl_typemap_entry_t *entry = (jl_typemap_entry_t*)jl_array_ptr_ref(external, i);
             jl_value_t *record = jl_array_ptr_ref(external, i + 1);
+            jl_value_t *specrecord = jl_array_ptr_ref(external, i + 2);
             //uint64_t t0 = uv_hrtime();
-            jl_method_table_activate_with_record(entry, record == jl_nothing ? NULL : (jl_array_t*)record);
+            jl_method_table_activate_with_record(entry, record == jl_nothing ? NULL : (jl_array_t*)record,
+                                                 specrecord == jl_nothing ? NULL : (jl_array_t*)specrecord);
             //jl_printf(JL_STDERR, "%f ", (double)(uv_hrtime() - t0) / 1e6);
             //jl_static_show(JL_STDERR, entry->func.value);
             //jl_printf(JL_STDERR, "\n");

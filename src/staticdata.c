@@ -3705,7 +3705,7 @@ JL_DLLEXPORT uint32_t jl_create_system_image(void **_native_data, jl_array_t *wo
         ext_foreign_cis = NULL; // not needed anymore, free it
 
         // Collect method extensions
-        // extext_methods: [method1, record1, ...], worklist-owned "extending external" methods added to functions owned by modules outside the worklist, each paired with its ext_backinterferences (or nothing)
+        // extext_methods: [method1, record1, specrecord1, ...], worklist-owned "extending external" methods added to functions owned by modules outside the worklist, each with its ext_backinterferences and ext_specverdicts (or nothing)
         extext_methods = jl_alloc_vec_any(0);
         jl_collect_extext_methods(extext_methods, mod_array);
 

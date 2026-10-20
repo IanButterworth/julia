@@ -3033,6 +3033,17 @@ static int activate_replay_mode(void) JL_NOTSAFEPOINT
     return mode;
 }
 
+static int spec_replay_mode(void) JL_NOTSAFEPOINT
+{
+    static int mode = -1;
+    if (mode == -1) {
+        // JULIA_SPEC_REPLAY=0 ignores the specialization verdicts (temporary, for A/B timing)
+        const char *e = getenv("JULIA_SPEC_REPLAY");
+        mode = e == NULL || e[0] != '0';
+    }
+    return mode;
+}
+
 static void record_ext_backinterferences(jl_method_t *method, jl_array_t *record) JL_CANSAFEPOINT
 {
     if (jl_ext_backinterferences == NULL)
@@ -3048,6 +3059,38 @@ JL_DLLEXPORT jl_value_t *jl_get_ext_backinterferences(jl_method_t *method) JL_NO
         return jl_nothing;
     jl_value_t *record = jl_eqtable_get(jl_ext_backinterferences, (jl_value_t*)method, NULL);
     return record == NULL ? jl_nothing : record;
+}
+
+// The specialization verdicts of methods, made alongside their records. A verdict
+// depends on every method intersecting the new one, so it is only kept when all of
+// them are methods of images: a method made at run time in the precompile worker
+// may be missing at load. Without verdicts, a replay walks every specialization live.
+JL_DLLEXPORT jl_genericmemory_t *jl_ext_specverdicts = NULL;
+
+static void record_ext_specverdicts(jl_method_t *method, jl_array_t *specrecord) JL_CANSAFEPOINT
+{
+    if (jl_ext_specverdicts == NULL)
+        jl_ext_specverdicts = (jl_genericmemory_t*)jl_an_empty_memory_any;
+    jl_genericmemory_t *newtable = jl_eqtable_put(jl_ext_specverdicts, (jl_value_t*)method, (jl_value_t*)specrecord, NULL);
+    if (newtable != jl_ext_specverdicts)
+        jl_ext_specverdicts = newtable;
+}
+
+JL_DLLEXPORT jl_value_t *jl_get_ext_specverdicts(jl_method_t *method) JL_NOTSAFEPOINT
+{
+    if (jl_ext_specverdicts == NULL)
+        return jl_nothing;
+    jl_value_t *specrecord = jl_eqtable_get(jl_ext_specverdicts, (jl_value_t*)method, NULL);
+    return specrecord == NULL ? jl_nothing : specrecord;
+}
+
+static void specrecord_push(jl_array_t *specrecord, jl_method_instance_t *mi, int replaced_dispatch) JL_CANSAFEPOINT
+{
+    jl_array_ptr_1d_push(specrecord, (jl_value_t*)mi);
+    jl_value_t *flag = jl_box_int32(replaced_dispatch);
+    JL_GC_PUSH1(&flag);
+    jl_array_ptr_1d_push(specrecord, flag);
+    JL_GC_POP();
 }
 
 // Is `m`, in the interference set of a method activating with its record, a
@@ -3722,6 +3765,8 @@ struct activate_env {
     size_t interferences_max; // of the new method's interference set
     int dispatch_bits; // of the new method
     int invalidated;
+    jl_array_t *specrecord; // when recording: the verdicts on specializations of images
+    int skip_covered_specs; // when replaying verdicts: leave the covered specializations to them
 };
 
 // The specializations of `m`: `*specs` receives `m->specializations`, which keeps
@@ -3839,6 +3884,8 @@ static jl_genericmemory_t *activate_against_methods(struct activate_env *env, jl
             jl_method_instance_t *mi = jl_atomic_load_relaxed(&data[i]);
             if ((jl_value_t*)mi == jl_nothing)
                 continue;
+            if (env->skip_covered_specs && object_covered_by_record((jl_value_t*)mi))
+                continue;
             if (jl_type_intersection2(type, mi->specTypes, &isect, &isect2)) {
                 // Replacing a method--see if this really was the selected method previously
                 // over the intersection (not ambiguous) and the new method will be selected now (morespec).
@@ -3848,6 +3895,8 @@ static jl_genericmemory_t *activate_against_methods(struct activate_env *env, jl
                 // such that everything in `morespecific` dominates everything in `ambiguous`, and everything in `ambiguous` dominates everything in `lessspecific`
                 // And then compute where each isect falls, and whether it changed group--necessitating invalidation--or not.
                 int replaced_dispatch = is_replacing(ambig, type, m, d, n, isect, isect2, morespec);
+                if (env->specrecord && jl_object_in_image((jl_value_t*)mi))
+                    specrecord_push(env->specrecord, mi, replaced_dispatch);
                 invalidate_specialization(env, mi, type, m, d, n, replaced_dispatch, ambig, morespec, oldmi);
             }
             // TODO: do we have any interesting cases left where isect3 is useful
@@ -3893,6 +3942,34 @@ static void ext_backinterferences_complete(jl_method_t *method, jl_array_t *reco
                 jl_array_ptr_1d_push(record, (jl_value_t*)m);
         }
     }
+    // The verdicts on the specializations the image holds of every recorded method,
+    // judged against the recorded methods only, which can only say "replaced" more often.
+    jl_value_t *specrecord = jl_get_ext_specverdicts(method);
+    if (specrecord != jl_nothing) {
+        jl_genericmemory_t *interferences = jl_atomic_load_relaxed(&method->interferences);
+        jl_method_t *const *rd = (jl_method_t**)jl_array_ptr_data(record);
+        size_t rn = jl_array_nrows(record);
+        char *morespec = (char*)alloca(rn);
+        memset(morespec, 0, rn);
+        jl_value_t *specs = NULL, *isect = NULL, *isect2 = NULL;
+        JL_GC_PUSH3(&specs, &isect, &isect2);
+        for (size_t j = 0; j < rn; j++) {
+            jl_method_t *m = rd[j];
+            char ambig = has_key(interferences, (jl_value_t*)m);
+            _Atomic(jl_method_instance_t*) *data;
+            size_t l = method_specializations(m, &specs, &data);
+            for (size_t i = 0; i < l; i++) {
+                jl_method_instance_t *mi = jl_atomic_load_relaxed(&data[i]);
+                if ((jl_value_t*)mi == jl_nothing || !jl_object_in_image((jl_value_t*)mi) ||
+                    jl_external_blob_index((jl_value_t*)mi) != image)
+                    continue;
+                if (jl_type_intersection2(type, mi->specTypes, &isect, &isect2))
+                    specrecord_push((jl_array_t*)specrecord, mi, is_replacing(ambig, type, m, rd, rn, isect, isect2, morespec));
+                isect = isect2 = NULL;
+            }
+        }
+        JL_GC_POP();
+    }
     JL_GC_POP();
 }
 
@@ -3915,12 +3992,12 @@ JL_DLLEXPORT void jl_ext_backinterferences_complete(size_t image) JL_CANSAFEPOIN
 
 void jl_method_table_activate(jl_typemap_entry_t *newentry)
 {
-    jl_method_table_activate_with_record(newentry, NULL);
+    jl_method_table_activate_with_record(newentry, NULL, NULL);
 }
 
 // Activate `newentry`, replaying `record` (the ext_backinterferences of its method,
 // or NULL) for the images jl_set_activation_coverage says it covers.
-void jl_method_table_activate_with_record(jl_typemap_entry_t *newentry, jl_array_t *record) JL_CANSAFEPOINT
+void jl_method_table_activate_with_record(jl_typemap_entry_t *newentry, jl_array_t *record, jl_array_t *specrecord) JL_CANSAFEPOINT
 {
     JL_TIMING(ADD_METHOD, ADD_METHOD);
     jl_method_t *method = newentry->func.method;
@@ -3944,9 +4021,12 @@ void jl_method_table_activate_with_record(jl_typemap_entry_t *newentry, jl_array
     jl_value_t *isect2 = NULL;
     jl_genericmemory_t *interferences = NULL;
     jl_array_t *newrecord = NULL; // the record being made, when recording
-    JL_GC_PUSH7(&oldvalue, &oldmi, &loctag, &isect, &isect2, &interferences, &newrecord);
+    jl_array_t *newspecrecord = NULL; // and its specialization verdicts
+    JL_GC_PUSH8(&oldvalue, &oldmi, &loctag, &isect, &isect2, &interferences, &newrecord, &newspecrecord);
     // records are made while an incremental image is generated, which saves them (see jl_ext_backinterferences)
     int recording = jl_generating_output() && jl_options.incremental && mt == jl_method_table;
+    if (!spec_replay_mode())
+        specrecord = NULL;
     int replaying = record != NULL && activate_replay_mode() && activation_image != (size_t)-1 && mt == jl_method_table;
     // does every contributor to this signature's typenames lie in an image the record
     // covers? Then its scan saw every method on them.
@@ -4025,8 +4105,10 @@ void jl_method_table_activate_with_record(jl_typemap_entry_t *newentry, jl_array
         d = (jl_method_t**)jl_array_ptr_data((jl_array_t*)oldvalue);
         n = jl_array_nrows(oldvalue);
     }
-    if (recording)
+    if (recording) {
         newrecord = jl_alloc_vec_any(0);
+        newspecrecord = jl_alloc_vec_any(0);
+    }
     if (oldvalue != NULL || (replaying && rn > 0))
         oldmi = jl_alloc_vec_any(0); // the specializations whose dispatch may have changed
 
@@ -4041,7 +4123,24 @@ void jl_method_table_activate_with_record(jl_typemap_entry_t *newentry, jl_array
     if (replaying && rn > 0) {
         // The methods of the covered images intersecting this one, which the live
         // scan would otherwise find; their specializations are walked here as there.
+        env.skip_covered_specs = specrecord != NULL;
         interferences = activate_against_methods(&env, method, type, rd, rn, rmorespec, rambig, interferences, oldmi, NULL);
+        env.skip_covered_specs = 0;
+        if (specrecord != NULL) {
+            // the covered specializations the worker found intersecting, with its verdicts
+            for (size_t i = 0, l = jl_array_nrows(specrecord); i < l; i += 2) {
+                jl_method_instance_t *mi = (jl_method_instance_t*)jl_array_ptr_ref(specrecord, i);
+                int replaced_dispatch = jl_unbox_int32(jl_array_ptr_ref(specrecord, i + 1));
+                jl_method_t *m = mi->def.method;
+                size_t j = 0;
+                while (j < rn && rd[j] != m)
+                    j++;
+                if (j == rn) // not expected: judge it as replaced and ambiguous, which invalidates the most
+                    invalidate_specialization(&env, mi, type, m, rd, rn, 1, 1, rmorespec, oldmi);
+                else
+                    invalidate_specialization(&env, mi, type, m, rd, rn, replaced_dispatch, rambig[j], rmorespec, oldmi);
+            }
+        }
     }
     if (oldvalue) {
         // when replaying, these are only the methods of uncovered images
@@ -4107,7 +4206,14 @@ void jl_method_table_activate_with_record(jl_typemap_entry_t *newentry, jl_array
         }
         else {
             char *morespec = (char*)alloca(n);
+            env.specrecord = newspecrecord;
             interferences = activate_against_methods(&env, method, type, d, n, morespec, NULL, interferences, oldmi, newrecord);
+            env.specrecord = NULL;
+            // the verdicts were judged against every method in `d`, so keep them only
+            // if each of those will be in the method table at load
+            for (j = 0; j < n && newspecrecord != NULL; j++)
+                if (!jl_object_in_image((jl_value_t*)d[j]))
+                    newspecrecord = NULL;
         }
     }
 
@@ -4147,8 +4253,11 @@ void jl_method_table_activate_with_record(jl_typemap_entry_t *newentry, jl_array
     jl_atomic_store_relaxed(&newentry->max_world, ~(size_t)0);
     jl_atomic_store_relaxed(&method->dispatch_status, env.dispatch_bits); // TODO: this should be sequenced fully after the world counter store
     jl_gc_write_atomic(method, method->interferences, jl_genericmemory_t, interferences, release);
-    if (newrecord != NULL)
+    if (newrecord != NULL) {
         record_ext_backinterferences(method, newrecord); // completed against the images loaded from now on
+        if (newspecrecord != NULL)
+            record_ext_specverdicts(method, newspecrecord);
+    }
     JL_GC_POP();
 }
 
