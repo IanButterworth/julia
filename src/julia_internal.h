@@ -1457,7 +1457,6 @@ JL_DLLEXPORT int jl_activation_recording(void) JL_NOTSAFEPOINT;
 enum activation_record_slot {
     ACTIVATION_RECORD_METHODS = 0, // the intersecting methods of images, or nothing
     ACTIVATION_RECORD_FLAGS,      // Int32 per method: 1 = more specific than the new one, 2 = ambiguous
-    ACTIVATION_RECORD_SPECS,      // (specialization, replaced::Int32) pairs invalidated, or nothing
     ACTIVATION_RECORD_NSLOTS
 };
 // GC configuration baked into generated code; must match between an image and the runtime that loads it.
