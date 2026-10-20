@@ -2346,24 +2346,27 @@ static jl_method_instance_t *jl_mt_assoc_by_type(
 
 struct matches_env {
     struct typemap_intersection_env match;
-    jl_typemap_entry_t *newentry;
+    jl_typemap_entry_t *newentry; // the entry being activated, or NULL to collect every intersecting method
     jl_value_t *shadowed;
     jl_typemap_entry_t *replaced;
+    size_t image; // for intersect_entry_in_image
 };
 
 static int get_intersect_visitor(jl_typemap_entry_t *oldentry, struct typemap_intersection_env *closure0) JL_CANSAFEPOINT
 {
     struct matches_env *closure = container_of(closure0, struct matches_env, match);
     jl_method_t *oldmethod = oldentry->func.method;
-    assert(oldentry != closure->newentry && "entry already added");
-    assert(jl_atomic_load_relaxed(&oldentry->min_world) <= jl_atomic_load_relaxed(&closure->newentry->min_world) && "old method cannot be newer than new method");
-    //assert(jl_atomic_load_relaxed(&oldentry->max_world) != jl_atomic_load_relaxed(&closure->newentry->min_world) && "method cannot be added at the same time as method deleted");
-    assert((jl_atomic_load_relaxed(&oldentry->max_world) == ~(size_t)0));
-    // don't need to consider other similar methods if this oldentry will always fully intersect with them and dominates all of them
-    if (closure->match.issubty // e.g. jl_subtype(closure->newentry.sig, oldentry->sig)
-        && jl_subtype(oldmethod->sig, (jl_value_t*)closure->newentry->sig)) { // e.g. jl_type_equal(closure->newentry->sig, oldentry->sig)
-        if (closure->replaced == NULL || jl_atomic_load_relaxed(&closure->replaced->min_world) < jl_atomic_load_relaxed(&oldentry->min_world))
-            closure->replaced = oldentry; // must pick the newest insertion (both are still valid)
+    if (closure->newentry) {
+        assert(oldentry != closure->newentry && "entry already added");
+        assert(jl_atomic_load_relaxed(&oldentry->min_world) <= jl_atomic_load_relaxed(&closure->newentry->min_world) && "old method cannot be newer than new method");
+        //assert(jl_atomic_load_relaxed(&oldentry->max_world) != jl_atomic_load_relaxed(&closure->newentry->min_world) && "method cannot be added at the same time as method deleted");
+        assert((jl_atomic_load_relaxed(&oldentry->max_world) == ~(size_t)0));
+        // don't need to consider other similar methods if this oldentry will always fully intersect with them and dominates all of them
+        if (closure->match.issubty // e.g. jl_subtype(closure->newentry.sig, oldentry->sig)
+            && jl_subtype(oldmethod->sig, closure->match.type)) { // e.g. jl_type_equal(closure->newentry->sig, oldentry->sig)
+            if (closure->replaced == NULL || jl_atomic_load_relaxed(&closure->replaced->min_world) < jl_atomic_load_relaxed(&oldentry->min_world))
+                closure->replaced = oldentry; // must pick the newest insertion (both are still valid)
+        }
     }
     if (closure->shadowed == NULL)
         closure->shadowed = (jl_value_t*)jl_alloc_vec_any(0);
@@ -2375,16 +2378,29 @@ static int get_intersect_visitor(jl_typemap_entry_t *oldentry, struct typemap_in
 
 static int method_covered_by_record(jl_method_t *m) JL_NOTSAFEPOINT;
 
+// the entries of images the activation record does not cover
 static int intersect_entry_uncovered(jl_typemap_entry_t *ml, struct typemap_intersection_env *closure) JL_NOTSAFEPOINT
 {
-    // only methods of images the activation record does not cover
     return !method_covered_by_record(ml->func.method);
 }
 
-static jl_value_t *get_intersect_matches(jl_typemap_t *defs, jl_typemap_entry_t *newentry, jl_typemap_entry_t **replaced, size_t world, int uncovered_only) JL_CANSAFEPOINT
+// the entries of the image at linkage blob `image`
+static int intersect_entry_in_image(jl_typemap_entry_t *ml, struct typemap_intersection_env *closure0) JL_NOTSAFEPOINT
 {
-    jl_tupletype_t *type = newentry->sig;
-    jl_tupletype_t *ttypes = (jl_tupletype_t*)jl_unwrap_unionall((jl_value_t*)type);
+    struct matches_env *closure = container_of(closure0, struct matches_env, match);
+    jl_method_t *m = ml->func.method;
+    return jl_object_in_image((jl_value_t*)m) && jl_external_blob_index((jl_value_t*)m) == closure->image;
+}
+
+// The methods of `defs` intersecting `type` in `world`, among the entries
+// `entry_filter` admits when given: the methods `newentry` is activated against,
+// with the one of an equal signature it replaces in `*replaced`, or every such
+// method when `newentry` is NULL.
+static jl_value_t *get_intersect_matches(jl_typemap_t *defs, jl_value_t *type, jl_typemap_entry_t *newentry, jl_typemap_entry_t **replaced, size_t world,
+                                         int (*entry_filter)(jl_typemap_entry_t *ml, struct typemap_intersection_env *closure) JL_NOTSAFEPOINT,
+                                         size_t image) JL_CANSAFEPOINT
+{
+    jl_tupletype_t *ttypes = (jl_tupletype_t*)jl_unwrap_unionall(type);
     size_t l = jl_nparams(ttypes);
     jl_value_t *va = NULL;
     if (l > 0) {
@@ -2395,17 +2411,18 @@ static jl_value_t *get_intersect_matches(jl_typemap_t *defs, jl_typemap_entry_t 
             va = NULL;
     }
     // search for all intersecting methods active in the previous world, to determine the changes needed to be made for the next world
-    struct matches_env env = {{get_intersect_visitor, (jl_value_t*)type, va, /* .search_bottom = */ 0,
+    struct matches_env env = {{get_intersect_visitor, type, va, /* .search_bottom = */ 0,
             /* .min_valid = */ world, /* .max_valid = */ world,
             /* .ti = */ NULL, /* .env = */ NULL, /* .issubty = */ 0,
             /* .emptiness_only = */ 1,
-            /* .entry_filter = */ uncovered_only ? intersect_entry_uncovered : NULL},
-        /* .newentry = */ newentry, /* .shadowed */ NULL, /* .replaced */ NULL};
+            /* .entry_filter = */ entry_filter},
+        /* .newentry = */ newentry, /* .shadowed */ NULL, /* .replaced */ NULL, image};
     JL_GC_PUSH3(&env.match.env, &env.match.ti, &env.shadowed);
     jl_typemap_intersection_visitor(defs, 0, &env.match);
     env.match.env = NULL;
     env.match.ti = NULL;
-    *replaced = env.replaced;
+    if (replaced)
+        *replaced = env.replaced;
     JL_GC_POP();
     return env.shadowed;
 }
@@ -2942,48 +2959,55 @@ JL_DLLEXPORT size_t jl_sig_contributors_world(jl_value_t *sig, jl_methtable_t *m
     return decomposed && env.clean ? env.world : 0;
 }
 
-static int blob_in_bitset(const size_t *bits, size_t nblobs, size_t idx) JL_NOTSAFEPOINT
+// ---- method activation records ----
+// What the activation of a method found by scanning the method table live, kept
+// per method in jl_activation_records (see the ACTIVATION_RECORD_* slots): the
+// intersecting methods with their specificity flags, and the (specialization,
+// replaced) pairs it invalidated. Only objects of images are recorded. A method or caller made at run time
+// is scanned live at every load anyway, as its contributor tag names no image, and
+// an object of the image being generated needs no record: that image carries the
+// outcome of the interaction itself, and recording it would make the replay depend
+// on the order the image's methods activate in.
+//
+// A saved record covers every dependency of its image, the images its precompile
+// worker had loaded. An activation only sees the images loaded at the time, so a
+// record is completed against each image loaded later as that image is restored
+// (jl_activation_records_complete). The part of a record owned by one image is
+// the slice of each list that image owns.
+//
+// At load, the activation applies the record to the loading image's dependencies
+// and scans live only the methods and specializations owned by other images. Each
+// side sees part of the intersecting set, and the replacement check can only
+// invalidate more when given fewer methods, so a partial view over-invalidates at
+// worst. The callers reached through missing-method backedges are always checked
+// live: a caller's backedges are inserted when its edges are verified, at any time
+// after its image was restored, so no activation could have seen them all.
+//
+// Records are made while an incremental image is generated, which saves those of
+// its methods. The live scan of an activation that replays a record, over the
+// images the record does not cover, finds what a database of records per method
+// and image would be missing for the next load; such a record is not made yet.
+JL_DLLEXPORT jl_genericmemory_t *jl_activation_records = NULL;
+
+JL_DLLEXPORT int jl_activation_recording(void) JL_NOTSAFEPOINT
 {
-    if (idx >= nblobs)
-        return 0;
-    return (bits[idx / (8 * sizeof(size_t))] >> (idx % (8 * sizeof(size_t)))) & 1;
+    return jl_generating_output() && jl_options.incremental;
 }
 
-// ---- method activation records ----
-// A precompile worker records, for every method it activates, what the activation
-// found against the images loaded at that moment (see the ACTIVATION_RECORD_*
-// slots): the intersecting methods with their specificity flags, the
-// (specialization, replaced) pairs it invalidated, and the callers it invalidated
-// through missing-method edges. A record covers a set of images: it is the
-// method's interaction with each of them, and the part owned by one image is the
-// slice of each list that image owns. Today the only record of a method is the
-// worker's own, covering the images it had loaded, saved with the image. A record
-// covering a single sibling image, which the loader would have to get from a
-// separate database, has the same shape, and the loader would union the coverage.
-//
-// At load, activation applies the record to the images it covers and scans live
-// only the methods, specializations and callers owned by uncovered images. Each
-// side sees part of the intersecting set, and the replacement and missing-edge
-// checks can only invalidate more when given fewer methods, so a partial view
-// over-invalidates at worst.
-JL_DLLEXPORT jl_genericmemory_t *jl_activation_records = NULL; // only filled in the precompile worker
+// The linkage blob of the image whose methods are activating with their records,
+// or -1: a record covers that image's dependencies (jl_linkage_blob_dep_world).
+static size_t activation_image = (size_t)-1;
 
-// Bitset over linkage blobs of the images covered by the record of the method
-// that is activating, installed by the loader around each replayed activation.
-static size_t *activation_covered_bits = NULL;
-static size_t activation_covered_nblobs = 0;
-
-JL_DLLEXPORT void jl_set_activation_coverage(size_t *bits, size_t nblobs) JL_NOTSAFEPOINT
+JL_DLLEXPORT void jl_set_activation_coverage(size_t image) JL_NOTSAFEPOINT
 {
-    activation_covered_bits = bits;
-    activation_covered_nblobs = nblobs;
+    activation_image = image;
 }
 
 static int object_covered_by_record(jl_value_t *v) JL_NOTSAFEPOINT
 {
     if (!jl_object_in_image(v))
         return 0;
-    return blob_in_bitset(activation_covered_bits, activation_covered_nblobs, jl_external_blob_index(v));
+    return jl_linkage_blob_dep_world(activation_image, jl_external_blob_index(v)) != 0;
 }
 
 static int method_covered_by_record(jl_method_t *m) JL_NOTSAFEPOINT
@@ -3019,33 +3043,33 @@ JL_DLLEXPORT jl_value_t *jl_get_activation_record(jl_method_t *method) JL_NOTSAF
     return record == NULL ? jl_nothing : record;
 }
 
-// Does every contributor to the typenames of a signature in `mt` lie in an image
-// the activating method's record covers? Then the record's scan saw every method
-// on those typenames.
-struct _typename_check_covered_env {
-    jl_methtable_t *mt;
-    int clean;
-};
-
-static void _typename_check_covered(jl_typename_t *tn, int explct, void *env0) JL_NOTSAFEPOINT
+// append `v` to the list in `slot` of `record`, making the list if the slot is `nothing`
+static void record_list_push(jl_svec_t *record, int slot, jl_value_t *v) JL_CANSAFEPOINT
 {
-    struct _typename_check_covered_env *env = (struct _typename_check_covered_env*)env0;
-    (void)explct;
-    if (!env->clean)
-        return;
-    jl_genericmemory_t *contributors = jl_atomic_load_relaxed(&env->mt->contributors);
-    jl_array_t *tags = (jl_array_t*)jl_eqtable_get(contributors, (jl_value_t*)tn, NULL);
-    if (tags == NULL)
-        return; // no contributor this session: the sysimage's methods are not tagged
-    size_t l = jl_array_nrows(tags);
-    int32_t *d = jl_array_data(tags, int32_t);
-    for (size_t i = 0; i < l; i++) {
-        if (d[i] < 0 || !blob_in_bitset(activation_covered_bits, activation_covered_nblobs, (size_t)d[i])) {
-            env->clean = 0;
-            return;
-        }
+    jl_value_t *lst = jl_svecref(record, slot);
+    JL_GC_PUSH1(&lst);
+    if (lst == jl_nothing) {
+        lst = (jl_value_t*)jl_alloc_vec_any(0);
+        jl_svecset(record, slot, lst);
     }
+    jl_array_ptr_1d_push((jl_array_t*)lst, v);
+    JL_GC_POP();
 }
+
+// append the specificity flags of the last method appended to `record`
+static void record_flags_push(jl_svec_t *record, char morespec, char ambig) JL_CANSAFEPOINT
+{
+    jl_value_t *lst = jl_svecref(record, ACTIVATION_RECORD_FLAGS);
+    JL_GC_PUSH1(&lst);
+    if (lst == jl_nothing) {
+        lst = (jl_value_t*)jl_alloc_array_1d(jl_array_int32_type, 0);
+        jl_svecset(record, ACTIVATION_RECORD_FLAGS, lst);
+    }
+    jl_array_grow_end((jl_array_t*)lst, 1);
+    jl_array_data((jl_array_t*)lst, int32_t)[jl_array_nrows((jl_array_t*)lst) - 1] = (int32_t)((morespec ? 1 : 0) | (ambig ? 2 : 0));
+    JL_GC_POP();
+}
+
 
 struct _typename_invalidate_backedge {
     jl_value_t *type;
@@ -3055,10 +3079,6 @@ struct _typename_invalidate_backedge {
     size_t n;
     size_t max_world;
     int invalidated;
-    jl_array_t *callers; // precompile worker: collects the invalidated callers for the activation record
-    // When replaying a record, the callers it covers were already handled by the
-    // replay, so we only drop the dead ones and keep the live ones.
-    int uncovered_only;
 };
 
 static void _typename_invalidate_backedges(jl_typename_t *tn, int explct, void *env0) JL_CANSAFEPOINT
@@ -3080,48 +3100,6 @@ static void _typename_invalidate_backedges(jl_typename_t *tn, int explct, void *
             continue; // empty or deleted slot
         JL_GC_PROMISE_ROOTED(backedgetyp);
         JL_GC_PROMISE_ROOTED(callers);
-        size_t j, l = jl_array_nrows(callers);
-        size_t ncovered = 0; // callers the record replay already judged, kept whatever the verdict below
-        if (env->uncovered_only) {
-            // The record replay already invalidated the callers of covered images.
-            // Drop the dead callers, and partition the live ones with the covered
-            // ones first: the intersection is checked again only if an uncovered
-            // caller remains, and only those are invalidated if it is missing.
-            size_t keep = 0;
-            for (j = 0; j < l; j++) {
-                jl_code_instance_t *backedge = (jl_code_instance_t*)jl_array_ptr_ref(callers, j);
-                JL_GC_PROMISE_ROOTED(backedge);
-                if (jl_atomic_load_relaxed(&backedge->max_world) != ~(size_t)0)
-                    continue; // dead
-                if (object_covered_by_record((jl_value_t*)backedge)) {
-                    if (ncovered < keep) {
-                        // the first uncovered survivor moves to the end of the survivors
-                        jl_value_t *uncovered = jl_array_ptr_ref(callers, ncovered);
-                        jl_array_ptr_set(callers, keep, uncovered);
-                    }
-                    jl_array_ptr_set(callers, ncovered++, (jl_value_t*)backedge);
-                    keep++;
-                }
-                else {
-                    jl_array_ptr_set(callers, keep++, (jl_value_t*)backedge);
-                }
-            }
-            if (keep != l) {
-                jl_array_del_end((jl_array_t*)callers, l - keep);
-                l = keep;
-            }
-            if (ncovered == l) {
-                if (l == 0) {
-                    // remove this entry
-                    jl_gc_write_atomic(table, tab[i], jl_value_t, jl_nothing, relaxed); // clear the key
-                    jl_gc_write_atomic(table, tab[i + 1], jl_value_t, NULL, relaxed); // and the value
-                }
-                else {
-                    alive++;
-                }
-                continue;
-            }
-        }
         int missing = 0;
         if (jl_type_intersection2(backedgetyp, (jl_value_t*)env->type, env->isect, env->isect2)) {
             // See if the intersection was actually already fully
@@ -3151,20 +3129,14 @@ static void _typename_invalidate_backedges(jl_typename_t *tn, int explct, void *
         }
         *env->isect = *env->isect2 = NULL;
         if (missing) {
-            for (j = ncovered; j < l; j++) {
+            size_t j, l = jl_array_nrows(callers);
+            for (j = 0; j < l; j++) {
                 jl_code_instance_t *backedge = (jl_code_instance_t*)jl_array_ptr_ref(callers, j);
                 JL_GC_PROMISE_ROOTED(backedge);
                 invalidate_code_instance(backedge, env->max_world, 0);
                 env->invalidated = 1;
-                if (env->callers)
-                    jl_array_ptr_1d_push(env->callers, (jl_value_t*)backedge);
                 if (_jl_debug_method_invalidation)
                     jl_array_ptr_1d_push(_jl_debug_method_invalidation, (jl_value_t*)backedgetyp);
-            }
-            if (ncovered != 0) {
-                jl_array_del_end((jl_array_t*)callers, l - ncovered);
-                alive++;
-                continue;
             }
             // remove this entry (cf. `jl_eqtable_pop`)
             jl_gc_write_atomic(table, tab[i], jl_value_t, jl_nothing, relaxed); // clear the key
@@ -3761,8 +3733,22 @@ struct activate_env {
     size_t interferences_max; // of the new method's interference set
     int dispatch_bits; // of the new method
     int invalidated;
-    int skip_covered; // leave the specializations owned by images the activation record covers to its replay
+    int record_only; // completing a record (activation_record_complete): change and invalidate nothing
+    int (*scan_spec)(jl_method_instance_t *mi, struct activate_env *env) JL_NOTSAFEPOINT; // the specializations to examine, or NULL for all
+    size_t image; // for spec_in_image
 };
+
+// the specializations a record's replay leaves to the live scan: those of images it does not cover
+static int spec_uncovered(jl_method_instance_t *mi, struct activate_env *env) JL_NOTSAFEPOINT
+{
+    return !object_covered_by_record((jl_value_t*)mi);
+}
+
+// the specializations of the image at linkage blob `image`
+static int spec_in_image(jl_method_instance_t *mi, struct activate_env *env) JL_NOTSAFEPOINT
+{
+    return jl_object_in_image((jl_value_t*)mi) && jl_external_blob_index((jl_value_t*)mi) == env->image;
+}
 
 // The specializations of `m`: `*specs` receives `m->specializations`, which keeps
 // the returned slots alive; each of the `l` slots at `*data` is a MethodInstance or `nothing`.
@@ -3829,56 +3815,58 @@ static jl_genericmemory_t *activate_against_methods(struct activate_env *env, jl
         jl_method_t *m = d[j];
         // Compute ambig state: is there an ambiguity between new method and old m?
         char ambig = flags ? (char)((flags[j] >> 1) & 1) : !morespec[j] && !jl_type_morespecific(type, m->sig);
-        if (newrecord)
-            jl_array_data((jl_array_t*)jl_svecref(newrecord, ACTIVATION_RECORD_FLAGS), int32_t)[j] =
-                (int32_t)((morespec[j] ? 1 : 0) | (ambig ? 2 : 0));
-        if (morespec[j] || ambig) {
-            // !morespecific(new, old): add the old method to this interference set
-            ssize_t idx;
-            if (!check_dup_key || !has_key(interferences, (jl_value_t*)m))
-                interferences = jl_idset_put_key(interferences, (jl_value_t*)m, &env->interferences_max, &idx);
+        if (newrecord && flags == NULL && jl_object_in_image((jl_value_t*)m)) {
+            record_list_push(newrecord, ACTIVATION_RECORD_METHODS, (jl_value_t*)m);
+            record_flags_push(newrecord, morespec[j], ambig);
         }
-        if (morespec[j]) {
-            // morespecific(old, new): the old method gained a strict loser (when
-            // replaying, its image was saved without this method, so the bit is stale)
-            int m_dispatch = jl_atomic_load_relaxed(&m->dispatch_status);
-            if (m_dispatch & METHOD_SIG_NO_LOSERS)
-                jl_atomic_store_relaxed(&m->dispatch_status, m_dispatch & ~METHOD_SIG_NO_LOSERS);
-        }
-        else if (!ambig) {
-            // morespecific(new, old): the new method beats something
-            env->dispatch_bits &= ~METHOD_SIG_NO_LOSERS;
-        }
-        if (!morespec[j]) {
-            // !morespecific(old, new): add the new method to its interference set.
-            // Live, no duplicate-key probe is needed: `d` was collected against the
-            // prior world, and the methods of a loaded image activate together in a
-            // single world bump, so a same-image method -- the only kind whose
-            // serialized interference set could already contain `method` -- never
-            // appears in `d`. A record does list such methods, so a replay probes.
-            if (flags == NULL || !method_in_interferences(method, m)) {
-                jl_genericmemory_t *m_interferences = jl_atomic_load_relaxed(&m->interferences);
+        if (!env->record_only) {
+            if (morespec[j] || ambig) {
+                // !morespecific(new, old): add the old method to this interference set
                 ssize_t idx;
-                size_t m_max = jl_idset_max(m_interferences);
-                m_interferences = jl_idset_put_key(m_interferences, (jl_value_t*)method, &m_max, &idx);
-                jl_gc_write_atomic(m, m->interferences, jl_genericmemory_t, m_interferences, release);
+                if (!check_dup_key || !has_key(interferences, (jl_value_t*)m))
+                    interferences = jl_idset_put_key(interferences, (jl_value_t*)m, &env->interferences_max, &idx);
             }
+            if (morespec[j]) {
+                // morespecific(old, new): the old method gained a strict loser (when
+                // replaying, its image was saved without this method, so the bit is stale)
+                int m_dispatch = jl_atomic_load_relaxed(&m->dispatch_status);
+                if (m_dispatch & METHOD_SIG_NO_LOSERS)
+                    jl_atomic_store_relaxed(&m->dispatch_status, m_dispatch & ~METHOD_SIG_NO_LOSERS);
+            }
+            else if (!ambig) {
+                // morespecific(new, old): the new method beats something
+                env->dispatch_bits &= ~METHOD_SIG_NO_LOSERS;
+            }
+            if (!morespec[j]) {
+                // !morespecific(old, new): add the new method to its interference set.
+                // Live, no duplicate-key probe is needed: `d` was collected against the
+                // prior world, and the methods of a loaded image activate together in a
+                // single world bump, so a same-image method -- the only kind whose
+                // serialized interference set could already contain `method` -- never
+                // appears in `d`. A record does list such methods, so a replay probes.
+                if (flags == NULL || !method_in_interferences(method, m)) {
+                    jl_genericmemory_t *m_interferences = jl_atomic_load_relaxed(&m->interferences);
+                    ssize_t idx;
+                    size_t m_max = jl_idset_max(m_interferences);
+                    m_interferences = jl_idset_put_key(m_interferences, (jl_value_t*)method, &m_max, &idx);
+                    jl_gc_write_atomic(m, m->interferences, jl_genericmemory_t, m_interferences, release);
+                }
+            }
+            // Now examine if this caused any invalidations.
+            jl_method_instance_t *unspec = jl_atomic_load_relaxed(&m->unspecialized);
+            if (unspec && !morespec[j])
+                jl_array_ptr_1d_push(oldmi, (jl_value_t*)unspec);
         }
         if (morespec[j])
             continue;
-
-        // Now examine if this caused any invalidations.
-        jl_method_instance_t *unspec = jl_atomic_load_relaxed(&m->unspecialized);
-        if (unspec)
-            jl_array_ptr_1d_push(oldmi, (jl_value_t*)unspec);
         _Atomic(jl_method_instance_t*) *data;
         size_t l = method_specializations(m, &specs, &data);
         for (size_t i = 0; i < l; i++) {
             jl_method_instance_t *mi = jl_atomic_load_relaxed(&data[i]);
             if ((jl_value_t*)mi == jl_nothing)
                 continue;
-            if (env->skip_covered && object_covered_by_record((jl_value_t*)mi))
-                continue; // the record already covers it
+            if (env->scan_spec && !env->scan_spec(mi, env))
+                continue;
             if (jl_type_intersection2(type, mi->specTypes, &isect, &isect2)) {
                 // Replacing a method--see if this really was the selected method previously
                 // over the intersection (not ambiguous) and the new method will be selected now (morespec).
@@ -3888,15 +3876,15 @@ static jl_genericmemory_t *activate_against_methods(struct activate_env *env, jl
                 // such that everything in `morespecific` dominates everything in `ambiguous`, and everything in `ambiguous` dominates everything in `lessspecific`
                 // And then compute where each isect falls, and whether it changed group--necessitating invalidation--or not.
                 int replaced_dispatch = is_replacing(ambig, type, m, d, n, isect, isect2, morespec);
-                if (newrecord) {
-                    jl_array_t *rspecs = (jl_array_t*)jl_svecref(newrecord, ACTIVATION_RECORD_SPECS);
-                    jl_array_ptr_1d_push(rspecs, (jl_value_t*)mi);
+                if (newrecord && jl_object_in_image((jl_value_t*)mi)) {
+                    record_list_push(newrecord, ACTIVATION_RECORD_SPECS, (jl_value_t*)mi);
                     jl_value_t *flag = jl_box_int32(replaced_dispatch);
                     JL_GC_PUSH1(&flag);
-                    jl_array_ptr_1d_push(rspecs, flag);
+                    record_list_push(newrecord, ACTIVATION_RECORD_SPECS, flag);
                     JL_GC_POP();
                 }
-                invalidate_specialization(env, mi, type, m, d, n, replaced_dispatch, ambig, morespec, oldmi);
+                if (!env->record_only)
+                    invalidate_specialization(env, mi, type, m, d, n, replaced_dispatch, ambig, morespec, oldmi);
             }
             // TODO: do we have any interesting cases left where isect3 is useful
             //jl_value_t *isect3 = NULL;
@@ -3918,6 +3906,60 @@ static jl_genericmemory_t *activate_against_methods(struct activate_env *env, jl
     }
     JL_GC_POP();
     return interferences;
+}
+
+// Complete the activation record of `method` against the image at linkage blob
+// `image`, restored after the method activated: the image's methods intersecting
+// it, with their specificity, and the specializations the image holds of every
+// recorded method, with whether the method replaced their dispatch. This is what
+// the activation would have recorded had the image been loaded. Nothing is
+// invalidated here: the image's methods activated with the method in the table,
+// and its edges are verified against it.
+static void activation_record_complete(jl_method_t *method, jl_svec_t *record, size_t image) JL_CANSAFEPOINT
+{
+    jl_methtable_t *mt = jl_method_get_table(method);
+    jl_value_t *type = (jl_value_t*)method->sig;
+    size_t world = jl_atomic_load_acquire(&jl_world_counter);
+    jl_value_t *late = NULL;
+    JL_GC_PUSH1(&late);
+    late = get_intersect_matches(jl_atomic_load_relaxed(&mt->defs), type, NULL, NULL, world, intersect_entry_in_image, image);
+    if (late != NULL) {
+        for (size_t i = 0, n = jl_array_nrows((jl_array_t*)late); i < n; i++) {
+            jl_method_t *m = (jl_method_t*)jl_array_ptr_ref((jl_array_t*)late, i);
+            char morespec = (char)jl_type_morespecific(m->sig, type);
+            char ambig = !morespec && !jl_type_morespecific(type, m->sig);
+            record_list_push(record, ACTIVATION_RECORD_METHODS, (jl_value_t*)m);
+            record_flags_push(record, morespec, ambig);
+        }
+    }
+    // the specializations are judged against every recorded method, the late ones included
+    jl_value_t *rmethods = jl_svecref(record, ACTIVATION_RECORD_METHODS);
+    if (rmethods != jl_nothing) {
+        size_t n = jl_array_nrows((jl_array_t*)rmethods);
+        struct activate_env env = {world, 0, 0, 0, /* .record_only = */ 1, spec_in_image, image};
+        char *morespec = (char*)alloca(n);
+        activate_against_methods(&env, method, type, (jl_method_t**)jl_array_ptr_data((jl_array_t*)rmethods), n,
+                                 jl_array_data((jl_array_t*)jl_svecref(record, ACTIVATION_RECORD_FLAGS), int32_t), morespec,
+                                 jl_atomic_load_relaxed(&method->interferences), NULL, record);
+    }
+    JL_GC_POP();
+}
+
+// The image at linkage blob `image` was restored: complete the activation records
+// made before it against it. Only the records of methods that are in no image are
+// completed, as only those are saved (with the image they will be in).
+JL_DLLEXPORT void jl_activation_records_complete(size_t image) JL_CANSAFEPOINT
+{
+    jl_genericmemory_t *records = jl_activation_records;
+    if (records == NULL)
+        return;
+    for (size_t i = 0, l = records->length; i < l; i += 2) {
+        jl_value_t *method = jl_genericmemory_ptr_ref(records, i);
+        jl_value_t *record = jl_genericmemory_ptr_ref(records, i + 1);
+        if (method == NULL || method == jl_nothing || record == NULL || jl_object_in_image(method))
+            continue;
+        activation_record_complete((jl_method_t*)method, (jl_svec_t*)record, image);
+    }
 }
 
 void jl_method_table_activate(jl_typemap_entry_t *newentry)
@@ -3951,29 +3993,23 @@ void jl_method_table_activate_with_record(jl_typemap_entry_t *newentry, jl_svec_
     jl_value_t *isect2 = NULL;
     jl_genericmemory_t *interferences = NULL;
     jl_svec_t *newrecord = NULL; // the activation record being made, when recording
-    jl_array_t *callers = NULL; // callers invalidated through missing-method edges, for the record
-    JL_GC_PUSH8(&oldvalue, &oldmi, &loctag, &isect, &isect2, &interferences, &newrecord, &callers);
+    JL_GC_PUSH7(&oldvalue, &oldmi, &loctag, &isect, &isect2, &interferences, &newrecord);
+    // records are made while an incremental image is generated, which saves them (see jl_activation_records)
     int recording = jl_generating_output() && jl_options.incremental && mt == jl_method_table;
     int replaying = record != NULL && jl_svec_len(record) == ACTIVATION_RECORD_NSLOTS && activate_replay_mode() &&
-                    activation_covered_bits != NULL && mt == jl_method_table;
-    int all_covered = 0;
-    if (replaying) {
-        struct _typename_check_covered_env check = {mt, /* .clean = */ 1};
-        int decomposed = jl_foreach_top_typename_for(_typename_check_covered, type, 1, &check);
-        all_covered = decomposed && check.clean;
-    }
+                    activation_image != (size_t)-1 && mt == jl_method_table;
+    // does every contributor to this signature's typenames lie in an image the record
+    // covers? Then its scan saw every method on them.
+    int all_covered = replaying && jl_sig_contributors_world(type, mt, activation_image) != 0;
     jl_typemap_entry_t *replaced = NULL;
     jl_value_t *rmethods = replaying ? jl_svecref(record, ACTIVATION_RECORD_METHODS) : jl_nothing;
     if (rmethods != jl_nothing) {
-        // A method the worker saw may have been deleted since. The record would still
-        // count it as a witness, so scan everything instead. A method of this image
-        // that is not activated yet is not deleted: it activates in this world too,
-        // since precompilation can neither delete nor overwrite methods.
+        // A method the record saw may have been deleted since. The record would still
+        // count it as a witness, so scan everything instead.
         jl_array_t *rm = (jl_array_t*)rmethods;
         for (size_t i = 0, l = jl_array_nrows(rm); i < l && replaying; i++) {
             jl_method_t *m = (jl_method_t*)jl_array_ptr_ref(rm, i);
-            if (!(jl_atomic_load_relaxed(&m->dispatch_status) & METHOD_SIG_LATEST_WHICH) &&
-                jl_atomic_load_relaxed(&m->primary_world) != ~(size_t)0)
+            if (!(jl_atomic_load_relaxed(&m->dispatch_status) & METHOD_SIG_LATEST_WHICH))
                 replaying = 0;
         }
     }
@@ -3987,13 +4023,14 @@ void jl_method_table_activate_with_record(jl_typemap_entry_t *newentry, jl_svec_
         oldvalue = NULL;
     }
     else {
-        oldvalue = get_intersect_matches(jl_atomic_load_relaxed(&mt->defs), newentry, &replaced, max_world, replaying);
+        oldvalue = get_intersect_matches(jl_atomic_load_relaxed(&mt->defs), type, newentry, &replaced, max_world,
+                                         replaying ? intersect_entry_uncovered : NULL, (size_t)-1);
     }
     if (replaying && replaced != NULL) {
         // a method of an uncovered image has the exact same signature, so the
         // record does not apply; do the full scan
         replaying = 0;
-        oldvalue = get_intersect_matches(jl_atomic_load_relaxed(&mt->defs), newentry, &replaced, max_world, 0);
+        oldvalue = get_intersect_matches(jl_atomic_load_relaxed(&mt->defs), type, newentry, &replaced, max_world, NULL, (size_t)-1);
     }
     recording = recording && !replaying && replaced == NULL;
     jl_method_t *const *d;
@@ -4009,10 +4046,8 @@ void jl_method_table_activate_with_record(jl_typemap_entry_t *newentry, jl_svec_
     }
     if (recording) {
         newrecord = jl_alloc_svec(ACTIVATION_RECORD_NSLOTS);
-        jl_svecset(newrecord, ACTIVATION_RECORD_METHODS, oldvalue ? oldvalue : jl_nothing);
-        jl_svecset(newrecord, ACTIVATION_RECORD_FLAGS, n > 0 ? (jl_value_t*)jl_alloc_array_1d(jl_array_int32_type, n) : jl_nothing);
-        jl_svecset(newrecord, ACTIVATION_RECORD_SPECS, (jl_value_t*)jl_alloc_vec_any(0));
-        callers = jl_alloc_vec_any(0);
+        for (int slot = 0; slot < ACTIVATION_RECORD_NSLOTS; slot++)
+            jl_svecset(newrecord, slot, jl_nothing); // the lists are made as they are needed
     }
     if (oldvalue != NULL || (replaying && rmethods != jl_nothing))
         oldmi = jl_alloc_vec_any(0); // the specializations whose dispatch may have changed
@@ -4026,7 +4061,9 @@ void jl_method_table_activate_with_record(jl_typemap_entry_t *newentry, jl_svec_
         // Always set LATEST_WHICH and carry over NO_LOSERS from initialization and across precompilation
         METHOD_SIG_LATEST_WHICH | (precompiled_status & METHOD_SIG_NO_LOSERS),
         /* .invalidated = */ 0,
-        /* .skip_covered = */ 0,
+        /* .record_only = */ 0,
+        /* .scan_spec = */ NULL,
+        /* .image = */ (size_t)-1,
     };
     if (replaying) {
         // The precompile worker saw the same methods of the covered images, so we
@@ -4036,9 +4073,9 @@ void jl_method_table_activate_with_record(jl_typemap_entry_t *newentry, jl_svec_
             size_t rn = jl_array_nrows((jl_array_t*)rmethods);
             const int32_t *flags = jl_array_data((jl_array_t*)jl_svecref(record, ACTIVATION_RECORD_FLAGS), int32_t);
             char *rmorespec = (char*)alloca(rn);
-            env.skip_covered = 1; // scan only the specializations owned by uncovered images
+            env.scan_spec = spec_uncovered; // scan only the specializations owned by uncovered images
             interferences = activate_against_methods(&env, method, type, rd, rn, flags, rmorespec, interferences, oldmi, NULL);
-            env.skip_covered = 0;
+            env.scan_spec = NULL;
             // the specializations the worker invalidated
             jl_value_t *rspecs = jl_svecref(record, ACTIVATION_RECORD_SPECS);
             if (rspecs != jl_nothing) {
@@ -4055,16 +4092,6 @@ void jl_method_table_activate_with_record(jl_typemap_entry_t *newentry, jl_svec_
                     }
                     invalidate_specialization(&env, mi, type, m, rd, rn, replaced_dispatch, ambig, rmorespec, oldmi);
                 }
-            }
-        }
-        // Callers of covered images that the worker invalidated through missing-method
-        // edges. The scan below skips the callers of covered images.
-        jl_value_t *rcallers = jl_svecref(record, ACTIVATION_RECORD_CALLERS);
-        if (rcallers != jl_nothing) {
-            for (size_t i = 0, l = jl_array_nrows((jl_array_t*)rcallers); i < l; i++) {
-                jl_code_instance_t *ci = (jl_code_instance_t*)jl_array_ptr_ref((jl_array_t*)rcallers, i);
-                invalidate_code_instance(ci, max_world, 0);
-                env.invalidated = 1;
             }
         }
     }
@@ -4138,8 +4165,7 @@ void jl_method_table_activate_with_record(jl_typemap_entry_t *newentry, jl_svec_
 
     jl_methcache_t *mc = jl_method_table->cache;
     JL_LOCK(&mc->writelock);
-    struct _typename_invalidate_backedge typename_env = {type, &isect, &isect2, d, n, max_world, env.invalidated,
-                                                         callers, /* uncovered_only */ replaying};
+    struct _typename_invalidate_backedge typename_env = {type, &isect, &isect2, d, n, max_world, env.invalidated};
     invalidate_missing_backedges(&typename_env);
     env.invalidated |= typename_env.invalidated;
     if (oldmi && jl_array_nrows(oldmi)) {
@@ -4173,18 +4199,8 @@ void jl_method_table_activate_with_record(jl_typemap_entry_t *newentry, jl_svec_
     jl_atomic_store_relaxed(&newentry->max_world, ~(size_t)0);
     jl_atomic_store_relaxed(&method->dispatch_status, env.dispatch_bits); // TODO: this should be sequenced fully after the world counter store
     jl_gc_write_atomic(method, method->interferences, jl_genericmemory_t, interferences, release);
-    if (newrecord != NULL) {
-        // empty lists are saved as `nothing`
-        if (jl_array_nrows((jl_array_t*)jl_svecref(newrecord, ACTIVATION_RECORD_SPECS)) == 0)
-            jl_svecset(newrecord, ACTIVATION_RECORD_SPECS, jl_nothing);
-        jl_svecset(newrecord, ACTIVATION_RECORD_CALLERS, jl_array_nrows(callers) > 0 ? (jl_value_t*)callers : jl_nothing);
-        // The record covers every image loaded so far, and the objects not in any
-        // image yet, which the image being built will own. Saving turns the count
-        // into the keys of these images.
-        loctag = jl_box_long((long)jl_n_linkage_blobs());
-        jl_svecset(newrecord, ACTIVATION_RECORD_IMAGES, loctag);
-        record_activation(method, newrecord);
-    }
+    if (newrecord != NULL)
+        record_activation(method, newrecord); // completed against the images loaded from now on
     JL_GC_POP();
 }
 

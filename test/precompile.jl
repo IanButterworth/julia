@@ -2378,6 +2378,7 @@ precompile_test_harness("activation replay: record validity") do load_path
         f(::Any) = :old
         f(::Int) = :blocker
         h(::Any) = :any
+        g(::String) = :str
         end
         """)
     # loads another dependency after defining its method, so the worker activated
@@ -2389,6 +2390,8 @@ precompile_test_harness("activation replay: record validity") do load_path
         ActReplayDep.h(::Integer) = :late
         callh() = ActReplayDep.h(1)
         callh()
+        callg() = ActReplayDep.g(1) # no method yet: a missing-method edge
+        precompile(callg, ())
         end
         """)
     write(joinpath(load_path, "ActReplayPkg.jl"),
@@ -2397,6 +2400,7 @@ precompile_test_harness("activation replay: record validity") do load_path
         using ActReplayDep
         ActReplayDep.f(::Real) = :new
         ActReplayDep.h(::Int) = :pkg
+        ActReplayDep.g(::Int) = :pkg
         using ActReplayLate
         end
         """)
@@ -2421,9 +2425,17 @@ precompile_test_harness("activation replay: record validity") do load_path
         print(Base.invokelatest(ActReplayLate.callh))
         """)
     @test out == "pkg"
+    # the late dependency's caller of a method missing when it was built is found
+    # through its missing-method backedge, which is always checked live
+    out = trusted_edge_test_output(load_path, DEPOT_PATH[1], """
+        using ActReplayLate
+        using ActReplayPkg
+        print(Base.invokelatest(ActReplayLate.callg))
+        """)
+    @test out == "pkg"
 end
 
-precompile_test_harness("activation replay: record covers only the images seen") do load_path
+precompile_test_harness("activation replay: record completed against images loaded later") do load_path
     write(joinpath(load_path, "ActKeepDep.jl"),
         """
         module ActKeepDep
@@ -2442,7 +2454,7 @@ precompile_test_harness("activation replay: record covers only the images seen")
         end
         """)
     # the worker activates the first two methods before the late dependency is loaded,
-    # so its scan never saw that dependency's methods; the last one sees them
+    # so their records are completed against it at save; the last one sees it
     write(joinpath(load_path, "ActKeepPkg.jl"),
         """
         module ActKeepPkg
