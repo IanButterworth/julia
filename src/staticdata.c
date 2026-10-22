@@ -206,11 +206,7 @@ typedef struct {
                              // (0 until then)
 } image_metadata_t;
 
-// Readers of the image tree take no lock: a reader loads the current snapshot
-// and finishes with it without passing a safepoint, keeping only the
-// image_metadata_t it found, which is never freed. A replaced snapshot is
-// therefore unreachable once every thread has passed a safepoint, which a
-// collection guarantees, so it is freed at the next one.
+// readers use a snapshot without passing a safepoint, so free it after the next collection
 static void image_tree_retire(void *snapshot) JL_NOTSAFEPOINT
 {
     jl_gc_add_quiescent(jl_current_task->ptls, (void**)snapshot, free);
@@ -260,10 +256,8 @@ JL_DLLEXPORT size_t jl_external_blob_index(jl_value_t *v) JL_NOTSAFEPOINT
     return external_blob_index(v);
 }
 
-// The dependencies of the image at blob `idx`, as a bitvector over blobs
-// 0..idx: the sysimage, every image in `depmods`, and itself. `depmods` lists
-// every module the precompile worker had loaded, so it is already complete.
-// Blobs are only appended, so the bitvector never changes.
+// bitvector over blobs 0..idx: the sysimage, `depmods`, and itself.
+// `depmods` already lists every module the precompile worker had loaded.
 static uint32_t *image_deps_new(size_t idx, jl_array_t *depmods) JL_NOTSAFEPOINT
 {
     uint32_t *deps = (uint32_t*)calloc_s(bitvector_nwords(idx + 1) * sizeof(uint32_t));
@@ -4924,8 +4918,7 @@ static jl_value_t *jl_restore_package_image_from_stream(ios_t *f, jl_image_t *im
                 jl_atomic_store_release(&jl_world_counter, world);
             // now permit more methods to be added again
             JL_UNLOCK(&world_counter_lock);
-            // the ext_backinterferences recorded so far saw the method table without this
-            // image: complete them against it (see jl_ext_backinterferences)
+            // the records made so far did not see this image
             if (jl_recording_ext_backinterferences())
                 jl_ext_backinterferences_complete(meta->idx);
 
